@@ -1,0 +1,83 @@
+name: Job
+description: A scoped piece of work, in one area, with a done-when
+title: "[job] "
+labels: ["job"]
+body:
+  - type: input
+    id: goal
+    attributes:
+      label: Goal
+      description: One sentence; the title of the job.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: One area; the files each holds are in TASKS.md.
+      options:
+        - Tools and measurement
+        - "CPU side: speed and memory"
+        - "GPU side: picture, shaders, the card"
+    validations:
+      required: true
+  - type: dropdown
+    id: cards
+    attributes:
+      label: Cards
+      description: >-
+        The graphics cards whose behaviour this job concerns. A job for one vendor still needs a statement that the
+        others do not regress (TASKS.md, "Cards").
+      options:
+        - all
+        - nvidia
+        - amd
+        - intel
+      default: 0
+    validations:
+      required: true
+  - type: input
+    id: files
+    attributes:
+      label: Files owned
+      description: The files this job may change; "to be confirmed by a maintainer" when they are not yet clear.
+    validations:
+      required: true
+  - type: textarea
+    id: symptom
+    attributes:
+      label: Symptom or gain
+      description: What is wrong today, or what the change gains, in plain words.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: What is known, and how
+      description: >-
+        The established tool that measured it, the test that shows it, or "by reading the code". A cause that is
+        only suspected says "suspected".
+  - type: textarea
+    id: ruled-out
+    attributes:
+      label: Ruled out
+      description: What has already been excluded, so nobody re-tests it.
+  - type: textarea
+    id: done-when
+    attributes:
+      label: Done when
+      description: >-
+        The fixture that must fail before and pass after, whether it runs without the title, and the run result
+        where one is asked, with the tool that judges it.
+    validations:
+      required: true
+  - type: dropdown
+    id: size
+    attributes:
+      label: Size
+      options:
+        - S
+        - M
+        - L
+    validations:
+      required: true

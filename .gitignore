@@ -1,0 +1,8 @@
+# Local state and build output: never committed
+harness/local.env
+harness/run.lock
+harness/quiet.flag
+harness/logs/
+target/
+victory/target/
+*.log

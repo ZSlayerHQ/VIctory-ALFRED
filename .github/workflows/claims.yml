@@ -1,0 +1,53 @@
+name: Claims
+
+# Keeps one live claim per open task (TASKS.md, "Claims"): labels a fresh claim, answers a second claim on a held
+# task, flags a claim whose model or effort the model requirement does not cover (AGENTS.md, "Which model"), and
+# frees a claim after 60 minutes without a check-in (48 hours for `model: human`). The rules are in
+# scripts/claims.mjs and its tests.
+#
+# GitHub runs a schedule on a best-effort basis: a run can start late, or be dropped when Actions is busy, so a lapse
+# may be noticed some minutes after it falls due. A new comment checks its own issue at once. Runs share one
+# concurrency group, so two never write at the same time; a queued run that a newer one replaces is caught up by the
+# next scheduled pass.
+#
+# Security: issue and comment text is untrusted. The script reads it through the REST API as data; nothing from the
+# event reaches a `run:` line except through `env:`, and the checkout is the default branch's, so a pull request
+# cannot change the code that runs with this token.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  issue_comment:
+    types: [created, edited, deleted]
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: read
+  contents: read
+
+concurrency:
+  group: claims
+  cancel-in-progress: false
+
+jobs:
+  claims:
+    name: claims
+    # A comment on a pull request is not a check-in (TASKS.md): only comments on an issue run this.
+    if: ${{ github.event_name != 'issue_comment' || !github.event.issue.pull_request }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # actions/checkout v5.0.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Read the claims
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: node scripts/claims.mjs

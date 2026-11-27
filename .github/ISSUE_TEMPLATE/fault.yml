@@ -1,0 +1,63 @@
+name: Fault report
+description: A picture, stability or speed fault, with evidence
+title: "[fault] "
+labels: ["fault"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Nothing from the game goes in this issue: no captures, no assets, no executable bytes, no dumps and no bulk
+        extracted tables. A shader may be named beside its 16-hex id.
+  - type: input
+    id: symptom
+    attributes:
+      label: What you see
+      description: Plain words, and where on screen.
+    validations:
+      required: true
+  - type: input
+    id: when
+    attributes:
+      label: When, and how much of the run
+      description: Time into the recording or frame numbers; how long it lasts.
+  - type: dropdown
+    id: cards
+    attributes:
+      label: Cards
+      description: The vendor of the card that showed it. Say in the evidence whether another vendor's card does too.
+      options:
+        - nvidia
+        - amd
+        - intel
+        - all
+    validations:
+      required: true
+  - type: input
+    id: tested-on
+    attributes:
+      label: Tested on
+      description: "Vendor, card and driver, as the runtime's `host adapter:` log line gives them."
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: >-
+        The harness summary pasted whole and the machine line (GPU, driver, RAM); for a speed or picture claim, the
+        established tool that measured it.
+    validations:
+      required: true
+  - type: textarea
+    id: ruled-out
+    attributes:
+      label: What you have ruled out, and how
+  - type: checkboxes
+    id: content
+    attributes:
+      label: Content check
+      options:
+        - label: >-
+            This issue holds no part of the game: no captures, assets, executable bytes, dumps, bulk extracted
+            tables, or paths into a game dump.
+          required: true

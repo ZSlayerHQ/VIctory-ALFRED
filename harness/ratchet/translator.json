@@ -1,0 +1,15 @@
+{
+  "note": "the translator failures by cause; a build may only improve on this",
+  "counts": {
+    "refused: converter shader.dxil v1: GFX10 code an opaque lane mask is not supported": 1,
+    "refused: converter shader.dxil v1: GFX10 code a lane mask holding lanes elsewhere read as data is not supported": 2,
+    "refused: converter shader.dxil v1: GFX10 code a descriptor chosen by control flow is not supported": 40,
+    "refused: converter shader.dxil v1: GFX10 code a descriptor read only as data is not supported": 5,
+    "refused: converter shader.dxil v1: GFX10 code a lane mask exchanged where not every lane runs is not supported": 1,
+    "refused: converter shader.dxil v1: GFX10 code a first-lane read where not every lane runs is not supported": 3,
+    "refused: converter shader.dxil v1: GFX10 code a hardware SGPR input is not supported": 10,
+    "failed_validation: signature part mismatch": 72,
+    "failed_validation: mesh output over 32768 bytes": 71,
+    "failed_validation: row interpolation modes differ": 70
+  }
+}

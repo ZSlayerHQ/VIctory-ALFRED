@@ -1,0 +1,57 @@
+[package]
+name = "victory-gpu"
+description = "D3D12.X command streams and GPU memory, translated onto host D3D12."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+blake3.workspace = true
+zlib-rs.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+# The texture pack's mapping file (`texture_pack`).
+serde.workspace = true
+toml.workspace = true
+victory-formats.workspace = true
+victory-pipeline.workspace = true
+victory-shader = { workspace = true, features = ["adapter"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+# Debugging switches (frame capture, the host debug layer, per-draw data).
+diagnostics = []
+
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Performance", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
+windows = { workspace = true, features = [
+    # The caption's GPU share: the kernel's graphics statistics (`D3DKMTQueryStatistics`).
+    "Wdk_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    # The texture pack decodes PNG and JPEG with Windows' own decoders (WIC).
+    "Win32_Graphics_Imaging",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The texture pack's tests write their pictures with WIC's encoders.
+windows = { workspace = true, features = ["Win32_System_Com_StructuredStorage"] }
+# The write tracking's tests run the loader's console-instruction emulation
+# against the real opener (`watch/console_writes_tests.rs`).
+victory-loader.workspace = true

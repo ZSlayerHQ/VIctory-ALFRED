@@ -1,0 +1,69 @@
+name: Run report
+description: One run's evidence, so results from different GPUs line up
+title: "[run] "
+labels: ["run"]
+body:
+  - type: input
+    id: build
+    attributes:
+      label: Build
+      description: The runtime commit and profile, and the branch the harness came from.
+    validations:
+      required: true
+  - type: dropdown
+    id: cards
+    attributes:
+      label: Cards
+      description: The vendor of the card the run used.
+      options:
+        - nvidia
+        - amd
+        - intel
+    validations:
+      required: true
+  - type: textarea
+    id: machine
+    attributes:
+      label: Machine
+      description: >-
+        A self-chosen machine id, the GPU vendor, card and driver version (the runtime's `host adapter:` line), RAM,
+        and the Windows build. The same id on later runs is what makes them comparable.
+    validations:
+      required: true
+  - type: input
+    id: switches
+    attributes:
+      label: Switches and options
+      description: The switches set, loop limit, console profile, render size, cold or warm cache.
+  - type: input
+    id: tools
+    attributes:
+      label: Measured by
+      description: The established tool behind each figure you report (PresentMon, WPA, PIX, Nsight, ffmpeg).
+  - type: textarea
+    id: summary
+    attributes:
+      label: Harness summary
+      description: >-
+        Pasted whole from the harness summary tool. It carries the frame and GPU times, the drops and "what was on
+        screen". Counts and times only; no pictures.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What it showed
+      description: >-
+        One or two sentences: what the fault did, or what changed. For an intermittent fault, how many runs showed
+        it out of how many.
+    validations:
+      required: true
+  - type: checkboxes
+    id: content
+    attributes:
+      label: Content check
+      options:
+        - label: >-
+            This report holds no part of the game: no captures, assets, executable bytes, dumps, bulk extracted
+            tables, or paths into a game dump.
+          required: true

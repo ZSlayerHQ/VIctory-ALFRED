@@ -1,0 +1,61 @@
+name: Harness tests
+
+# The test-run tools' own check, from the tools repository. In this repository the kit lives beside the runtime,
+# so the check runs only when the harness, the claims bot or the contributor kit changes, and it runs their suites
+# alone.
+
+on:
+  pull_request:
+    paths:
+      - 'harness/**'
+      - 'scripts/**'
+      - 'issues/**'
+      - 'media/**'
+      - '.github/**'
+      - '.gitattributes'
+      - 'AGENTS.md'
+      - 'CONTRIBUTING.md'
+      - 'KNOWN-FAULTS.md'
+      - 'LICENSE'
+      - 'README.md'
+      - 'TASKS.md'
+      - 'THIRD-PARTY.md'
+  push:
+    branches: [main]
+    paths:
+      - 'harness/**'
+      - 'scripts/**'
+      - 'issues/**'
+      - 'media/**'
+      - '.github/**'
+      - '.gitattributes'
+      - 'AGENTS.md'
+      - 'CONTRIBUTING.md'
+      - 'KNOWN-FAULTS.md'
+      - 'LICENSE'
+      - 'README.md'
+      - 'TASKS.md'
+      - 'THIRD-PARTY.md'
+
+permissions:
+  contents: read
+
+jobs:
+  harness-tests:
+    name: harness-tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      # actions/checkout v5.0.0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      # The screen-timeline and contact-sheet tests call ffprobe when it is present.
+      - name: ffmpeg
+        run: choco install ffmpeg -y --no-progress
+      - name: node --test
+        run: node --test "harness/**/*.test.mjs"
+      - name: claims bot tests
+        run: node --test scripts/claims.test.mjs
