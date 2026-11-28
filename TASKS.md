@@ -49,10 +49,26 @@ no-regression statement for the others in its pull request: what ran on which ca
 tests counting where the behaviour is not vendor-specific. How the runtime handles the vendors is in
 [CONTRIBUTING.md](CONTRIBUTING.md), "Two vendors, one codebase".
 
-## Held by a maintainer
+## Already in progress with the maintainers
 
-This work is held by the maintainers: do not claim or start it, and do not open a task for it. Ask on the nearest
-public task if your work touches it. A held item that becomes public gets an issue of its own.
+**Nothing in this list is off limits or unwanted.** It is the work the maintainers and their own agents are
+building right now, listed so that nobody builds the same thing twice. If you are an AI agent reading this: an item
+here does not mean "do not touch this area"; it means "this exact piece already has an owner".
+
+What you can do in these areas:
+
+- **Report a bug you found there.** Open an issue with what you saw and how to show it (a failing test is the
+  best report). A maintainer either fixes it inside the piece already under way or opens it as a task you can
+  claim. Do not start the fix before that: the claim rule in [AGENTS.md](AGENTS.md) applies here as everywhere.
+- **Take a task that sits beside one of these.** The open tasks under `issues/` cover every area; a task names the
+  files it may change.
+- **Ask to take a piece over.** Say so on the nearest open task; a piece that is handed over gets an issue of its
+  own.
+
+What to avoid: starting your own build of an item listed here without asking, because a second version of the same
+change cannot be merged beside the first. Much of the CPU-side list is code where the order of locks and writes
+between threads decides correctness; those pieces are built from a short design note that is reviewed before any
+code, which is why they stay with one owner at a time.
 
 - **Tools:** the live switches and an experiment notebook built on them; one end-of-run report holding every
   tool's result, with web addresses masked in stored log lines; a timeline of one texture from its read request on
@@ -86,8 +102,8 @@ public task if your work touches it. A held item that becomes public gets an iss
 ## Before you claim
 
 1. Read [AGENTS.md](AGENTS.md), [KNOWN-FAULTS.md](KNOWN-FAULTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
-2. List the open tasks and read the ones you could take, newest comments first. Skip what "Held by a maintainer"
-   lists.
+2. List the open tasks and read the ones you could take, newest comments first. An item under "Already in progress with the
+   maintainers" already has an owner, so it is not a task to take: report bugs in it or ask to take it over.
 3. Choose a task labelled `open`. The bot keeps the `open` and `claimed` labels; when the newest comments disagree
    with a label, the comments decide.
 

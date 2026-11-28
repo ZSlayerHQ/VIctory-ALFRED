@@ -6,6 +6,7 @@
 #                     [--settled-fps F] [--settled-waiting K]
 #                     [--console series-x|series-s] [--profile diag|release]
 #                     [--copy-mode plain|none] [--heavy-seconds N] [--tag name] [--require-quiet] [--quiet-wait N]
+#                     [--cold-pipelines]
 # VICTORY_BIN overrides the binary (default $VICTORY_DIR/target/$PROFILE/victory.exe). GAME_EXE (the title's
 # executable in the dump), VICTORY_CAPTURES (the root each run's capture folder goes under; CAPTURE names one run's
 # folder outright) and VICTORY_SAVE_BACKUPS come from the environment, else harness/local.env on a machine that has
@@ -33,7 +34,7 @@ usage() {
     "                     [--print-env] [--settled-seconds N] [--settled-after-s N] [--settled-timeout N] [--world-timeout N]" \
     "                     [--settled-fps F] [--settled-waiting K] [--console series-x|series-s]" \
     "                     [--profile diag|release] [--settings noone|none|<name>] [--menu-file <file>] [--boot-video <file>] [--boot-volume N] [--copy-mode plain|none] [--heavy-seconds N] [--tag name]" \
-    "                     [--require-quiet] [--quiet-wait N]" \
+    "                     [--require-quiet] [--quiet-wait N] [--cold-pipelines]" \
     | public_line
 }
 
@@ -120,6 +121,8 @@ LOOP_LIMIT=""
 SKIP=""
 DUMP_TARGETS=""
 PRINT_ENV=""
+# --cold-pipelines: the run starts with no pipeline library for its build (below, where the library is put in place).
+COLD_PIPELINES=""
 HEAVY_SECONDS=""
 SETTLED_SECONDS=""
 SETTLED_AFTER=""
@@ -183,6 +186,7 @@ while [ $# -gt 0 ]; do
     --skip) SKIP=$2; shift 2 ;;
     --dump-targets) DUMP_TARGETS=1; shift ;;
     --print-env) PRINT_ENV=1; shift ;;
+    --cold-pipelines) COLD_PIPELINES=1; shift ;;
     --heavy-seconds) HEAVY_SECONDS=$2; shift 2 ;;
     --settled-seconds) SETTLED_SECONDS=$2; shift 2 ;;
     --settled-after-s) SETTLED_AFTER=$2; shift 2 ;;
@@ -683,6 +687,8 @@ if [ -n "$PRINT_ENV" ]; then
   [ -n "$MENU_FILE" ] && printf 'harness env: menu-file=%s (%s values)\n' "$MENU_NAME" "$MENU_COUNT"
   [ -n "$BOOT_VIDEO" ] && printf 'harness env: boot-video=%s%s\n' "${BOOT_VIDEO##*[\\/]}" "${BOOT_VOLUME:+ (the game at $BOOT_VOLUME while it shows)}"
   [ -n "$WORLD_TIMEOUT" ] && printf 'harness env: world-timeout=%s\n' "$WORLD_TIMEOUT"
+  # Only under --cold-pipelines; no library is touched here.
+  [ -n "$COLD_PIPELINES" ] && printf 'harness env: pipelines=cold (the build'"'"'s library is set aside for the run and put back after it)\n'
   # Only under --protocol: an ordinary run's --print-env is unchanged.
   if [ -n "$PROTOCOL" ]; then
     printf 'harness env: protocol=%s\n' "$PROTOCOL"
@@ -752,6 +758,7 @@ fi
   [ -n "$SETTLED_SECONDS" ] && echo "harness env: settled-seconds=$SETTLED_SECONDS"
   [ -n "$SETTLED_TIMEOUT" ] && echo "harness env: settled-timeout=$SETTLED_TIMEOUT"
   [ -n "$WORLD_TIMEOUT" ] && echo "harness env: world-timeout=$WORLD_TIMEOUT"
+  [ -n "$COLD_PIPELINES" ] && echo "harness env: pipelines=cold"
   [ -n "$SETTLED_FPS" ] && echo "harness env: settled-fps=$SETTLED_FPS"
   [ -n "$SETTLED_WAITING" ] && echo "harness env: settled-waiting=$SETTLED_WAITING"
   [ "$GPU_TRACE" = 1 ] && echo "harness env: gpu-trace=after ${TRACE_AFTER_MS} ms, ${TRACE_FRAMES} frames, output $(harness_public_path "$CAPTURE")/gputrace"
@@ -799,10 +806,13 @@ fi
 # One pipeline library per build (pipeline-library.sh says why and how). This build's own is put in place now, whatever
 # build ran last, and put away when the run ends: below once the game has ended, and by the EXIT trap if the harness is
 # stopped or fails first. It prints one line, and refuses to start if the folder cannot be made this build's.
+# --cold-pipelines: the build's library is set aside instead, and at the end put back as it was while the cold run's
+# own is discarded, so a cold check never changes how warm a later run starts. A cold run killed too hard for the
+# trap is put right by the next start, with or without the flag.
 PIPE_TOOLS=$TOOLS
 . "$HERE/pipeline-library.sh"
 PIPE_LOG=$LOG
-pipeline_library_enter "$(pipeline_library_cache_dir "$SAVE_CONFIG")" "$(pipeline_library_key "$BIN")" || exit 2
+pipeline_library_enter "$(pipeline_library_cache_dir "$SAVE_CONFIG")" "$(pipeline_library_key "$BIN")" ${COLD_PIPELINES:+cold} || exit 2
 # The loading cover's player (--boot-video, below) is ended with the run, however the run ends.
 COVER_PID=""
 cover_end() {

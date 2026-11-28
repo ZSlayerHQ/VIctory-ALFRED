@@ -2,7 +2,7 @@
 
 Every task here is open. The area and cards come from each issue; "Needs" says what the work takes beyond this
 repository, so a contributor without a copy of the title can pick the tasks marked "none". The work a maintainer
-holds is listed in [TASKS.md](../TASKS.md), "Held by a maintainer", and has no issue.
+holds is listed in [TASKS.md](../TASKS.md), "Already in progress with the maintainers", and has no issue.
 
 | Issue | Area | Cards | Needs |
 |---|---|---|---|

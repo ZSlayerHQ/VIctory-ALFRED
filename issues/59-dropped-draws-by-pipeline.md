@@ -11,7 +11,7 @@
 - **Done when:** a test makes synthetic drops for two pipelines across two stats intervals and asserts each object names both with the right counts and frames, at most the ten most-dropped, and nothing when nothing dropped; with no drops the object is byte for byte as today; the GPU crate's tests pass on the software adapter. With your own copy, one run's stats file names the pipelines dropped during the warm-up.
 - **Test without the title:** yes, the synthetic test.
 - **Judged by:** a run with `VICTORY_SKIP_PIPELINES` set to a named pipeline, in which that pipeline's drops become skips: the counts must agree.
-- **Out of scope:** why a pipeline is not ready (pipelines made ahead are held by a maintainer); the harness readers of the stats file.
+- **Out of scope:** why a pipeline is not ready (pipelines made ahead are already in progress with the maintainers); the harness readers of the stats file.
 - **Size:** M
 - **Needs:** none for the test; your own copy for the run.
 - **Claim:** one `CHECK-IN` comment holds it; check in every 60 minutes (48 hours for `model: human`); the forms are in TASKS.md.

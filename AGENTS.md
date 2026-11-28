@@ -13,8 +13,9 @@ repository exists to prevent.
 
 ## Start of every session
 
-1. Read [TASKS.md](TASKS.md). It gives the three areas and the files each holds, the work a maintainer holds (take
-   none of it), and the claim protocol. Every task is an issue on this repository; its `Area:` line says where it
+1. Read [TASKS.md](TASKS.md). It gives the three areas and the files each holds, the work already in progress
+   with the maintainers (those exact pieces have an owner, so they are not tasks to take; the areas around them are
+   open), and the claim protocol. Every task is an issue on this repository; its `Area:` line says where it
    sits and its `Cards:` line which graphics cards it concerns.
 2. List the open tasks (`gh issue list --state open --label task --limit 200`) and read the ones you could take,
    newest comments first.

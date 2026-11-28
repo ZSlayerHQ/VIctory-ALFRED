@@ -54,6 +54,19 @@ test('--dump-targets sets the unsafe flag beside the targets and keeps the frame
   assert.equal(env.has('VICTORY_CAPTURE_FRAMES=2400,2600'), true);
 });
 
+test('--cold-pipelines: --print-env names it, the library step is told, and without it neither shows', (t) => {
+  const cold = printEnv(t, ['--cold-pipelines']);
+  assert.equal(
+    cold.has("harness env: pipelines=cold (the build's library is set aside for the run and put back after it)"),
+    true,
+  );
+  for (const line of printEnv(t, [])) assert.doesNotMatch(line, /pipelines=cold/);
+  const text = fs.readFileSync(script, 'utf8');
+  assert.match(text, /pipeline_library_enter "[^\n]*" \$\{COLD_PIPELINES:\+cold\} \|\| exit 2/);
+  assert.match(text, /\[ -n "\$COLD_PIPELINES" \] && echo "harness env: pipelines=cold"/, 'the log header says so');
+  assert.match(text, /\[--cold-pipelines\]/, 'the usage lists it');
+});
+
 test('without --dump-targets neither dump variable is passed', (t) => {
   const env = printEnv(t, ['--frames', '2400,2600']);
   for (const line of env) assert.doesNotMatch(line, /^VICTORY_DUMP_/);

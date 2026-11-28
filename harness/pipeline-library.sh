@@ -12,6 +12,11 @@
 # (unmarked-<time>) before this build's own are put in place, so a run can only ever write into its own build's
 # library, even after a harness that was killed outright.
 #
+# A cold start (run-world.sh --cold-pipelines; pipeline_library_enter's third argument `cold`) moves the build's own
+# library, stored or in place, to pipelines-cold-aside/<build>/ and marks the empty live folder `cold <build>` (no
+# build's name has a space). When the run ends its own files are discarded and the library goes back to the store as
+# it was. A start that finds either left behind by a killed cold run discards and puts back before anything else.
+#
 # Never print the cache folder's path (its output can appear in a shared recording): output names builds and sizes only, and every
 # command that could name a path has its error output dropped.
 
@@ -22,7 +27,9 @@ PIPE_TOOLS=${PIPE_TOOLS:-$PIPE_HERE}
 PIPE_MARKER=library-build.txt
 PIPE_KEEP=${PIPELINE_LIBRARY_KEEP:-6}
 PIPE_RETRIES=${PIPELINE_LIBRARY_RETRIES:-10}
+PIPE_ASIDE_NAME=pipelines-cold-aside
 PIPE_ON=
+PIPE_COLD=
 
 # Prints a line to the terminal (through run-world.sh's public filter when it is loaded) and, when PIPE_LOG names the
 # run's log, to the log as well.
@@ -73,6 +80,83 @@ _pipe_move_all() {
     done
   done < <(_pipe_files "$1")
   return $rc
+}
+
+# Deletes folder $1's library files (a cold run's own), each retried like a move. Fails if any file stays.
+_pipe_discard_all() {
+  local name try rc=0
+  while IFS= read -r name; do
+    try=1
+    until rm -f "$1/$name" 2>/dev/null && [ ! -e "$1/$name" ]; do
+      if [ "$try" -ge "$PIPE_RETRIES" ]; then
+        rc=1
+        break
+      fi
+      try=$((try + 1))
+      sleep 1
+    done
+  done < <(_pipe_files "$1")
+  return $rc
+}
+
+# Moves store-style folder $1 (library files and .last-used) to $2 as it is: one rename when $2 is absent, else file
+# by file into it. Nothing to do when $1 is absent. Fails if anything stays in $1.
+_pipe_move_folder() {
+  local try=1
+  [ -d "$1" ] || return 0
+  if [ ! -e "$2" ]; then
+    until mv "$1" "$2" 2>/dev/null; do
+      [ "$try" -ge "$PIPE_RETRIES" ] && break
+      try=$((try + 1))
+      sleep 1
+    done
+    [ -d "$1" ] || return 0
+  fi
+  _pipe_move_all "$1" "$2" || return 1
+  if [ -e "$1/.last-used" ]; then
+    mv -f "$1/.last-used" "$2/.last-used" 2>/dev/null || return 1
+  fi
+  rmdir "$1" 2>/dev/null
+}
+
+# Puts build $1's library back from the cold aside folder into the store, and removes that folder when it is empty.
+_pipe_put_back() {
+  _pipe_move_folder "$PIPE_COLDROOT/$1" "$PIPE_ROOT/$1" || return 1
+  rmdir "$PIPE_COLDROOT" 2>/dev/null
+  return 0
+}
+
+# First at every start: a cold run killed before its put-back left its own files in place (marked `cold <build>`)
+# and the build's library aside. The first are discarded, the second put back, and one line says so. Fails (the run
+# must not start) if either cannot be done: the run would otherwise write into, or save over, the wrong library.
+_pipe_recover() {
+  local held d name mb said=
+  held=$(cat "$PIPE_LIVE/$PIPE_MARKER" 2>/dev/null)
+  case $held in
+    "cold "*)
+      if ! _pipe_discard_all "$PIPE_LIVE"; then
+        _pipe_say "pipeline library: an interrupted cold run's own files could not be discarded; run refused"
+        return 1
+      fi
+      rm -f "$PIPE_LIVE/$PIPE_MARKER"
+      ;;
+    *) held= ;;
+  esac
+  for d in "$PIPE_COLDROOT"/*/; do
+    [ -d "$d" ] || continue
+    name=$(basename "$d")
+    mb=$(_pipe_mb "$d")
+    if ! _pipe_put_back "$name"; then
+      _pipe_say "pipeline library: $name could not be put back from an interrupted cold run; run refused"
+      return 1
+    fi
+    _pipe_say "pipeline library: $name put back ($mb MB) after a cold run that was interrupted"
+    said=1
+  done
+  if [ -n "$held" ] && [ -z "$said" ]; then
+    _pipe_say "pipeline library: an interrupted cold run's own files (${held#cold }) discarded"
+  fi
+  return 0
 }
 
 # The live folder's files go into the store under name $1; the marker is removed only once they are all there.
@@ -139,22 +223,60 @@ pipeline_library_cache_dir() {
   case $dir in [A-Za-z]:[/\\]* | /*) printf '%s' "$dir" ;; esac
 }
 
-# pipeline_library_enter <cache folder> <build>: puts the build's library in place, setting aside whatever else is
-# there, and prints one line. Returns 1 (the run must not start) if another build's files cannot be set aside or
-# this build's cannot be put in place: a run would then write into the wrong library.
+# A cold start, after any other build's files are set aside: the build's own library (stored, or in place after a
+# harness killed outright, which wins as it would for a warm start) moves to the aside folder, and the live folder is
+# marked as the cold run's. $1 is the marker found, $2 the note on what was set aside. Prints one line.
+_pipe_enter_cold() {
+  local held=$1 aside=$2 to=$PIPE_COLDROOT/$PIPE_KEY mb
+  if ! mkdir -p "$PIPE_COLDROOT" 2>/dev/null ||
+    ! _pipe_move_folder "$PIPE_ROOT/$PIPE_KEY" "$to" ||
+    { [ "$held" = "$PIPE_KEY" ] && ! _pipe_move_all "$PIPE_LIVE" "$to"; } ||
+    ! printf '%s\n' "cold $PIPE_KEY" >"$PIPE_LIVE/$PIPE_MARKER" 2>/dev/null; then
+    _pipe_put_back "$PIPE_KEY"
+    _pipe_say "pipeline library: could not set $PIPE_KEY aside for a cold start; run refused"
+    return 1
+  fi
+  PIPE_ON=1
+  if [ -d "$to" ]; then
+    mb=$(_pipe_mb "$to")
+    _pipe_say "pipeline library: $PIPE_KEY cold start: its library ($mb MB) set aside until the run ends$aside"
+  else
+    rmdir "$PIPE_COLDROOT" 2>/dev/null
+    _pipe_say "pipeline library: $PIPE_KEY cold start: none stored$aside"
+  fi
+  return 0
+}
+
+# pipeline_library_enter <cache folder> <build> [cold]: puts the build's library in place, setting aside whatever else
+# is there, and prints one line; with `cold`, the build's own library is set aside too (_pipe_enter_cold). First it
+# puts back what a killed cold run left (_pipe_recover). Returns 1 (the run must not start) if another build's files
+# cannot be set aside or this build's cannot be put in place: a run would then write into the wrong library. A cold
+# start with no cache folder is refused too: it could not be told cold.
 pipeline_library_enter() {
   PIPE_ON=
   PIPE_KEY=$2
+  PIPE_COLD=
+  [ "${3:-}" = cold ] && PIPE_COLD=1
   PIPE_LIVE=$1/pipelines
   PIPE_ROOT=$1/pipelines-by-build
+  PIPE_COLDROOT=$1/$PIPE_ASIDE_NAME
   if [ -z "$1" ] || ! mkdir -p "$PIPE_LIVE" "$PIPE_ROOT" 2>/dev/null; then
+    if [ -n "$PIPE_COLD" ]; then
+      _pipe_say "pipeline library: cache folder not found, so no cold start can be made; run refused"
+      return 1
+    fi
     _pipe_say "pipeline library: cache folder not found, left alone"
     return 0
   fi
+  _pipe_recover || return 1
   local held aside="" mb
   held=$(cat "$PIPE_LIVE/$PIPE_MARKER" 2>/dev/null)
   if [ -n "$(_pipe_files "$PIPE_LIVE")" ]; then
     if [ "$held" = "$PIPE_KEY" ]; then
+      if [ -n "$PIPE_COLD" ]; then
+        _pipe_enter_cold "$held" ""
+        return
+      fi
       PIPE_ON=1
       _pipe_say "pipeline library: $PIPE_KEY already in place ($(_pipe_mb "$PIPE_LIVE") MB)"
       return 0
@@ -166,6 +288,10 @@ pipeline_library_enter() {
       return 1
     fi
     aside=", $held set aside ($mb MB)"
+  fi
+  if [ -n "$PIPE_COLD" ]; then
+    _pipe_enter_cold "" "$aside"
+    return
   fi
   if ! printf '%s\n' "$PIPE_KEY" >"$PIPE_LIVE/$PIPE_MARKER" 2>/dev/null; then
     _pipe_say "pipeline library: could not mark the folder as $PIPE_KEY's; run refused"
@@ -190,9 +316,14 @@ pipeline_library_enter() {
 
 # pipeline_library_leave: stores the library the run wrote under its build's name and prunes the store. Safe to call
 # twice (run-world.sh calls it when the game ends and again from its EXIT trap). Silent unless something goes wrong.
+# After a cold start it stores nothing: _pipe_leave_cold.
 pipeline_library_leave() {
   [ -n "${PIPE_ON:-}" ] || return 0
   PIPE_ON=
+  if [ -n "${PIPE_COLD:-}" ]; then
+    _pipe_leave_cold
+    return
+  fi
   local held
   held=$(cat "$PIPE_LIVE/$PIPE_MARKER" 2>/dev/null)
   [ "$held" = "$PIPE_KEY" ] || return 0
@@ -205,4 +336,27 @@ pipeline_library_leave() {
     return 1
   fi
   _pipe_prune
+}
+
+# The end of a cold run: the build's library goes back to the store as it was, and the files the cold run made are
+# discarded, not stored. Why: a cold run checks a fault of the cold start, and storing what it made would replace the
+# build's full library with a partial one; a cold check must not change how warm any later run starts. Says one line.
+# What cannot be done here is done at the next start (_pipe_recover).
+_pipe_leave_cold() {
+  local rc=0 back="it had none to put back"
+  [ -d "$PIPE_COLDROOT/$PIPE_KEY" ] && back="$PIPE_KEY's library put back ($(_pipe_mb "$PIPE_COLDROOT/$PIPE_KEY") MB)"
+  if ! _pipe_put_back "$PIPE_KEY"; then
+    _pipe_say "pipeline library: $PIPE_KEY could not be put back after the cold run; the next run puts it back"
+    rc=1
+  fi
+  if [ "$(cat "$PIPE_LIVE/$PIPE_MARKER" 2>/dev/null)" = "cold $PIPE_KEY" ]; then
+    if _pipe_discard_all "$PIPE_LIVE"; then
+      rm -f "$PIPE_LIVE/$PIPE_MARKER"
+    else
+      _pipe_say "pipeline library: the cold run's own files could not be discarded; the next run discards them"
+      rc=1
+    fi
+  fi
+  [ "$rc" = 0 ] && _pipe_say "pipeline library: the cold run's own files discarded, $back"
+  return $rc
 }

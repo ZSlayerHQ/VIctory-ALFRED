@@ -21,6 +21,10 @@ These are read from the environment before a run starts. An explicit value alway
 | `VICTORY_RUN_LOCK` | `harness/run.lock` | The run lock a `--save` restore must find held by this run. |
 | `HARNESS_ROUTES_DIR` | `harness/routes` | Where `--route <name>` reads `<name>.keys` from. |
 
+`--cold-pipelines` starts a run with no pipeline library for its build: the library is set aside in
+`<cache_dir>/pipelines-cold-aside/<build>/`, put back as it was when the run ends, and the cold run's own discarded,
+so a cold check never changes later runs (`pipeline-library.sh` says how, including a run killed outright).
+
 A run is timed when a hold ends it on the harness's own timer: `--heavy-seconds` or `--settled-seconds` (a route
 may supply either). Such a run defaults to `WATCHDOG=1`, because a frozen timed leg is over and ending it frees the
 lock. An open, untimed session defaults to `WATCHDOG=warn`, because its counter can stand still while the window is
