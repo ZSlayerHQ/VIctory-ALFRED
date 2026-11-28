@@ -67,6 +67,11 @@ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The interval frames begin at now ([`set_interval`]); `None` until the title sets one.
+pub(crate) fn interval() -> Option<Duration> {
+    clock().as_ref().map(|c| c.interval)
+}
+
 /// `VICTORY_FRAME_INTERVAL_US=<n>`: frames begin every `n` microseconds
 /// whatever interval the title sets (16667: 60 a second, 8333: 120, 1000:
 /// as fast as frames are made). The title sets 33,333 us (30 a second)

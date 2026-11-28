@@ -10,13 +10,12 @@
 //! saves already are.
 //!
 //! This build downloads nothing. NVIDIA's DLSS and frame generation files,
-//! AMD's FSR 3 frame generation files, Microsoft's newer Direct3D 12 runtime
-//! and MFG Unlocker (someone else's mod) are not part of this program: each
-//! is used where it was put (`nvidia-sdk`, `amd-fidelityfx` and
-//! `mfg-unlocker` under `%LOCALAPPDATA%\victory`, `D3D12` beside the
-//! program; main.rs for the last), and a start without one says so. DLSS
-//! and both frame generations also need the title's FidelityFX path patched
-//! in, which this build does not have (`run.rs`).
+//! AMD's FSR 3 frame generation files and Microsoft's newer Direct3D 12
+//! runtime are not part of this program: each is used where it was put
+//! (`nvidia-sdk` and `amd-fidelityfx` under `%LOCALAPPDATA%\victory`, `D3D12`
+//! beside the program), and a start without one says where it goes. MFG
+//! Unlocker, someone else's mod that unlocks DLSS Frame Generation on RTX 20
+//! and 30 cards, is not in this build.
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
@@ -67,6 +66,12 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_UPLOAD_AHEAD", "1"),
     ("VICTORY_SHOW_AFTER", "1"),
     ("VICTORY_MAP_THREADS", "1"),
+    // A frame's texture passes within 8 ms together; helpers woken at each submission's start
+    // (foxhound 0.2.0-pre.4, from its PR #13; its launcher sets 8 and 1)
+    ("VICTORY_TEXSPK_PASS_MS", "8"),
+    ("VICTORY_PASSES_HOT", "1"),
+    // The layer's threads a frame waits for, above normal priority (foxhound: cutscene worst second 74.8 -> 63.8 ms)
+    ("VICTORY_HELPER_PRIORITY", "1"),
     // Shader writes into big write-combined copies stay on the card
     ("VICTORY_WC_NO_BACK", "1"),
     ("VICTORY_WC_NO_BACK_MIN_KB", "1024"),
@@ -100,12 +105,26 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_LEAVE_OUT", "02384a60fda6f2d0,731a39171b568298"),
     // Pipelines the title makes are written down, for `victory warm`
     ("VICTORY_PIPELINE_BOOK", "1"),
+    // Memory stack (skornuta): texture slots left unused are given back, old command allocators
+    // are taken anew, small buffers share card memory (off since .8; on again 2026-11-28)
+    ("VICTORY_SLOT_EVICT", "1"),
+    ("VICTORY_ALLOCATOR_TRIM", "1"),
+    ("VICTORY_BUDGET_PACK", "1"),
 ];
 
 /// Path settings a start keeps from its surroundings; every other
 /// `VICTORY_...` variable is cleared before the settings are put in (a
 /// restart from the menu inherits the last run's).
+///
+/// `VICTORY_HOME` and `VICTORY_ADAPTER` are read again after the clearing:
+/// the cache and save folders (`Config::load` in `run`), the restart the F1
+/// menu or the warm-up starts (which inherits this environment), and the
+/// card the host device is made on. Cleared, the caches and saves went to
+/// `%LOCALAPPDATA%` with `VICTORY_HOME` set (#472), and a named card was
+/// passed over for the one with the most memory.
 const KEPT: &[&str] = &[
+    "VICTORY_HOME",
+    "VICTORY_ADAPTER",
     "VICTORY_CONFIG",
     "VICTORY_GAME_DIR",
     "VICTORY_CACHE_DIR",
@@ -117,8 +136,13 @@ const KEPT: &[&str] = &[
 
 const FG_TYPES: [&str; 3] = ["auto", "dlss", "fsr"];
 
-const RESOLUTIONS: [&str; 3] = ["1440", "1080to1440", "4k"];
+const RESOLUTIONS: [&str; 4] = ["1440", "1080", "1080to1440", "4k"];
 const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performance"];
+/// The Series S scene heights the F1 menu offers and the DLSS mode of each: the picture
+/// is 1920x1080, the scene that mode's share of it (720: the game's own size, and what
+/// it stays at without DLSS: the title's own FidelityFX path from 540 stopped it at the
+/// start, 0xc0000094, a division by zero in the title, 2026-11-28).
+const S_SIZES: [(&str, &str); 4] = [("1080", "dlaa"), ("720", "quality"), ("626", "balanced"), ("540", "performance")];
 
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct Play {
@@ -128,20 +152,25 @@ pub(crate) struct Play {
     /// The Series S profile (1280x720 inside: faster, softer).
     #[arg(long)]
     series_s: bool,
-    /// 1440: output and scene 2560x1440; 1080to1440: scene 1920x1080
-    /// upscaled by the title; 4k: the stock 3840x2160 output. This build
-    /// has only the stock output: 1440 and 1080to1440 are refused at the
-    /// start, which then goes on with it.
+    /// 1080: output and scene 1920x1080 (no upscaling); 1440: output and
+    /// scene 2560x1440; 1080to1440: scene 1920x1080
+    /// upscaled by the title; 4k: the stock 3840x2160 output.
     #[arg(long, default_value = "1440", value_parser = RESOLUTIONS)]
     res: String,
     /// DLSS in place of the title's upscaling (needs NVIDIA's files).
     #[arg(long, default_value = "quality", value_parser = DLSS_MODES)]
     dlss: String,
     /// DLSS frame generation on from the start: frames shown for each one
-    /// rendered, 2 to 6. Without it, it is ready and the F1 menu switches it.
+    /// rendered, 2 to 6. Without it, it is off (see `--framegen-ready`).
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=6))]
     framegen: Option<u32>,
-    /// Frame generation not made ready at the start.
+    /// Frame generation made ready but off at the start, so that the F1 menu
+    /// switches it while playing. Not by default: ready but off, frames go
+    /// through Streamline's swap chain, which held an RTX 5070 Ti's first
+    /// playable part at 14 a second (20 without).
+    #[arg(long)]
+    framegen_ready: bool,
+    /// (The default now; still taken.)
     #[arg(long)]
     no_framegen_ready: bool,
     /// Which frame generation: auto (DLSS frame generation where the card has
@@ -260,7 +289,19 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     let saved = |k: &str| menu.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     let series_s = saved("VICTORY_MENU_CONSOLE").map_or(o.series_s, |c| c == "series-s");
     let res = saved("VICTORY_MENU_RES").filter(|r| RESOLUTIONS.contains(r)).unwrap_or(&o.res);
-    let dlss = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d)).unwrap_or(&o.dlss);
+    let mut dlss = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d)).unwrap_or(&o.dlss);
+    // Series S picture: the scene's size, which with DLSS on is its mode (the menu keeps the
+    // two matched); not saved yet, it is the DLSS mode's.
+    let s_res = saved("VICTORY_MENU_S_RES")
+        .and_then(|r| S_SIZES.iter().find(|(h, _)| *h == r))
+        .or_else(|| S_SIZES.iter().find(|(_, m)| *m == dlss))
+        .map_or("720", |(h, _)| *h);
+    if series_s
+        && dlss != "off"
+        && let Some((_, mode)) = S_SIZES.iter().find(|(h, _)| *h == s_res)
+    {
+        dlss = *mode;
+    }
     // 0: off; 2 to 6: that many frames shown for each one rendered (1, from an older file: 2).
     let (mut framegen, mut times) = (o.framegen.is_some(), o.framegen.unwrap_or(2));
     if let Some(saved) = saved("VICTORY_MENU_FRAMEGEN") {
@@ -282,6 +323,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
         match res {
             "1440" => set("VICTORY_NATIVE_1440P", "1"),
             "1080to1440" => set("VICTORY_RENDER_1080P", "1"),
+            "1080" => set("VICTORY_OUTPUT_1080P", "1"),
             _ => {}
         }
     }
@@ -295,7 +337,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
         set("VICTORY_STREAMLINE_DIR", &dir.to_string_lossy());
         if framegen {
             framegen_x = Some(times);
-        } else if !o.no_framegen_ready {
+        } else if o.framegen_ready && !o.no_framegen_ready {
             framegen_x = Some(0); // ready, off
         }
         if let Some(x) = framegen_x {
@@ -310,7 +352,10 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     // AMD FSR 3 frame generation, made ready as DLSS frame generation is: auto, the layer uses
     // it only where DLSS frame generation does not run; fsr, DLSS frame generation is not asked.
     // The layer checks the files and the card and says at the start what runs and why not.
-    if fg_type != "dlss" && (framegen || !o.no_framegen_ready) {
+    // Only with DLSS on: it never runs without DLSS's upscaling, and made ready without it (the
+    // title's FidelityFX then left with AMD's files) the title stopped during the boot screens
+    // (a check, 0x80000003, or exit code 3; #331, #459: --no-framegen-ready avoided it).
+    if dlss_on && fg_type != "dlss" && (framegen || o.framegen_ready && !o.no_framegen_ready) {
         set("VICTORY_FSR_FRAMEGEN", "1");
         if fg_type == "fsr" {
             s.remove("VICTORY_FRAMEGEN");
@@ -338,6 +383,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
     set("VICTORY_MENU_CONSOLE", if series_s { "series-s" } else { "series-x" });
     set("VICTORY_MENU_RES", res);
+    set("VICTORY_MENU_S_RES", if dlss_on { s_res } else { "720" });
     set("VICTORY_MENU_DLSS", if dlss_on { dlss } else { "off" });
     set("VICTORY_MENU_FRAMEGEN", &framegen_x.unwrap_or(0).to_string());
     set("VICTORY_MENU_FG_TYPE", fg_type);
@@ -387,24 +433,26 @@ fn log_file(logs: &Path) -> Result<PathBuf> {
 /// from these).
 const LOG_PREFIX: &str = "victory-nvidia-play-";
 
-/// At a start without NVIDIA's files: says so (this build downloads nothing).
-fn offer_dlss() {
-    println!("No NVIDIA files: running without DLSS and frame generation (this build does not download them).");
+/// At a start without NVIDIA's files: says where to put them (this build
+/// downloads nothing). `picked`: DLSS was turned on in the F1 menu, which
+/// needs them.
+fn offer_dlss(picked: bool) {
+    let folder = nvidia_home().map_or_else(|_| "nvidia-sdk under %LOCALAPPDATA%\\victory".to_owned(), |to| to.display().to_string());
+    if picked {
+        println!("DLSS was picked in the F1 menu, and NVIDIA's DLSS and frame generation files are not on this PC.");
+    } else {
+        println!("No NVIDIA files: running without DLSS and frame generation (this build does not download them).");
+    }
+    println!("They are NVIDIA's own (the Streamline SDK, from NVIDIA): put its Streamline folder into {folder},");
+    println!("so that Streamline\\bin\\x64\\sl.interposer.dll is there, and start again.");
 }
 
-/// At a start that would use FSR 3 without AMD's files: says so (this build
-/// downloads nothing).
+/// At a start that would use FSR 3 without AMD's files: says where to put
+/// them (this build downloads nothing).
 fn offer_fsr(_card: &str) {
+    let folder = amd_home().map_or_else(|_| "amd-fidelityfx under %LOCALAPPDATA%\\victory".to_owned(), |to| to.display().to_string());
     println!("No AMD FSR 3 files: frame generation stays off on this card (this build does not download them).");
-}
-
-/// The mod's DLL, under its own name: loaded by this program (main.rs, [`load_mfg`]), not by
-/// Windows in place of one of its own, so nothing is renamed or put beside the game.
-const MFG_DLL: &str = "MFGUnlocker.dll";
-
-/// Where `play` looks for MFG Unlocker.
-fn mfg_home() -> Result<PathBuf> {
-    Ok(home()?.join("mfg-unlocker"))
+    println!("They are AMD's own (the FidelityFX SDK, from AMD): put {} into {folder} and start again.", FSR_FILES.join(" and "));
 }
 
 /// A GeForce RTX of the 20 or 30 series ("NVIDIA GeForce RTX 3080", "... RTX 2060 SUPER"): DLSS
@@ -416,16 +464,11 @@ fn older_rtx(name: &str) -> bool {
     model.len() == 4 && (model.starts_with("20") || model.starts_with("30"))
 }
 
-/// With MFG Unlocker on: the DLL. `None`: not there (said; this build does
-/// not download it).
+/// With MFG Unlocker on: the DLL. Always `None`, said: the unlocker is not
+/// in this build.
 fn mfg_dll() -> Option<PathBuf> {
-    let to = mfg_home().ok()?;
-    let dll = to.join(MFG_DLL);
-    if !dll.is_file() {
-        println!("MFG UNLOCKER is on, and {MFG_DLL} is not in {}: running without it (this build does not download it).", to.display());
-        return None;
-    }
-    Some(dll)
+    println!("MFG UNLOCKER is on, and the unlocker for older cards is not in this build: running without it.");
+    None
 }
 
 /// Loads MFG Unlocker (`VICTORY_MFG_UNLOCKER_DLL`, set by [`prepare`] with the option on) into
@@ -469,15 +512,42 @@ fn shader_model() -> Option<(u32, u32)> {
 /// Makes sure the GPU runs the translated shaders' model (6.6) before the
 /// title starts. Below 6.6 every pipeline is refused and the title closes
 /// within seconds, so such a start stops here, saying why. Where Windows'
-/// own Direct3D 12 stops below it (Windows 10), Microsoft's newer runtime
-/// in `D3D12` beside this program runs it; this build does not download it.
+/// own Direct3D 12 does not run it (Windows 10), Microsoft's newer runtime
+/// in `D3D12` beside this program does; this build does not download it,
+/// and says where it goes.
+///
+/// On Windows 10 the runtime is needed even where its own reports 6.6 or
+/// more (an up-to-date driver says 6.8): Windows 10's own Direct3D 12
+/// refuses the root signatures the translated shaders need (descriptor
+/// heaps indexed directly), and the title closed a second after its first
+/// frame (2026-11-27, Windows 10 21H2 LTSC with an RTX 4060, issue #290;
+/// #123 and discussion #186 found the same refusal).
 fn check_shader_model() -> Result<()> {
     let needed = victory_hle::streamline::SHADER_MODEL_NEEDED;
     let Some(found) = shader_model() else { return Ok(()) };
-    if found >= needed {
+    let to = d3d12_dir()?;
+    let had = to.join("D3D12Core.dll").is_file();
+    let windows_10 = !had && crate::windows_build().is_some_and(|build| build < 22000);
+    if found >= needed && !windows_10 {
         return Ok(());
     }
-    let to = d3d12_dir()?;
+    if !had {
+        if found < needed {
+            println!("This PC's Direct3D 12 runs shader model {}.{}, and the game's translated shaders need 6.6.", found.0, found.1);
+            println!("Windows 10's own Direct3D 12 stops at 6.5; Microsoft's newer runtime (the D3D12 Agility SDK)");
+            println!("runs 6.6.");
+        } else {
+            println!("This is Windows 10: its own Direct3D 12 refuses root signatures the game's translated shaders");
+            println!("need, and the game would close at the start. Microsoft's newer runtime (the D3D12 Agility SDK)");
+            println!("takes them.");
+        }
+        println!("It is Microsoft's own, under Microsoft's licence; this build does not download it. Put the");
+        println!("D3D12Core.dll of its package into {} and start again.", to.display());
+    }
+    if found >= needed {
+        println!("Starting with Windows 10's own Direct3D 12: the game may close at the start.");
+        return Ok(());
+    }
     anyhow::bail!(
         "this PC's Direct3D 12 runs shader model {}.{}, and the game needs 6.6: every shader would be \
          refused and the game would close at once. {}",
@@ -504,8 +574,9 @@ fn mod_dlls(here: &Path) -> Vec<String> {
     NAMES.iter().filter(|n| here.join(n).is_file()).map(|n| (*n).to_owned()).collect()
 }
 
-/// How long the first start of a new victory.exe plays before it restarts.
-const WARMUP_SECONDS: u32 = 20;
+/// How long the first start of a new victory.exe plays before it restarts,
+/// counted from the first frame of the game's world (100 draws or more).
+const WARMUP_SECONDS: u32 = 10;
 
 /// The file that says this victory.exe (its bytes) had its warm-up start:
 /// `%LOCALAPPDATA%\victory\warmed\<hash>`. `None`: the exe could not be read.
@@ -548,14 +619,9 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
     let menu_file = home.join("victory-settings.txt");
     let menu = parse_menu(&std::fs::read_to_string(&menu_file).unwrap_or_default());
-    let wants_dlss = menu
-        .iter()
-        .rev()
-        .find(|(k, _)| k == "VICTORY_MENU_DLSS")
-        .map_or(o.dlss.as_str(), |(_, v)| v.as_str())
-        != "off";
-    if wants_dlss && streamline_dir(&here).is_none() {
-        offer_dlss();
+    let picked = menu.iter().rev().find(|(k, _)| k == "VICTORY_MENU_DLSS").map(|(_, v)| v.as_str());
+    if picked.unwrap_or(o.dlss.as_str()) != "off" && streamline_dir(&here).is_none() {
+        offer_dlss(picked.is_some_and(|d| DLSS_MODES.contains(&d)));
     }
     let streamline = streamline_dir(&here);
     let (mut s, series_s) = settings(o, &menu, streamline.as_deref());
@@ -575,19 +641,17 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     }
     // MFG Unlocker (F1, MFG UNLOCKER): DLSS frame generation on RTX 20 and 30 cards. Said once a
     // start on such a card with DLSS on, where the choice was never made and no mod DLL is beside
-    // us: this build does not download it, and loads it only where it was put.
+    // us: the unlocker is not in this build.
     let mods = mod_dlls(&here);
     if s.contains_key("VICTORY_DLSS")
         && !menu.iter().any(|(k, _)| k == "VICTORY_MFG_UNLOCKER")
         && !s.contains_key("VICTORY_MFG_UNLOCKER")
         && mods.is_empty()
         && let Some(card) = victory_hle::streamline::adapter_name().filter(|c| older_rtx(c))
-        && let Ok(to) = mfg_home()
     {
         println!(
-            "This card ({card}) has DLSS frame generation only with MFG Unlocker, someone else's mod, which this \
-             build does not download: with {MFG_DLL} in {}, F1, MFG UNLOCKER turns it on.",
-            to.display()
+            "This card ({card}) runs DLSS, but NVIDIA's DLSS frame generation only on RTX 40 and later; the \
+             unlocker for older cards is not in this build."
         );
     }
     if s.get("VICTORY_MFG_UNLOCKER").is_some_and(|v| v == "1")
@@ -598,23 +662,22 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     // The first start of this victory.exe (no mark for its bytes yet): the game plays a little
     // and starts again by itself (crates\victory-gpu\src\host\menu.rs, `warmup`), since a new
     // exe's first run stays at about 14 fps. `--set VICTORY_WARMUP_RESTART=0`: not done.
+    // Only with DLSS Frame Generation ready or on: its swap chain (Streamline's) is what held
+    // a first run at 14 fps (#515, #574); without it a first run plays at full speed.
     if !s.contains_key("VICTORY_WARMUP_RESTART")
+        && s.get("VICTORY_FRAMEGEN").is_some_and(|v| v == "1")
         && let Some(mark) = warmup_mark(&home, &program)
         && !mark.exists()
     {
-        println!("First start of this version of victory.exe: the game restarts by itself after {WARMUP_SECONDS} seconds,");
-        println!("once (a new version's first run otherwise stays at about 14 fps).");
+        println!("First start of this version of victory.exe: the game restarts by itself {WARMUP_SECONDS} seconds after it");
+        println!("loads into the game (press A at the title screen), once (a new version's first run otherwise stays at about 14 fps).");
         s.insert("VICTORY_WARMUP_RESTART".to_owned(), WARMUP_SECONDS.to_string());
         s.insert("VICTORY_WARMUP_MARK".to_owned(), mark.to_string_lossy().into_owned());
     }
-    // Where the menu saves, and how it starts the title again (`--set` is not carried over).
-    let quoted = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "''"));
+    // Where the menu saves, and how it starts the title again: with this start's options.
     s.insert("VICTORY_MENU_FILE".to_owned(), menu_file.to_string_lossy().into_owned());
     s.insert("VICTORY_MENU_PLAY".to_owned(), program.to_string_lossy().into_owned());
-    s.insert(
-        "VICTORY_MENU_ARGS".to_owned(),
-        format!("play {}{}", quoted(&exe), if o.no_framegen_ready { " --no-framegen-ready" } else { "" }),
-    );
+    s.insert("VICTORY_MENU_ARGS".to_owned(), restart_args(o, &exe));
     let log = log_file(&home.join("logs"))?;
     let console = if series_s { "series-s" } else { "series-x" };
     let line: Vec<String> = s.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -645,6 +708,35 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     Ok(Ready { exe, series_s })
 }
 
+/// A PowerShell word holding `text` as it is.
+fn quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// The arguments the warm-up and the F1 menu's restarts start the title
+/// again with (`VICTORY_MENU_ARGS`, after `& '<victory.exe>'` in PowerShell):
+/// this start's own options, so those given on the command line (`--series-s`,
+/// `--dlss`, `--framegen`, `--set` ...) are kept. Values saved in the F1 menu
+/// still win over them, as at every start. A preload is not asked again.
+fn restart_args(o: &Play, exe: &Path) -> String {
+    let mut args = vec!["play".to_owned(), quoted(&exe.to_string_lossy())];
+    if o.series_s {
+        args.push("--series-s".to_owned());
+    }
+    args.extend(["--res".to_owned(), quoted(&o.res), "--dlss".to_owned(), quoted(&o.dlss)]);
+    if let Some(x) = o.framegen {
+        args.extend(["--framegen".to_owned(), x.to_string()]);
+    }
+    if o.framegen_ready && !o.no_framegen_ready {
+        args.push("--framegen-ready".to_owned());
+    }
+    args.extend(["--fg-type".to_owned(), quoted(&o.fg_type), "--fps".to_owned(), o.fps.to_string()]);
+    for more in &o.more {
+        args.extend(["--set".to_owned(), quoted(more)]);
+    }
+    args.join(" ")
+}
+
 /// After a start that went wrong in a window of its own (a double click):
 /// the text stays until a key is pressed.
 pub(crate) fn hold_window() {
@@ -666,12 +758,58 @@ mod tests {
             res: "1440".to_owned(),
             dlss: "quality".to_owned(),
             framegen: None,
+            framegen_ready: false,
             no_framegen_ready: false,
             fg_type: "auto".to_owned(),
             fps: 1000,
             more: Vec::new(),
             preload: false,
         }
+    }
+
+    #[test]
+    fn a_restart_keeps_the_options_of_the_command_line() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Line {
+            #[command(flatten)]
+            play: Play,
+        }
+        let exe = Path::new(r"D:\Titles\The Title's\title.exe");
+        let first = [
+            "x", "--series-s", "--dlss", "performance", "--framegen", "2", "--fg-type", "dlss", "--set", "VICTORY_MFG_UNLOCKER=1", "--set",
+            "VICTORY_X=a b", "--preload",
+        ];
+        let o = Line::try_parse_from(first).unwrap().play;
+        let args = restart_args(&o, exe);
+        assert_eq!(
+            args,
+            r"play 'D:\Titles\The Title''s\title.exe' --series-s --res '1440' --dlss 'performance' --framegen 2 --fg-type 'dlss' --fps 1000 --set 'VICTORY_MFG_UNLOCKER=1' --set 'VICTORY_X=a b'"
+        );
+        // Read back as PowerShell reads it: the same options again, and no preload.
+        let mut words: Vec<String> = Vec::new();
+        let (mut word, mut open, mut chars) = (String::new(), false, args.chars().peekable());
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' if open && chars.peek() == Some(&'\'') => {
+                    word.push('\'');
+                    chars.next();
+                }
+                '\'' => open = !open,
+                ' ' if !open => words.push(std::mem::take(&mut word)),
+                _ => word.push(c),
+            }
+        }
+        words.push(word);
+        assert_eq!(words[1], exe.to_string_lossy());
+        let again = Line::try_parse_from(std::iter::once("x".to_owned()).chain(words.into_iter().skip(2))).unwrap().play;
+        assert_eq!(restart_args(&again, exe), args);
+        assert!(o.preload && !again.preload);
+        let plain = Line::try_parse_from(["x"]).unwrap().play;
+        assert_eq!(
+            restart_args(&plain, exe),
+            r"play 'D:\Titles\The Title''s\title.exe' --res '1440' --dlss 'quality' --fg-type 'auto' --fps 1000"
+        );
     }
 
     #[test]
@@ -686,7 +824,14 @@ mod tests {
         assert_eq!(get("VICTORY_NATIVE_1440P"), Some("1"));
         assert_eq!((get("VICTORY_DLSS"), get("VICTORY_DLSS_MODE")), (Some("1"), Some("quality")));
         assert_eq!(get("VICTORY_STREAMLINE_DIR"), Some(r"C:\nvidia"));
-        // frame generation ready, off, with a little memory held back for it
+        // frame generation off and not made ready: no swap chain of Streamline's, no memory held back
+        assert!(!s.contains_key("VICTORY_FRAMEGEN") && !s.contains_key("VICTORY_FRAMEGEN_X"));
+        assert!(!s.contains_key("VICTORY_FSR_FRAMEGEN") && !s.contains_key("VICTORY_TEXTURE_ROOM_PERCENT"));
+        // ready, off, with a little memory held back for it, when asked
+        let mut o = options();
+        o.framegen_ready = true;
+        let (s, _) = settings(&o, &[], Some(dir));
+        let get = |k: &str| s.get(k).map(String::as_str);
         assert_eq!((get("VICTORY_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("0")));
         assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
         assert_eq!(get("VICTORY_FRAME_INTERVAL_US"), Some("1000"));
@@ -700,10 +845,16 @@ mod tests {
         let get = |k: &str| s.get(k).map(String::as_str);
         assert!(!s.contains_key("VICTORY_DLSS") && !s.contains_key("VICTORY_FRAMEGEN"));
         assert_eq!(get("VICTORY_MENU_DLSS"), Some("off"));
-        // FSR 3 frame generation is made ready instead (the layer says whether it can run)
-        assert_eq!((get("VICTORY_FSR_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("0")));
-        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
+        // nor FSR 3 frame generation, off and not made ready
+        assert!(!s.contains_key("VICTORY_FSR_FRAMEGEN") && !s.contains_key("VICTORY_FRAMEGEN_X"));
+        assert!(!s.contains_key("VICTORY_TEXTURE_ROOM_PERCENT"));
         assert_eq!(get("VICTORY_MENU_FG_TYPE"), Some("auto"));
+        // nor when asked: made ready without DLSS, the title's own FidelityFX check stopped the
+        // game (#331, #459)
+        let mut o = options();
+        o.framegen_ready = true;
+        let (s, _) = settings(&o, &[], None);
+        assert!(!s.contains_key("VICTORY_FSR_FRAMEGEN") && !s.contains_key("VICTORY_FRAMEGEN_X"));
     }
 
     #[test]
@@ -744,6 +895,37 @@ mod tests {
     }
 
     #[test]
+    fn the_series_s_picture_sets_the_scene() {
+        let get = |s: &BTreeMap<String, String>, k: &str| s.get(k).cloned();
+        let s_menu = |more: &str| parse_menu(&format!("VICTORY_MENU_CONSOLE=series-s\r\n{more}"));
+        // not saved yet: the DLSS mode's size, and the mode as it was
+        let (s, _) = settings(&options(), &s_menu("VICTORY_MENU_DLSS=balanced\r\n"), Some(Path::new("x")));
+        assert_eq!(get(&s, "VICTORY_MENU_S_RES").as_deref(), Some("626"));
+        assert_eq!(get(&s, "VICTORY_DLSS_MODE").as_deref(), Some("balanced"));
+        // 540 with DLSS: its performance mode, whatever the DLSS line held
+        let (s, _) = settings(&options(), &s_menu("VICTORY_MENU_DLSS=quality\r\nVICTORY_MENU_S_RES=540\r\n"), Some(Path::new("x")));
+        assert_eq!(get(&s, "VICTORY_DLSS_MODE").as_deref(), Some("performance"));
+        assert_eq!(get(&s, "VICTORY_MENU_DLSS").as_deref(), Some("performance"));
+        assert_eq!(get(&s, "VICTORY_FSR_PATH"), None);
+        // DLAA is 1080
+        let (s, _) = settings(&options(), &s_menu("VICTORY_MENU_DLSS=dlaa\r\n"), Some(Path::new("x")));
+        assert_eq!((get(&s, "VICTORY_DLSS_MODE").as_deref(), get(&s, "VICTORY_MENU_S_RES").as_deref()), (Some("dlaa"), Some("1080")));
+        // without DLSS (off, or no NVIDIA files): the game's 720, never the title's FidelityFX path
+        for (more, dir) in [("VICTORY_MENU_DLSS=off\r\nVICTORY_MENU_S_RES=540\r\n", Some(Path::new("x"))), ("VICTORY_MENU_S_RES=540\r\n", None)] {
+            let (s, _) = settings(&options(), &s_menu(more), dir);
+            assert_eq!((get(&s, "VICTORY_DLSS"), get(&s, "VICTORY_FSR_PATH"), get(&s, "VICTORY_DLSS_MODE")), (None, None, None));
+            assert_eq!(get(&s, "VICTORY_MENU_S_RES").as_deref(), Some("720"));
+        }
+        // 720 without DLSS: the game as it is
+        let (s, _) = settings(&options(), &s_menu("VICTORY_MENU_DLSS=off\r\nVICTORY_MENU_S_RES=720\r\n"), None);
+        assert_eq!((get(&s, "VICTORY_FSR_PATH"), get(&s, "VICTORY_DLSS_MODE")), (None, None));
+        // Series X: the Series S size changes nothing
+        let (s, series_s) = settings(&options(), &parse_menu("VICTORY_MENU_S_RES=540\r\n"), Some(Path::new("x")));
+        assert!(!series_s);
+        assert_eq!((get(&s, "VICTORY_DLSS_MODE").as_deref(), get(&s, "VICTORY_FSR_PATH")), (Some("quality"), None));
+    }
+
+    #[test]
     fn options_and_set_are_applied() {
         let mut o = options();
         (o.res, o.dlss, o.framegen, o.fps) = ("1080to1440".to_owned(), "off".to_owned(), Some(4), 30);
@@ -757,6 +939,30 @@ mod tests {
         assert_eq!((get("VICTORY_AMBIENT"), get("VICTORY_NEW")), (Some("0"), Some("2")));
     }
 
+    /// Each resolution, from the option or saved by the menu, sets its one switch (none on
+    /// Series S); 1080 is the only one that sets `VICTORY_OUTPUT_1080P`.
+    #[test]
+    fn each_resolution_sets_its_switch() {
+        const SWITCHES: [&str; 3] = ["VICTORY_OUTPUT_1080P", "VICTORY_NATIVE_1440P", "VICTORY_RENDER_1080P"];
+        let on = |s: &BTreeMap<String, String>| SWITCHES.iter().filter(|k| s.get(**k).is_some_and(|v| v == "1")).copied().collect::<Vec<_>>();
+        let expected: [(&str, &[&str]); 4] = [
+            ("1440", &["VICTORY_NATIVE_1440P"]),
+            ("1080", &["VICTORY_OUTPUT_1080P"]),
+            ("1080to1440", &["VICTORY_RENDER_1080P"]),
+            ("4k", &[]),
+        ];
+        assert_eq!(RESOLUTIONS, expected.map(|(r, _)| r));
+        for (res, switches) in expected {
+            let mut o = options();
+            o.res = res.to_owned();
+            assert_eq!(on(&settings(&o, &[], Some(Path::new("x"))).0), switches, "--res {res}");
+            let saved = parse_menu(&format!("VICTORY_MENU_RES={res}\r\n"));
+            assert_eq!(on(&settings(&options(), &saved, Some(Path::new("x"))).0), switches, "saved {res}");
+            let s = parse_menu(&format!("VICTORY_MENU_RES={res}\r\nVICTORY_MENU_CONSOLE=series-s\r\n"));
+            assert!(on(&settings(&options(), &s, Some(Path::new("x"))).0).is_empty(), "Series S, {res}");
+        }
+    }
+
     /// AMD's files are offered only to cards without DLSS Frame Generation (or FSR 3 chosen).
     #[test]
     fn cards_with_dlss_frame_generation() {
@@ -764,6 +970,9 @@ mod tests {
         assert!(fg("NVIDIA GeForce RTX 5070") && fg("NVIDIA GeForce RTX 4070 SUPER") && fg("NVIDIA GeForce RTX 5090 Laptop GPU"));
         assert!(!fg("NVIDIA GeForce RTX 3080 Ti") && !fg("NVIDIA GeForce RTX 2060") && !fg("NVIDIA GeForce GTX 1080"));
         assert!(!fg("AMD Radeon RX 7900 XTX") && !fg("Intel(R) Arc(TM) A770 Graphics") && !fg(""));
+        // Workstation cards (#312): Ada and Blackwell have it, Turing and Ampere not.
+        assert!(fg("NVIDIA RTX PRO 4000 Blackwell SFF Edition") && fg("NVIDIA RTX 2000 Ada Generation") && fg("NVIDIA RTX 6000 Ada Generation"));
+        assert!(!fg("Quadro RTX 5000") && !fg("NVIDIA Quadro RTX 4000") && !fg("NVIDIA RTX A4500") && !fg("NVIDIA RTX A2000 12GB"));
     }
 
     /// MFG Unlocker is offered only to RTX 20 and 30 cards.
@@ -787,6 +996,14 @@ mod tests {
         assert_eq!(executable_named("<Executable Name=\"..\\up.exe\"/>"), None);
         assert_eq!(executable_named("<Executable Name=\"\"/>"), None);
         assert_eq!(executable_named("<ExecutableList></ExecutableList>"), None);
+    }
+
+    /// Settings read again after `prepare` clears the others survive it.
+    #[test]
+    fn paths_and_the_named_card_are_kept() {
+        for k in ["VICTORY_HOME", "VICTORY_ADAPTER", "VICTORY_CACHE_DIR", "VICTORY_DATA_DIR"] {
+            assert!(KEPT.contains(&k), "{k}");
+        }
     }
 
     #[test]

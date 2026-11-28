@@ -213,7 +213,12 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            // As far as it goes: an unfinished version is never read, and a
+            // file another program holds (a virus scanner, a backup) must
+            // not make the container unreadable.
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::debug!(dir = %entry.path().display(), %e, "an unfinished save version stays for now");
+            }
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -230,8 +235,16 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let Some((name, display, blobs)) = load(&version)? else {
             continue;
         };
+        // Older versions go as far as they can. The newest readable one is
+        // the container whatever is left below it, and a file another
+        // program holds without letting it be deleted fails the removal:
+        // returning that error made every save fail for as long as it was
+        // held (while a virus scanner or a backup had it open).
         for old in &committed[at + 1..] {
-            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+            let path = dir.join(format!("v{old}"));
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                tracing::info!(dir = %path.display(), %e, "an older save version stays for now; it goes at a later save");
+            }
         }
         return Ok(Some(Version {
             dir: version,
@@ -405,11 +418,11 @@ impl Provider {
     /// folder itself, where the other configurations' folders are.
     fn open(saves: &Path, config: Option<&str>) -> Result<Provider, HRESULT> {
         let config = config.filter(|c| !c.is_empty()).unwrap_or("default");
-        let root = saves
-            .join(format!("{:016X}", xuser::XUID))
-            .join(file_name(config));
+        let user = saves.join(format!("{:016X}", xuser::XUID));
+        let root = user.join(file_name(config));
         std::fs::create_dir_all(&root).map_err(|_| NO_ACCESS)?;
         let _saves = saves_lock();
+        adopt(&user.join(crate::save_share::UNPLACED), &root);
         containers(&root); // converts old containers now
         Ok(Provider { root })
     }
@@ -425,6 +438,78 @@ impl Provider {
             dir: container_dir(&self.root, name),
         }
     }
+}
+
+/// Containers an import left for a configuration not known when it was staged
+/// (`save_share::UNPLACED`, beside the configurations' folders): moved into
+/// `root`, the configuration the title opens, each in place of one of its name
+/// (an import replaces the save). Under the saves lock.
+fn adopt(unplaced: &Path, root: &Path) {
+    adopt_with(unplaced, root, |from, to| std::fs::rename(from, to));
+}
+
+/// [`adopt`], moving folders with `rename`. Neither copy is ever lost: the
+/// player's container is first moved aside (`<configuration>.aside`, beside
+/// the configuration's own folder, so each configuration settles only its
+/// own), the import is moved in, and only then is the aside copy
+/// deleted; an import that does not move puts the aside copy back and waits in
+/// the holding folder for the next open. The holding folder goes only once
+/// every entry has moved. An open that stopped half way is settled first.
+fn adopt_with(unplaced: &Path, root: &Path, rename: impl Fn(&Path, &Path) -> std::io::Result<()>) {
+    let aside = aside_of(root);
+    settle_aside(&aside, root, &rename);
+    let Ok(entries) = std::fs::read_dir(unplaced) else { return };
+    for entry in entries.flatten() {
+        let to = root.join(entry.file_name());
+        let kept = aside.join(entry.file_name());
+        if to.exists()
+            && let Err(e) = std::fs::create_dir_all(&aside).and_then(|()| rename(&to, &kept))
+        {
+            tracing::warn!(error = %e, "a save container an import replaces could not be moved aside: the import waits for the next start");
+            continue;
+        }
+        match rename(&entry.path(), &to) {
+            Ok(()) => {
+                if kept.exists() {
+                    let _ = std::fs::remove_dir_all(&kept);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "an imported save container could not be moved into the title's saves: it waits for the next start");
+                if kept.exists()
+                    && let Err(e) = rename(&kept, &to)
+                {
+                    tracing::warn!(error = %e, "the save container it was to replace could not be put back: it is kept beside the saves, and put back at the next start");
+                }
+            }
+        }
+    }
+    // Only folders left empty go (`remove_dir` never deletes what is in one).
+    let _ = std::fs::remove_dir(unplaced);
+    let _ = std::fs::remove_dir(&aside);
+}
+
+/// Where [`adopt_with`] moves `root`'s containers aside: `<configuration>.aside`
+/// beside it (a configuration's folder has no dot in its name).
+fn aside_of(root: &Path) -> PathBuf {
+    let mut name = root.file_name().unwrap_or_default().to_os_string();
+    name.push(".aside");
+    root.with_file_name(name)
+}
+
+/// What an earlier adopt left aside: put back where nothing took its place,
+/// deleted where the import did.
+fn settle_aside(aside: &Path, root: &Path, rename: &impl Fn(&Path, &Path) -> std::io::Result<()>) {
+    let Ok(entries) = std::fs::read_dir(aside) else { return };
+    for entry in entries.flatten() {
+        let to = root.join(entry.file_name());
+        if to.exists() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        } else if let Err(e) = rename(&entry.path(), &to) {
+            tracing::warn!(error = %e, "a save container moved aside could not be put back yet");
+        }
+    }
+    let _ = std::fs::remove_dir(aside);
 }
 
 /// Quota left under a provider's root, or less if the host disk is fuller.
@@ -1018,6 +1103,52 @@ mod tests {
         assert_eq!(no_room(mb, 0, 0, mb), None);
     }
 
+    /// A file of an older version held by another program (a virus scanner,
+    /// a backup copy in progress) keeps that version from being removed.
+    /// The saves after it must not fail for that: the newest readable
+    /// version is the container whatever is left below it, and what is left
+    /// goes at a later save.
+    #[cfg(windows)]
+    #[test]
+    fn an_older_version_that_cannot_be_removed_does_not_fail_the_saves_after_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = container_dir(root.path(), "Slot");
+        let versions = || {
+            let entries = std::fs::read_dir(&dir).unwrap().flatten();
+            entries
+                .filter(|e| e.file_name().to_string_lossy().starts_with('v'))
+                .count()
+        };
+        assert_eq!(update(root.path(), "one", &[("a", Some("first a"))]), S_OK);
+        let first = current(&dir).unwrap().unwrap();
+        // Opened with no sharing: nobody else can delete it while it is held.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(first.blob(0))
+            .unwrap();
+        assert_eq!(update(root.path(), "two", &[("a", Some("second a"))]), S_OK);
+        assert_eq!(
+            state(root.path()),
+            Some(("two".into(), vec![("a".into(), "second a".into())]))
+        );
+        assert_eq!(update(root.path(), "three", &[("a", Some("third a"))]), S_OK);
+        assert_eq!(
+            state(root.path()),
+            Some(("three".into(), vec![("a".into(), "third a".into())]))
+        );
+        assert!(first.blob(0).exists(), "the held file is still there");
+        // Let go of: the next look at the container removes what was left.
+        drop(held);
+        assert_eq!(update(root.path(), "four", &[("a", Some("fourth a"))]), S_OK);
+        assert_eq!(
+            state(root.path()),
+            Some(("four".into(), vec![("a".into(), "fourth a".into())]))
+        );
+        assert_eq!(versions(), 1);
+    }
+
     fn update(root: &Path, display: &str, changes: &[(&str, Option<&str>)]) -> HRESULT {
         Update {
             name: "Slot".into(),
@@ -1191,25 +1322,105 @@ mod tests {
     fn the_old_layout_moves_over() {
         let saves = tempfile::tempdir().unwrap();
         let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
-        let old = root.join("Player");
+        let old = root.join("Journey");
         std::fs::create_dir_all(&old).unwrap();
-        std::fs::write(old.join("Save%20Game%20Data"), b"data").unwrap();
-        std::fs::write(old.join("Save%20Game%20Header"), b"header").unwrap();
-        std::fs::write(old.join("Save%20Game%20Data.new"), b"half").unwrap();
+        std::fs::write(old.join("Trail%20Notes"), b"data").unwrap();
+        std::fs::write(old.join("Trail%20Summary"), b"header").unwrap();
+        std::fs::write(old.join("Trail%20Notes.new"), b"half").unwrap();
         std::fs::write(old.join(".display"), b"Chapter 1").unwrap();
         let p = Provider::open(saves.path(), Some("scid")).unwrap();
         assert!(!old.exists());
-        let c = p.container("Player");
+        let c = p.container("Journey");
         let blobs = read(&c, None).unwrap();
         assert_eq!(
             blobs,
             [
-                ("Save Game Data".into(), b"data".to_vec()),
-                ("Save Game Header".into(), b"header".to_vec())
+                ("Trail Notes".into(), b"data".to_vec()),
+                ("Trail Summary".into(), b"header".to_vec())
             ]
         );
-        let v = current_named(&c.dir, "Player").unwrap().unwrap();
+        let v = current_named(&c.dir, "Journey").unwrap().unwrap();
         assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
+    }
+
+    /// Containers an import left before the title named its configuration
+    /// go into the configuration it opens, over ones of the same name.
+    #[test]
+    fn containers_left_for_a_configuration_go_into_the_one_opened() {
+        let put = |root: &Path, name: &str, data: &str| {
+            let dir = container_dir(root, name);
+            let changes = vec![("a".to_owned(), Some(data.as_bytes().to_vec()))];
+            Update { name: name.into(), dir, display: None, changes }.submit()
+        };
+        let saves = tempfile::tempdir().unwrap();
+        let user = saves.path().join(format!("{:016X}", xuser::XUID));
+        let left = user.join(crate::save_share::UNPLACED);
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert_eq!(put(&p.root, "one", "old"), S_OK);
+        assert_eq!(put(&p.root, "two", "kept"), S_OK);
+        // An import's container for "one", left beside the configurations.
+        assert_eq!(put(&left, "one", "imported"), S_OK);
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(!left.exists());
+        let blob = |name: &str| read(&p.container(name), None).unwrap();
+        assert_eq!(blob("one"), [("a".into(), b"imported".to_vec())]);
+        assert_eq!(blob("two"), [("a".into(), b"kept".to_vec())]);
+    }
+
+    /// An import that cannot be moved in loses neither copy: the player's
+    /// container is back in place, the import waits in the holding folder,
+    /// and the next open that can move it does.
+    #[test]
+    fn a_failed_adoption_loses_neither_copy() {
+        let put = |root: &Path, name: &str, data: &str| {
+            let dir = container_dir(root, name);
+            let changes = vec![("a".to_owned(), Some(data.as_bytes().to_vec()))];
+            Update { name: name.into(), dir, display: None, changes }.submit()
+        };
+        let saves = tempfile::tempdir().unwrap();
+        let user = saves.path().join(format!("{:016X}", xuser::XUID));
+        let left = user.join(crate::save_share::UNPLACED);
+        let root = Provider::open(saves.path(), Some("scid")).unwrap().root;
+        assert_eq!(put(&root, "one", "mine"), S_OK);
+        assert_eq!(put(&left, "one", "imported"), S_OK);
+        assert_eq!(put(&left, "two", "imported too"), S_OK);
+        let blob = |root: &Path, name: &str| {
+            read(&Provider { root: root.into() }.container(name), None).unwrap().first().map(|b| b.1.clone()).unwrap_or_default()
+        };
+        // Every move out of the holding folder fails; moves aside and back work.
+        let failing = |from: &Path, to: &Path| {
+            if from.starts_with(&left) {
+                Err(std::io::Error::other("refused for the test"))
+            } else {
+                std::fs::rename(from, to)
+            }
+        };
+        adopt_with(&left, &root, failing);
+        assert_eq!(blob(&root, "one"), b"mine", "the player's container is back");
+        assert_eq!(blob(&left, "one"), b"imported", "the import waits");
+        assert_eq!(blob(&left, "two"), b"imported too");
+        assert!(!aside_of(&root).exists());
+        // The next open that can move them does.
+        adopt(&left, &root);
+        assert_eq!(blob(&root, "one"), b"imported");
+        assert_eq!(blob(&root, "two"), b"imported too");
+        assert!(!left.exists() && !aside_of(&root).exists());
+        // Half way, as if the process had stopped after moving this configuration's container
+        // aside. Another configuration, with a container of the same name, opens first: it
+        // neither takes the aside copy nor deletes it. Then this one opens and puts it back.
+        let aside = aside_of(&root);
+        std::fs::create_dir_all(&aside).unwrap();
+        let one = container_dir(&root, "one");
+        std::fs::rename(&one, aside.join(one.file_name().unwrap())).unwrap();
+        let other = Provider::open(saves.path(), Some("other")).unwrap().root;
+        assert_eq!(put(&other, "one", "other's"), S_OK);
+        drop(Provider::open(saves.path(), Some("other")).unwrap());
+        assert_eq!(blob(&other, "one"), b"other's");
+        assert!(aside.join(one.file_name().unwrap()).is_dir(), "the aside copy is this configuration's to settle");
+        drop(Provider::open(saves.path(), Some("scid")).unwrap());
+        assert_eq!(blob(&root, "one"), b"imported");
+        assert_eq!(blob(&other, "one"), b"other's");
+        assert!(!aside.exists());
     }
 
     /// An empty configuration id names none. As a folder name it would be

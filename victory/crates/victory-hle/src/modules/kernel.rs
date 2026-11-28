@@ -85,7 +85,8 @@ fn title_path(module: *mut c_void) -> Option<String> {
 
 /// `GetModuleFileName`'s contract: copy with a NUL; if it does not fit,
 /// truncate to the buffer, report `ERROR_INSUFFICIENT_BUFFER` and return
-/// the buffer size.
+/// the buffer size. A name that fits clears the last error, as the host
+/// does: titles tell a truncated name from a whole one by it.
 fn copy_truncated<T: Copy + Default>(text: &[T], out: &mut [T]) -> u32 {
     let Some(room) = out.len().checked_sub(1) else {
         host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
@@ -98,8 +99,11 @@ fn copy_truncated<T: Copy + Default>(text: &[T], out: &mut [T]) -> u32 {
         host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
         return out.len() as u32;
     }
+    host::set_last_error(ERROR_SUCCESS);
     n as u32
 }
+
+const ERROR_SUCCESS: u32 = 0;
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
@@ -413,7 +417,7 @@ pub extern "C" fn __p___argv() -> *mut *mut *mut c_char {
 /// and by our own workers (sixteen when pipelines are made): with every
 /// one of them busy such a thread ran once in four seconds or so, when the
 /// host's scheduler took pity, and the loading that waits for it with it
-/// (run stream-3: loads seen to be done 1.1 s late on average, 4.8 s at
+/// (a measured run: loads seen to be done 1.1 s late on average, 4.8 s at
 /// worst). `VICTORY_TITLE_PRIORITIES=0`: as the title sets them.
 fn title_priority(asked: i32) -> i32 {
     const IDLE: i32 = -15;
@@ -718,6 +722,34 @@ mod tests {
         let mut small = [0u8; 4];
         assert_eq!(GetModuleFileNameA(module, small.as_mut_ptr(), 4), 4);
         assert_eq!(&small, &[b'C', b':', b'\\', 0]);
+    }
+
+    /// A name that fits clears the last error, as the host does: titles tell
+    /// a truncated name from a whole one by it.
+    #[cfg(windows)]
+    #[test]
+    fn a_module_name_that_fits_clears_the_last_error() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // SAFETY: this thread's last error.
+        let last_error = || unsafe { GetLastError() };
+        // SAFETY: sets this thread's last error.
+        let stale = || unsafe { SetLastError(ERROR_INSUFFICIENT_BUFFER) };
+        let base = 0x7200_0000_0000;
+        runtime::set_image_path(base, std::path::Path::new(r"C:\title\game.exe"));
+        let module = base as *mut c_void;
+        let (mut wide, mut narrow) = ([0u16; 512], [0u8; 512]);
+        stale();
+        assert_eq!(GetModuleFileNameW(module, wide.as_mut_ptr(), 512), 17);
+        assert_eq!(last_error(), 0, "a title image, wide");
+        stale();
+        assert_eq!(GetModuleFileNameA(module, narrow.as_mut_ptr(), 512), 17);
+        assert_eq!(last_error(), 0, "a title image, narrow");
+        // An exact fit is whole too (17 characters and the NUL).
+        stale();
+        assert_eq!(GetModuleFileNameA(module, narrow.as_mut_ptr(), 18), 17);
+        assert_eq!(last_error(), 0);
+        assert_eq!(GetModuleFileNameA(module, narrow.as_mut_ptr(), 17), 17);
+        assert_eq!(last_error(), ERROR_INSUFFICIENT_BUFFER);
     }
 
     /// The title's arguments come right after the program, and the list ends

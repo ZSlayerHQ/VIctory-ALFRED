@@ -190,7 +190,7 @@ fn early_budgets() -> (u64, u64) {
 /// landed, and at one uploaded whole a few frames later again, for a title
 /// that fills memory unnoticed: a bake in between took the bytes from before
 /// (another texture's), and what it bakes stays: coloured specks all over
-/// the waitress's face for the whole diner scene (run n01), none in other
+/// the waitress's face for the whole diner scene (a measured run), none in other
 /// runs. So the pass ahead of a bake takes those slots too, and its uploads
 /// wait for title memory that is being remapped (`crate::texture` `BAKING`).
 fn bake_exact() -> bool {
@@ -341,6 +341,40 @@ pub(crate) const BAKE_PIXEL_SHADERS: [&str; 7] = [
 /// permutations beyond `BAKE_PIXEL_SHADERS`.
 const BAKE_GEOMETRY_SHADERS: [&str; 2] = ["089d6271be6650ef", "d4111a6e6ea49d91"];
 
+/// Whether a shader of hash `hash` makes its pipeline one of the title's
+/// bakes: a known bake pixel shader or bake geometry stage.
+pub(crate) fn bake_shader(hash: &str) -> bool {
+    BAKE_PIXEL_SHADERS.contains(&hash) || BAKE_GEOMETRY_SHADERS.contains(&hash)
+}
+
+/// Whether a draw into `targets` with depth target `depth` (0: none) is one
+/// of the title's bakes by its shape alone: no depth, four or more colour
+/// targets, the first square and 512 texels wide or more (`size`: a
+/// target's width and height). So permutations no list names are found too.
+fn bake_targets(depth: usize, targets: &[usize], size: impl FnOnce(usize) -> Option<(u64, u32)>) -> bool {
+    depth == 0
+        && targets.len() >= 4
+        && targets
+            .first()
+            .and_then(|&t| size(t))
+            .is_some_and(|(w, h)| w >= 512 && w == u64::from(h))
+}
+
+/// Whether an indirect execution of `kind` (PC numbering: 2 dispatch, 10 mesh
+/// dispatch, the others draws) waits for a bake's pipeline: not a dispatch,
+/// and not a mesh draw while `mesh_test` ([`mesh_test`]) skips them all,
+/// as the direct mesh path.
+fn indirect_bake_wait(kind: u32, mesh_test: u8) -> bool {
+    const DISPATCH: u32 = 2;
+    const MESH: u32 = 10;
+    kind != DISPATCH && !(kind == MESH && mesh_test == 1)
+}
+
+/// A title texture's width and height.
+fn target_size(t: usize) -> Option<(u64, u32)> {
+    crate::resource::texture_kind(t as This).map(|(w, h, _)| (w, h))
+}
+
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -452,7 +486,7 @@ fn windows() -> bool {
 /// dispatches the title runs side by side (its tile classes, up to 92 at a
 /// time) are not held up by waits of ours. Off: whether the title has ways
 /// to wait that do not pass through its lists' methods is not known.
-fn batches() -> u8 {
+pub(crate) fn batches() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
         Ok("0") => 0,
@@ -706,7 +740,7 @@ const HEAP_ROUND: u64 = 16;
 /// them at every sixteenth pass, as before).
 ///
 /// All at once was some 115 ms on a thread that records the frame, every
-/// sixteenth frame (72,000 slots; run record-1: 11 ms a pass in the lines
+/// sixteenth frame (72,000 slots; a measured run: 11 ms a pass in the lines
 /// without such a pass, 22 in those of ten frames with one). A slot is
 /// looked at as often as before.
 fn heap_spread() -> bool {
@@ -943,7 +977,7 @@ fn held_of(view: &View) -> Option<(*const u8, usize, crate::texture::Digest)> {
         View::Placed(false, resource, desc) if resource[0] != 1 => {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let texture = crate::resource::texture_at(address, resource)?;
-            crate::texture::held_digest(texture, crate::resource::first_mip(desc))
+            crate::texture::held_digest(texture, crate::resource::first_mip(resource, desc))
         }
         View::Shader(object, _) => crate::texture::held_digest(*object as This, 0),
         _ => None,
@@ -1820,6 +1854,11 @@ impl State {
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
         }
+        // The first group of a dispatch run whole; one in parts sets it for
+        // each part (`group_base`).
+        if kind == victory_shader::emit::USER_GROUP_BASE {
+            return 0;
+        }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::View(address)) if kind == USER_ROOT_ADDRESS => address as u32,
@@ -2158,7 +2197,7 @@ impl State {
                 } else {
                     crate::memory::Use::Reads
                 };
-                let Some(ready) = self.memory_ready(list, &t, compute, use_) else {
+                let Some(ready) = self.memory_ready(list, t, compute, use_) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -2734,7 +2773,7 @@ impl State {
                         let texture = crate::resource::host_resource(resource);
                         let title_fills = texture.is_some_and(crate::texture::title_written);
                         let first = match (&placed, &view) {
-                            (Some(_), View::Placed(_, _, desc)) => crate::resource::first_mip(desc),
+                            (Some(_), View::Placed(_, resource, desc)) => crate::resource::first_mip(resource, desc),
                             _ => 0,
                         };
                         if let (Some(sync), Some(copy)) = (sync.as_deref_mut(), crate::resource::host_copy(resource)) {
@@ -2792,19 +2831,20 @@ impl State {
     /// (`>= 512x512`) so unseen NPC/head/clothing shader permutations never
     /// bake `neutral()` or `null` stand-ins into permanent ped textures.
     fn is_bake_draw(&self, p: &HostPipeline) -> bool {
-        if p.stages.iter().any(|s| {
-            let h = s.shader.hash.as_str();
-            BAKE_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
-        }) {
-            return true;
+        p.stages.iter().any(|s| bake_shader(&s.shader.hash)) || bake_targets(self.depth, &self.targets, target_size)
+    }
+
+    /// Before a draw: if it is one of the title's bakes (by its title
+    /// pipeline's shaders, or by its targets as [`State::is_bake_draw`]) and
+    /// its host pipeline is not made yet, waits for that pipeline
+    /// (`crate::pipeline::wait_if_bake`), so the draw is recorded rather than
+    /// dropped. `VICTORY_BAKE_WAIT=0`: not (dropped as before).
+    fn wait_if_bake(&self) {
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            return;
         }
-        self.depth == 0
-            && self.targets.len() >= 4
-            && self
-                .targets
-                .first()
-                .and_then(|&t| crate::resource::texture_kind(t as This))
-                .is_some_and(|(w, h, _)| w >= 512 && w == u64::from(h))
+        crate::pipeline::wait_if_bake(self.pipeline as This, || bake_targets(self.depth, &self.targets, target_size));
     }
 
     /// The title slots a draw of the title's bake can pick textures from.
@@ -2931,7 +2971,7 @@ impl State {
             let mut first = 0;
             if let View::Placed(false, desc_words, desc) = &view {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                first = crate::resource::first_mip(desc);
+                first = crate::resource::first_mip(desc_words, desc);
                 let len = crate::resource::placed_bytes_from(desc_words, first).unwrap_or(1);
                 if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
                     // Not there (yet): what the console reads there is no
@@ -2953,7 +2993,7 @@ impl State {
             // copies that texture's texels into it on the host, no upload.
             // (Lighting tables read as R9G9B9E5: 6 to 13 sources a run were
             // counted as failed for want of an upload.)
-            if crate::resource::alias_of(resource).is_some() {
+            if crate::resource::is_aliased(resource) {
                 readable(list, ResourceType::Srv, &view);
                 n[if shown { 2 } else { 5 }] += 1;
                 if !shown {
@@ -3424,6 +3464,19 @@ impl State {
             )
         };
 
+        // A frame's runs of the pass (its own and the early ones, not those
+        // before a bake) within `VICTORY_TEXSPK_PASS_MS` together
+        // ([`texspk_pass_ms`]).
+        let frame_pass = !required && !baking && sync.is_none();
+        let span = match texspk_pass_ms() {
+            Some(cap) if frame_pass => {
+                if PASS_FRAME.swap(frame, Ordering::Relaxed) != frame {
+                    PASS_FRAME_NANOS.store(0, Ordering::Relaxed);
+                }
+                pass_span_left(span, cap, PASS_FRAME_NANOS.load(Ordering::Relaxed))
+            }
+            _ => span,
+        };
         let began = std::time::Instant::now();
         HEAP_TEXTURE_REST[7].fetch_add(began.duration_since(entered).as_nanos() as u64, Ordering::Relaxed);
         // The frame's pass, the early one, or the one before a bake.
@@ -3524,7 +3577,7 @@ impl State {
                     // too: what is written there is told of there alone.
                     let elsewhere = crate::inplace::shown_elsewhere(at as usize & !0xffff, (at + len) as usize);
                     let first = heap.handle(index).and_then(crate::descriptor::view).map_or(0, |view| match view {
-                        View::Placed(false, _, desc) => crate::resource::first_mip(&desc),
+                        View::Placed(false, resource, desc) => crate::resource::first_mip(&resource, &desc),
                         _ => 0,
                     });
                     tracing::warn!(
@@ -3548,7 +3601,7 @@ impl State {
             let held = rest(1, || heap.handle(index).and_then(crate::descriptor::view));
             if let Some(View::Placed(false, resource, desc)) = &held {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let first = crate::resource::first_mip(desc);
+                let first = crate::resource::first_mip(resource, desc);
                 let len = crate::resource::placed_bytes_from(resource, first).unwrap_or(1);
                 let mapped = timed(1, || crate::texture::mapped_bytes(address as *const u8, len as usize));
                 if mapped == 0 {
@@ -3708,7 +3761,7 @@ impl State {
             let tabled = rest(6, || crate::texture::is_staged(resource));
             // The host copy holds these very bytes: nothing to upload.
             let first = match (&placed, &view) {
-                (Some(_), Some(View::Placed(_, _, desc))) => crate::resource::first_mip(desc),
+                (Some(_), Some(View::Placed(_, resource, desc))) => crate::resource::first_mip(resource, desc),
                 _ => 0,
             };
             let same = !tabled && timed(2, || crate::texture::unchanged(resource, first));
@@ -3886,6 +3939,9 @@ impl State {
         let took = began.elapsed().as_nanos() as u64;
         HEAP_TEXTURE_NANOS[4].fetch_add(took, Ordering::Relaxed);
         HEAP_TEXTURE_PASSES[3 + kind].fetch_add(took, Ordering::Relaxed);
+        if frame_pass && texspk_pass_ms().is_some() {
+            PASS_FRAME_NANOS.fetch_add(took, Ordering::Relaxed);
+        }
         served
     }
 
@@ -3997,8 +4053,25 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         dispatch_log::note(p, || dispatch_log::direct([x, y, z], size.map(|_| threads)));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        match group_base(p) {
+            Some((param, dword)) if x > crate::indirect::PART => {
+                // More groups in x than the host runs in one dispatch: in
+                // parts, each told the number of its first group.
+                // SAFETY: an open list with everything set; the parameter
+                // and dword are the pipeline's.
+                unsafe {
+                    let mut first = 0u32;
+                    while first < x {
+                        list.list.SetComputeRoot32BitConstant(param, first, dword);
+                        list.list.Dispatch((x - first).min(crate::indirect::PART), y, z);
+                        first = first.saturating_add(crate::indirect::PART);
+                    }
+                    list.list.SetComputeRoot32BitConstant(param, 0, dword);
+                }
+            }
+            // SAFETY: an open list with everything set.
+            _ => unsafe { list.list.Dispatch(x, y, z) },
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -4038,7 +4111,8 @@ impl State {
                 .unwrap_or(u32::MAX),
             _ => 0,
         };
-        // The alpha layer only with VICTORY_AMBIENT_SPECULAR_ALPHA set: its
+        // The alpha layer only with VICTORY_AMBIENT_SPECULAR_ALPHA set (the
+        // upstream's estimate is `=1` or `=estimate`, not its default): its
         // pixels are of transparent surfaces (glass, foam, wakes on water) and
         // the depth read is the opaque one behind them; outdoors on water that
         // is the bottom, the reflected direction is wrong and the estimate
@@ -4098,7 +4172,7 @@ impl State {
         // place (0,464) named #6481's stencil plane.
         // (The description's words are D3D12_SHADER_RESOURCE_VIEW_DESC's: its
         // union starts at word 4, so a 2D view's plane is word 6; word 5 is
-        // its levels, which run final-3 mistook for the plane.)
+        // its levels, which a measured run mistook for the plane.)
         fn stencil_view(view: Option<View>) -> bool {
             let view = view.map(|v| crate::descriptor::host::placed_texture(&v).unwrap_or(v));
             match view {
@@ -4209,6 +4283,56 @@ impl State {
                             d.Width.abs_diff(w * 2) <= 1 && u64::from(d.Height).abs_diff(u64::from(h) * 2) <= 1
                         })
                 })
+            })
+            .or_else(|| {
+                // In the opening's cutscenes the miss program's own places hold no depth of
+                // the picture (its usual place a 1x1 texture; in one run, no stand-in for 80 s,
+                // reflections of the bright sky in dark rooms and on eyes). The picture's
+                // depth is still in the frame's table, at a place this program does not read
+                // (in a capture: place 752 of table 0, the depth plane of the depth-stencil
+                // target; place 448 its stencil plane). So: every place of that table, the
+                // depth-stencil target's depth plane first, then any 32-bit depth of that size.
+                use windows::Win32::Graphics::Dxgi::Common::{
+                    DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_TYPELESS,
+                    DXGI_FORMAT_R32G8X24_TYPELESS,
+                };
+                let (w, h) = image.as_ref().map(|(d, _)| (d.Width, d.Height))?;
+                let Some(Root::Table(table)) = self.roots_ref(true).first() else { return None };
+                let start = match self.ambient_tables.iter().find(|m| m.0 == 0) {
+                    Some(m) => m.1,
+                    None => self.user_value(true, 0, RootType::Table, 0),
+                };
+                let mut plain = None;
+                for offset in (0..1600u32).step_by(8) {
+                    let Some(view) = crate::descriptor::view(table + u64::from(offset) * 4) else { continue };
+                    if stencil_view(Some(view.clone())) {
+                        continue;
+                    }
+                    let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
+                    let View::Shader(resource, _) = view else { continue };
+                    let Some(host) = crate::resource::host_resource(resource as This) else { continue };
+                    // SAFETY: a live resource.
+                    let d = unsafe { host.GetDesc() };
+                    let fits = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                        && d.Width.abs_diff(w * 2) <= 1
+                        && u64::from(d.Height).abs_diff(u64::from(h) * 2) <= 1;
+                    if !fits {
+                        continue;
+                    }
+                    let found = (d, heap.gpu_handle((start + offset * 4) / 32));
+                    match d.Format {
+                        DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT => {
+                            static WIDE: AtomicU64 = AtomicU64::new(0);
+                            if WIDE.fetch_add(1, Ordering::Relaxed) == 0 {
+                                tracing::info!(offset, "reflections stand-in: the picture's depth taken from the frame's table, a place the miss program does not read (counted once)");
+                            }
+                            return Some(found);
+                        }
+                        DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT if plain.is_none() => plain = Some(found),
+                        _ => {}
+                    }
+                }
+                plain
             }),
             Role::Radiance | Role::Air => image,
         };
@@ -4576,6 +4700,9 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        if mesh_test() != 1 {
+            self.wait_if_bake();
+        }
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
@@ -4639,7 +4766,7 @@ impl State {
             let draws: u32 = census.1.values().sum();
             if draws > 0 {
                 let mut rects: Vec<([i32; 4], u32)> = census.1.iter().map(|(r, n)| (*r, *n)).collect();
-                rects.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                rects.sort_unstable_by_key(|r| std::cmp::Reverse(r.1));
                 let scissors: Vec<String> = rects
                     .iter()
                     .take(5)
@@ -5055,6 +5182,7 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        self.wait_if_bake();
         if crate::streamline::hudless_wanted() {
             self.before_shown_target(list, vertices == 3 && instances == 1);
         }
@@ -5123,24 +5251,27 @@ impl State {
         crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
     }
 
-    /// With a 1440p output (`VICTORY_NATIVE_1440P=1`, set by the runner when
-    /// it patches the image for it): the frontend's last triangle is drawn
-    /// in output pixels, but some screens project it against the legacy
-    /// 3840x2160 canvas; for that draw the viewport is the canvas, so that
-    /// the projection lands on the 2560x1440 target. The scissor and target
-    /// stay 1440p. From DexNom's fork (`State::native_frontend_viewport`,
-    /// GPL-3.0-or-later).
+    /// With a patched output (`patched_output`: 1440p or 1080p, set by the
+    /// runner when it patches the image for it): the frontend's last triangle
+    /// is drawn in output pixels, but some screens project it against the
+    /// legacy 3840x2160 canvas; for that draw the viewport is the canvas, so
+    /// that the projection lands on the output-sized target. The scissor and
+    /// target stay the output's size. From DexNom's fork
+    /// (`State::native_frontend_viewport`, GPL-3.0-or-later), there for 1440p.
     fn native_frontend_viewport(&self) -> Option<D3D12_VIEWPORT> {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ENABLED.get_or_init(|| std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1"))
-            || self.depth != 0
-        {
+        static OUTPUT: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
+        let one = |var: &str| std::env::var(var).as_deref() == Ok("1");
+        let &Some((width, height)) = OUTPUT.get_or_init(|| patched_output(one("VICTORY_NATIVE_1440P"), one("VICTORY_OUTPUT_1080P")))
+        else {
+            return None;
+        };
+        if self.depth != 0 {
             return None;
         }
         let [viewport] = self.viewports.as_slice() else {
             return None;
         };
-        if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, 2560.0, 1440.0) {
+        if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, width, height) {
             return None;
         }
         let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
@@ -5171,7 +5302,7 @@ impl State {
             return None;
         }
         static FIRST: std::sync::Once = std::sync::Once::new();
-        FIRST.call_once(|| tracing::info!("the frontend's legacy 4K projection drawn on the 1440p target"));
+        FIRST.call_once(|| tracing::info!("the frontend's legacy 4K projection drawn on the {}p target", height as u32));
         Some(D3D12_VIEWPORT { Width: 3840.0, Height: 2160.0, ..*viewport })
     }
 
@@ -5249,6 +5380,7 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
+        self.wait_if_bake();
         if crate::streamline::hudless_wanted() {
             self.before_shown_target(list, false);
         }
@@ -5379,6 +5511,9 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        if indirect_bake_wait(kind, mesh_test()) {
+            self.wait_if_bake();
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
@@ -5444,8 +5579,21 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // A dispatch that may ask for more groups in x than the host runs,
+        // by a program that takes the number of its first group: clamped
+        // alone into parts (`crate::indirect::bound_split`), not in a batch.
+        // Nothing is looked up or made unless the switch is on and the
+        // program takes the number (`group_base`), and the clamp of parts is
+        // there.
+        let mut parts = if kind == DISPATCH && max == 1 && count.is_none() {
+            group_base(p)
+                .filter(|_| crate::indirect::parts_ready())
+                .and_then(|base| Some((base, host_signature(DISPATCH, crate::indirect::PART_BYTES as u32)?)))
+        } else {
+            None
+        };
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        let batch = if parts.is_none() && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -5514,7 +5662,15 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                let bounded = if parts.is_some() {
+                    // Not in parts after all: clamped for one execution, as
+                    // without the switch.
+                    let (bounded, split) = crate::indirect::bound_split(list, (&args.buffer, offset), (kind, step, records)).unzip();
+                    if split != Some(true) {
+                        parts = None;
+                    }
+                    bounded
+                } else if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
@@ -5547,7 +5703,9 @@ impl State {
             kind,
             pipeline: p.pso.as_raw() as usize,
             single: max == 1 && count.is_none(),
-            alone: crate::pipeline::is_builder(self.pipeline as This) || kind == MESH && mesh_test() == 2,
+            alone: parts.is_some()
+                || crate::pipeline::is_builder(self.pipeline as This)
+                || kind == MESH && mesh_test() == 2,
             clamped,
             epoch: list.epoch(),
             buffer: bounded.as_raw() as usize,
@@ -5616,14 +5774,20 @@ impl State {
                 // SAFETY: an open list with everything set; the scratch buffer and
                 // host copies are kept alive by the list, and the signature is cached.
                 unsafe {
-                    list.list.ExecuteIndirect(
-                        &signature,
-                        max,
-                        &bounded,
-                        at,
-                        counter.as_ref().map(|(s, _)| &s.buffer),
-                        counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-                    )
+                    match &parts {
+                        Some(((param, dword), signature)) => {
+                            let split = crate::indirect::split();
+                            crate::indirect::execute_parts(&list.list, signature, &bounded, (*param, *dword), split);
+                        }
+                        None => list.list.ExecuteIndirect(
+                            &signature,
+                            max,
+                            &bounded,
+                            at,
+                            counter.as_ref().map(|(s, _)| &s.buffer),
+                            counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                        ),
+                    }
                 };
                 if kind == MESH {
                     self.mesh_scissor(list, false);
@@ -5691,7 +5855,7 @@ fn unsettle_indirect(list: &HostList) {
 /// `DispatchX`: the counts are threads (the console's dispatch initiator bit
 /// "use thread dimensions"; DexNom/VIctory bc3cd4b0). Taken for groups, a
 /// rehydration stage of the structure builder ran up to 64 times its threads
-/// and stored over the structures after its own (runs light-1 to light-9).
+/// and stored over the structures after its own (measured runs).
 const THREAD_DIMENSIONS: u32 = 0x20;
 
 /// `VICTORY_LOG_DISPATCH=<hash>[,<hash>...]` (diagnostics builds; off when unset): the
@@ -5761,6 +5925,17 @@ fn thread_dimensions() -> bool {
 /// The groups of `size` threads that hold `threads`.
 fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
     std::array::from_fn(|i| threads[i].div_ceil(size[i]))
+}
+
+/// Where a compute pipeline's program takes the number of its first thread
+/// group (`victory_shader::emit::USER_GROUP_BASE`), while the host runs
+/// dispatches in parts (`crate::indirect::splits`): the root parameter and
+/// the dword in it. `None` with the switch off.
+fn group_base(p: &HostPipeline) -> Option<(u32, u32)> {
+    if !crate::indirect::splits() {
+        return None;
+    }
+    compute_word(p, victory_shader::emit::USER_GROUP_BASE)
 }
 
 /// Where a compute pipeline's user data has a word the host computes: the
@@ -5962,6 +6137,12 @@ impl RecordHash {
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
+    // Of a texture the title placed, the levels the view shows (read off the
+    // title's view, which names the texture's description too).
+    let first = match (&placed, view) {
+        (Some(_), View::Placed(_, resource, desc)) => crate::resource::first_mip(resource, desc),
+        _ => 0,
+    };
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
@@ -5989,18 +6170,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.flags() & 0x7 == 0
             {
                 // (A texture the title writes: no target, depth or unordered
                 // access, `crate::texture::title_written`.)
-                // Of a texture the title placed, the levels the view shows.
-                let first = match (&placed, view) {
-                    (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
-                    _ => 0,
-                };
                 crate::texture::upload_from(list, *resource as This, first);
             }
             // A depth texture shaders also write: what they wrote, first.
@@ -6235,6 +6411,45 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     }
 }
 
+/// The frame [`PASS_FRAME_NANOS`] counts for, and the nanoseconds its runs
+/// of the pass over textures picked by index took ([`texspk_pass_ms`]).
+static PASS_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+static PASS_FRAME_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// The milliseconds a frame's runs of the pass over textures picked by index
+/// take together at most (`VICTORY_TEXSPK_PASS_MS=<n>`, 1 to 1000; unset or
+/// 0: each run within `VICTORY_TEXTURE_STAGE_MS` alone, as before). The
+/// slots left wait for the next frame's runs, as those past a run's time do
+/// now; runs before a bake keep their own budget.
+///
+/// The pass runs several times a frame (its own, the early one at the
+/// frame's first draw, 16 ms each in the launcher): walking through the
+/// world it took 2.2-2.7 s of each 5 seconds in the stretches with frames
+/// over 50 ms (3,000 uploads a second, every one through a staging buffer
+/// made for it and detiled whole), 0.6-0.9 s in calm ones. With 8 ms (RTX
+/// 4090, Ryzen 9 7950X3D, DLSS Quality, no frame cap, the walking route
+/// through the first boat mission) the mean went from 39.4 to 47.0 fps.
+/// What changes for the picture: a texture picked by index may show a frame
+/// or more later in such a burst (its slot shows what it showed until then,
+/// `VICTORY_SHOW_NEW_LATER`).
+fn texspk_pass_ms() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_TEXSPK_PASS_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(|ms| ms.min(1000))
+    })
+}
+
+/// A run's time within the frame's cap of `cap_ms` milliseconds when the
+/// frame's runs took `spent_ns` nanoseconds already: no more than `span`.
+fn pass_span_left(span: std::time::Duration, cap_ms: u64, spent_ns: u64) -> std::time::Duration {
+    let cap = std::time::Duration::from_millis(cap_ms);
+    span.min(cap.saturating_sub(std::time::Duration::from_nanos(spent_ns)))
+}
+
 /// Per-frame texture staging byte budget scaled from the adapter's local VRAM
 /// budget (`None` keeps the 192 MiB 12 GiB baseline).
 fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
@@ -6248,9 +6463,49 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
     }
 }
 
+/// The size of the output the runner patched the image for, from its switches: the 1440p
+/// output's (`VICTORY_NATIVE_1440P`, which wins), else the 1080p one's (`VICTORY_OUTPUT_1080P`),
+/// else none (the stock 4K output, which needs no frontend fix).
+fn patched_output(native_1440p: bool, output_1080p: bool) -> Option<(f32, f32)> {
+    if native_1440p {
+        Some((2560.0, 1440.0))
+    } else if output_1080p {
+        Some((1920.0, 1080.0))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod patched_output_tests {
+    use super::patched_output;
+
+    #[test]
+    fn the_frontend_fix_takes_the_patched_outputs_size() {
+        assert_eq!(patched_output(false, false), None);
+        assert_eq!(patched_output(true, false), Some((2560.0, 1440.0)));
+        assert_eq!(patched_output(false, true), Some((1920.0, 1080.0)));
+        assert_eq!(patched_output(true, true), Some((2560.0, 1440.0)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::staging_budget_per_frame;
+
+    #[test]
+    fn a_frames_pass_runs_share_the_texspk_cap() {
+        use super::pass_span_left;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        // The first run of a frame: the run's own time, or the cap if less.
+        assert_eq!(pass_span_left(ms(16), 8, 0), ms(8));
+        assert_eq!(pass_span_left(ms(4), 8, 0), ms(4));
+        // Later runs: what the frame has left.
+        assert_eq!(pass_span_left(ms(16), 8, 5_000_000), ms(3));
+        // Spent: nothing (the run stops at its first slot).
+        assert_eq!(pass_span_left(ms(16), 8, 9_000_000), Duration::ZERO);
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
@@ -6443,5 +6698,162 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(test)]
+mod bake_wait_tests {
+    use super::*;
+
+    /// A host pipeline of our own: a triangle into one colour target, the
+    /// stand-in for a translated bake (no stages of the title's).
+    fn own_pipeline(host: &crate::host::Host) -> HostPipeline {
+        const SOURCE: &str = r#"
+#define RS "RootFlags(0)"
+[RootSignature(RS)]
+float4 corner(uint i : SV_VertexID) : SV_Position {
+    return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.5, 1.0);
+}
+float4 lit() : SV_Target { return 1.0; }
+"#;
+        use windows::core::s;
+        let vs = crate::host::compile(SOURCE, s!("corner"), s!("vs_5_1")).unwrap();
+        let ps = crate::host::compile(SOURCE, s!("lit"), s!("ps_5_1")).unwrap();
+        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        };
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        let mut formats = [DXGI_FORMAT(0); 8];
+        formats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+        // SAFETY: plain creation; the description points at live data.
+        let (root, pso) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &vs[..]).unwrap();
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: code(&vs[..]),
+                PS: code(&ps[..]),
+                BlendState: blend,
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                RTVFormats: formats,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let pso: ID3D12PipelineState = host.device.CreateGraphicsPipelineState(&desc).unwrap();
+            (root, pso)
+        };
+        HostPipeline {
+            compute: false,
+            mesh: false,
+            pso,
+            root,
+            stages: Vec::new(),
+            slots: 0,
+            inputs: Vec::new(),
+            rects: false,
+            name: "a bake held back".to_owned(),
+            state: String::new(),
+        }
+    }
+
+    /// A draw is a bake by its targets alone (no depth, four or more, the
+    /// first square and 512 or more), the test the made-pipeline check and
+    /// the wait share; a bake shader makes one too; a plain draw is not.
+    #[test]
+    fn a_bake_is_known_by_its_targets_or_shaders() {
+        let size = |w: u64, h: u32| move |_: usize| Some((w, h));
+        let four = [1, 2, 3, 4];
+        assert!(bake_targets(0, &four, size(2048, 2048)));
+        assert!(bake_targets(0, &[1, 2, 3, 4, 5], size(512, 512)));
+        assert!(!bake_targets(7, &four, size(2048, 2048)), "with depth");
+        assert!(!bake_targets(0, &four[..3], size(2048, 2048)), "three targets");
+        assert!(!bake_targets(0, &four, size(2048, 1024)), "not square");
+        assert!(!bake_targets(0, &four, size(256, 256)), "small");
+        assert!(!bake_targets(0, &four, |_| None), "no texture");
+        assert!(!bake_targets(0, &[], size(2048, 2048)));
+        assert!(bake_shader("089d6271be6650ef") && bake_shader("d4111a6e6ea49d91"));
+        assert!(BAKE_PIXEL_SHADERS.iter().all(|h| bake_shader(h)));
+        assert!(!bake_shader("00000000000000a1"));
+    }
+
+    /// A draw of a bake whose pipeline's making is held back 1.5 s, with both
+    /// ordinary waits (the frame's budget and the screen's) at zero on this
+    /// thread and a frame of the test's own, so only the bake wait can find
+    /// the pipeline made; `bake_wait`: `VICTORY_BAKE_WAIT` as if set (`None`:
+    /// the variable's). Whether the draw was recorded, or `None` without the
+    /// software adapter.
+    fn held_back_bake_draw(test: &str, frame: u64, bake_wait: Option<bool>) -> Option<bool> {
+        if !(cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP")) {
+            eprintln!("SKIPPED {test}: the software adapter only (VICTORY_WARP=1 VICTORY_D3D12_WARP=1, diagnostics)");
+            return None;
+        }
+        let Some(host) = crate::host::host() else {
+            eprintln!("SKIPPED {test}: no host GPU");
+            return None;
+        };
+        crate::pipeline::test_settings(Some(frame), bake_wait, true);
+        let made = own_pipeline(host);
+        let pso = made.pso.as_raw() as usize;
+        // The ped baker's vertex stage, with a pixel shader of no known bake.
+        let shaders = vec![
+            crate::pipeline::named_shader("vertex", "089d6271be6650ef"),
+            crate::pipeline::named_shader("pixel", "00000000000000b1"),
+        ];
+        let pipeline = crate::pipeline::held_back(shaders, std::time::Duration::from_millis(1500), made);
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_pipeline(pipeline);
+        let before = drawn();
+        state.draw(&list, 3, 1, 0, 0);
+        list.close();
+        crate::pipeline::test_settings(None, None, false);
+        let recorded = state.host_pipeline == pso;
+        // (Other tests' draws count too: only "recorded" says anything.)
+        assert!(!recorded || drawn() > before, "recorded on the list but not counted as drawn");
+        Some(recorded)
+    }
+
+    /// A draw of the title's character bake whose pipeline is still being
+    /// made is recorded once the pipeline is made, not dropped: the title
+    /// bakes each character's skin once, while it loads, and a dropped bake
+    /// left the player's head without its skin for the whole run (3 of 8
+    /// cold starts). With no ordinary wait, only the bake wait records it
+    /// (`VICTORY_BAKE_WAIT=0` makes this test fail).
+    #[test]
+    fn a_bake_draw_waits_for_its_pipeline() {
+        let test = "a_bake_draw_waits_for_its_pipeline";
+        if let Some(recorded) = held_back_bake_draw(test, 0xba4e_0000_0000_0001, None) {
+            assert!(recorded, "the bake draw was dropped for want of its pipeline");
+        }
+    }
+
+    /// The same draw without the bake wait is dropped: the fixture above
+    /// passes by the bake wait alone.
+    #[test]
+    fn without_the_bake_wait_the_held_back_bake_is_dropped() {
+        let test = "without_the_bake_wait_the_held_back_bake_is_dropped";
+        if let Some(recorded) = held_back_bake_draw(test, 0xba4e_0000_0000_0002, Some(false)) {
+            assert!(!recorded, "recorded with neither the bake wait nor an ordinary one");
+        }
+    }
+
+    /// An indirect mesh draw with mesh draws switched off
+    /// (`VICTORY_MESH_TEST=skip`) does not wait for a bake pipeline it will
+    /// not draw with, as the direct mesh path; dispatches never wait.
+    #[test]
+    fn indirect_draws_that_are_skipped_do_not_wait() {
+        assert!(indirect_bake_wait(0, 0) && indirect_bake_wait(1, 1) && indirect_bake_wait(10, 0));
+        assert!(indirect_bake_wait(10, 2), "the scissor test still draws");
+        assert!(!indirect_bake_wait(10, 1), "mesh draws skipped");
+        assert!(!indirect_bake_wait(2, 0), "a dispatch");
     }
 }

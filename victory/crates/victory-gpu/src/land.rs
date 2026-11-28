@@ -3,7 +3,7 @@
 //! that lands flights, as before).
 //!
 //! The relay's thread (`crate::host::relay`) was 58-60 ms of a 104 ms frame
-//! landing (run record-1): some 1,500 pieces of 64 KiB, 98 MB, fetched from
+//! landing (a measured run): some 1,500 pieces of 64 KiB, 98 MB, fetched from
 //! copies in the card's memory, and each of them searched from both ends,
 //! cleared room for, read from title memory, copied, merged and compared
 //! again while it was put, one after the other; a lock and a protection
@@ -464,7 +464,7 @@ impl Had {
 ///
 /// While the world streams a change is under way nearly all the time (pages
 /// are mapped in groups, eight threads side by side: 28 of 1,620 pieces a
-/// frame went through a view of ours in run textures-4, 630 in run n03). Put
+/// frame went through a view of ours in one measured run, 630 in another). Put
 /// through the title's address a piece opens the guards of its blocks, 5,000
 /// changes of protection a frame, which wait for the address-space lock the
 /// mapping wants as well, and every refresh guards them again: the frame went
@@ -502,7 +502,7 @@ unsafe impl Send for Notes {}
 /// side by the same merge. But the block counted as written, for that copy
 /// as for every other one, so the next refresh copied the whole block, sent
 /// it up and had the card hash it again: some 900 blocks a frame landed
-/// beside the guards, of the 103 MB a frame that went up (run record-1).
+/// beside the guards, of the 103 MB a frame that went up (a measured run).
 ///
 /// Why it may be left out ([`crate::shadow::Shadow::landed`]): the copy held
 /// title memory's bytes of the block before the landing, if it had taken it
@@ -572,6 +572,7 @@ pub(crate) unsafe fn piece(
 ///
 /// # Safety
 /// [`piece`]'s.
+#[allow(clippy::too_many_arguments)]
 unsafe fn piece_at(
     title: usize,
     now: *const u8,

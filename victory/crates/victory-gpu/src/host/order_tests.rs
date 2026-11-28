@@ -1,5 +1,5 @@
 //! Whether the title's buffer copies keep the list's order, and whether each
-//! submission reads its own bytes (board S25: the other tree's five failing
+//! submission reads its own bytes (the other tree's five failing
 //! fixtures, rebuilt on this tree's own API).
 //!
 //! Each test runs its body in a child process of its own, once per set of
@@ -64,6 +64,11 @@ const CLEARED: &[&str] = &[
 /// child's output if one fails, does not run the test, or takes over two
 /// minutes.
 fn children(test: &str, drop: &[&str]) {
+    children_with(test, drop, &[]);
+}
+
+/// [`children`], with `extra` set in every way besides its switches.
+fn children_with(test: &str, drop: &[&str], extra: &[(&str, &str)]) {
     if !(cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP")) {
         eprintln!("SKIPPED {test}: the software adapter only (VICTORY_WARP=1 VICTORY_D3D12_WARP=1, diagnostics)");
         return;
@@ -78,7 +83,7 @@ fn children(test: &str, drop: &[&str]) {
         // The least size of a copy in the card's memory scales with the
         // adapter's memory; 1 MiB makes the sizes below decide.
         command.env("VICTORY_CARD_BUFFERS_MIN_MB", "1").env(CHILD, "1");
-        for &(var, value) in switches.iter().filter(|(var, _)| !drop.contains(var)) {
+        for &(var, value) in switches.iter().filter(|(var, _)| !drop.contains(var)).chain(extra) {
             command.env(var, value);
         }
         let mut child = command
@@ -378,4 +383,108 @@ fn a_copy_takes_a_counter_a_shader_counted_up() {
     );
     assert_eq!(read[0], 5, "what the draw reads");
     assert_eq!([title[D + 128], title[D + 192]], [5, 5], "title memory");
+}
+
+/// The count of copies kept under flights ([`kept_under_flights`]): its change over the
+/// submission of `later`, sent with slow card work of our own in the air
+/// ahead of it (which declares no write), or with nothing in the air.
+fn counted(host: &Host, lists: &mut Vec<HostList>, behind: Option<&Slow>, later: HostList) -> [u64; 3] {
+    if let Some(slow) = behind {
+        let busy = host.new_list().unwrap();
+        slow.record(&busy, 40);
+        busy.close();
+        host.execute_own(&busy);
+        lists.push(busy);
+    }
+    later.close();
+    assert_eq!(flying(), behind.is_some(), "what is in the air when the later submission goes");
+    let before = kept_under_flights();
+    host.execute_own(&later);
+    let after = kept_under_flights();
+    lists.push(later);
+    settle_now(WHY_SYNC);
+    [0, 1, 2].map(|i| after[i] - before[i])
+}
+
+/// The case counted: a copy kept for submission (a title buffer copy, and
+/// `copy_memory`'s step) into a host copy in the PC's memory, behind a
+/// flight. `big`: a copy of 9 MiB on default settings, kept as it is over
+/// 8 MiB; else 64 bytes with `VICTORY_COPIES_IN_PLACE=0`.
+fn kept_under_a_flight_counts_one(resource: usize, len: usize, big: bool) {
+    let Some(host) = software_host() else {
+        return;
+    };
+    let (title, start, shadow) = title_of(resource, len);
+    assert!(!shadow.carded(), "the host copy is in the PC's memory");
+    let slow = Slow::new(host);
+    let mut lists = Vec::new();
+    taken_whole(host, &shadow, &mut lists);
+    let n = if big { 9 << 20 } else { 64 };
+    let (d, s) = (0x2000, 0x2000 + n);
+    title[s..s + n].fill(8);
+    let later = host.new_list().unwrap();
+    assert!(!title_copy(&later, start + d, start + s, n), "the copy is kept for submission");
+    assert_eq!(counted(host, &mut lists, Some(&slow), later), [1, n as u64, u64::from(big)], "a title buffer copy");
+    let later = host.new_list().unwrap();
+    later.defer_writing(start + d, n, || {});
+    assert_eq!(counted(host, &mut lists, Some(&slow), later), [1, n as u64, u64::from(big)], "copy_memory's step");
+}
+
+#[test]
+fn m14_count_a_copy_kept_under_a_flight_counts_one() {
+    if std::env::var_os(CHILD).is_some() {
+        return kept_under_a_flight_counts_one(0x9b10, 256 << 10, false);
+    }
+    children_with(
+        "m14_count_a_copy_kept_under_a_flight_counts_one",
+        &["VICTORY_CARD_BUFFERS_MIN_KB"],
+        &[("VICTORY_COPIES_IN_PLACE", "0")],
+    );
+}
+
+#[test]
+fn m14_count_a_big_copy_under_a_flight_counts_one() {
+    if std::env::var_os(CHILD).is_some() {
+        return kept_under_a_flight_counts_one(0x9b11, 32 << 20, true);
+    }
+    children_with(
+        "m14_count_a_big_copy_under_a_flight_counts_one",
+        &["VICTORY_CARD_BUFFERS_MIN_KB"],
+        &[("VICTORY_CARD_BUFFERS", "0")],
+    );
+}
+
+/// Not counted, on default settings: a copy placed in its list (PC memory),
+/// a copy kept into a host copy in the card's memory, both behind a flight,
+/// and a kept copy into the PC's memory with nothing in the air.
+fn ordinary_copies_count_nothing() {
+    let Some(host) = software_host() else {
+        return;
+    };
+    let (pc, pc_start, pc_shadow) = title_of(0x9b12, 256 << 10);
+    let (card, card_start, card_shadow) = title_of(0x9b13, 4 << 20);
+    assert!(!pc_shadow.carded() && card_shadow.carded(), "one host copy in each memory");
+    let slow = Slow::new(host);
+    let mut lists = Vec::new();
+    taken_whole(host, &pc_shadow, &mut lists);
+    taken_whole(host, &card_shadow, &mut lists);
+    pc[0x6000..0x6040].fill(8);
+    card[0x6000..0x6040].fill(8);
+    let later = host.new_list().unwrap();
+    assert!(title_copy(&later, pc_start + 0x2000, pc_start + 0x6000, 64), "the small copy is placed");
+    assert_eq!(counted(host, &mut lists, Some(&slow), later), [0; 3], "a copy placed in its list");
+    let later = host.new_list().unwrap();
+    later.defer_copy((card_start + 0x2000) as *mut u8, (card_start + 0x6000) as *const u8, 64);
+    assert_eq!(counted(host, &mut lists, Some(&slow), later), [0; 3], "a kept copy into the card's memory");
+    let later = host.new_list().unwrap();
+    later.defer_copy((pc_start + 0x2000) as *mut u8, (pc_start + 0x6000) as *const u8, 64);
+    assert_eq!(counted(host, &mut lists, None, later), [0; 3], "a kept copy with nothing in the air");
+}
+
+#[test]
+fn m14_count_ordinary_copies_count_nothing() {
+    if std::env::var_os(CHILD).is_some() {
+        return ordinary_copies_count_nothing();
+    }
+    children("m14_count_ordinary_copies_count_nothing", &["VICTORY_CARD_BUFFERS_MIN_KB"]);
 }

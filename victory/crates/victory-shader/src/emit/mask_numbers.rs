@@ -37,10 +37,7 @@ thread_local! {
 /// [`super::MASK_ELSEWHERE`], and only such a program, so every program that translated before
 /// is emitted as before.
 pub(in crate::emit) fn with_mask_numbers<R>(translate: impl FnOnce() -> R) -> R {
-    let before = MASK_NUMBERS.replace(true);
-    let result = translate();
-    MASK_NUMBERS.set(before);
-    result
+    super::super::with_flag(&MASK_NUMBERS, true, translate)
 }
 
 impl Lower<'_> {
@@ -195,4 +192,13 @@ impl Lower<'_> {
             _ => true,
         })
     }
+}
+
+/// A translation that panics in the mask-number retry leaves the retry off for the next
+/// program on its thread.
+#[cfg(test)]
+#[test]
+fn a_panic_in_the_retry_leaves_mask_numbers_off() {
+    super::super::caught(|| with_mask_numbers(|| panic!("a translation's panic")));
+    assert!(!MASK_NUMBERS.get());
 }

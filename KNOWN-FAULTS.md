@@ -56,10 +56,12 @@ them as open questions, not as known.
   about 16 pixels across.
 - **Suspected:** tiles whose light probes were never activated.
 
-### The water's own light is switched off
+### The water's own light
 
-- **Seen:** with it on, dark rectangles on the water.
-- **Known:** two tiled water-light passes produce them; the base leaves both off by default.
+- **Known:** two tiled water-light passes used to leave dark rectangles on the water on 32-lane cards. The base's
+  forms for 64-lane programs fixed them, and the passes now run by default; not yet re-checked in a measured run
+  here. `VICTORY_WATER_LIGHT=0` leaves them out on cards that run 32 lanes at a time, such as NVIDIA's; elsewhere the
+  switch does nothing.
 
 ## Shaders
 
@@ -76,6 +78,16 @@ them as open questions, not as known.
   of them, a compute program that collects triangles of small mesh pieces; its draws are dropped.
 - **How to count them:** the harness's run summary prints the programs a run could not translate.
 
+## Settings
+
+### Choosing 1920 x 1080 stops the next start
+
+- **Seen:** with `1920 x 1080` chosen on the F1 menu's Resolution row, the next start stops before the first frame:
+  the title halts under the change that gives it that output.
+- **Until it is fixed:** do not choose it. To recover, change the line `VICTORY_MENU_RES=1080` in
+  `%LOCALAPPDATA%\victory\victory-settings.txt` to `VICTORY_MENU_RES=4k` (or delete it). The menu's saved choice goes
+  over `--res`, so `victory play --res 4k` recovers only a start that was given `--res 1080` itself.
+
 ## Tools and tests
 
 ### Some of the base's own tests and lints fail
@@ -90,5 +102,7 @@ them as open questions, not as known.
 
 ### Left out of this public copy
 
-- The base's 1440p output mode, DLSS and frame generation: they work by changing the title's own code, and files
-  that do that are not published here.
+- MFG Unlocker, a third-party mod for DLSS frame generation on RTX 20 and 30 cards: not in this build. FSR 3 frame
+  generation (2x) is the way on those cards.
+- Nothing is downloaded. NVIDIA's DLSS and frame generation files are placed by hand: their `Streamline` folder goes
+  into `nvidia-sdk` under `%LOCALAPPDATA%\victory`, and a start without them says so.

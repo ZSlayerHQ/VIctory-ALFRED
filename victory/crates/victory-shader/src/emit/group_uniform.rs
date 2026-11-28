@@ -1,5 +1,5 @@
 //! Which blocks of a console compute program every thread of its thread group reaches, and
-//! the same number of times (board W35 P1, the census of waits). A group barrier is the only
+//! the same number of times (the census of waits). A group barrier is the only
 //! cross-wave wait D3D12 defines, and only where every thread of the group arrives: the
 //! translation's waits ([`super::lower`]'s meetings of the two host waves of a console wave,
 //! and the title's own `s_barrier`s) may stand only in such blocks when the meetings are
@@ -154,7 +154,7 @@ fn read_only(src: &Source, native: &NativeProgram, res: &Resources) -> bool {
         Source::Loaded { load, first } => {
             let Some(a) = res.scalar.iter().find(|s| s.0 == *load).map(|s| s.1) else { return false };
             // A computed term in the table's offset may pick any later range of the table, a
-            // writable one too: unproven (Astra's review of the census follow-up, 3).
+            // writable one too: unproven (a review's finding).
             // shortcut: no bound on that term is sought.
             if a.dynamic.is_some() {
                 return false;

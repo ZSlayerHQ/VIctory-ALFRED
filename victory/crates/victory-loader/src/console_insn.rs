@@ -67,7 +67,7 @@ fn wait_patch(what: ConsoleOnly) -> Option<[u8; 3]> {
 }
 
 /// Whether a `clzero` loop ([`ConsoleOnly::ClzeroLoop`]) is replaced the first time it faults
-/// by a jump to the same loop with plain stores ([`clzero_stub`]). Run cpu-5 (the dorm): 25,000
+/// by a jump to the same loop with plain stores ([`clzero_stub`]). In a measured run: 25,000
 /// exceptions a second, 2,100 a frame, at five such loops of one function of the title, for
 /// some kilobytes each; ten times what the wait instructions raised. On by default;
 /// `VICTORY_PATCH_CLZERO=0` emulates each time, as before.
@@ -159,7 +159,7 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
 
 /// The aligned 16 bytes `word` around address `at` with the bytes at `at` replaced; `None`
 /// where they do not all lie in those 16. (16 and not 8: the title's busiest one lies over the
-/// end of its 8 and took 28,000 exceptions a second, run cpu-6.)
+/// end of its 8 and took 28,000 exceptions a second, a measured run.)
 fn with_patch(word: u128, at: usize, patch: &[u8]) -> Option<u128> {
     let offset = at & 15;
     if offset + patch.len() > 16 {

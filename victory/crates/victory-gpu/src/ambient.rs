@@ -40,7 +40,7 @@
 //! title's screen-space march resolves (`CS_ResolveScreenSpace`) take the
 //! light seen on screen; the others go to the structures, find nothing, and
 //! `CS_RayMiss` gives each the sky's light from the sky's cube maps (in a
-//! cutscene frame, capture haze2: 10 to 30 against 0.01 to 0.1 for the room
+//! cutscene frame, a frame capture: 10 to 30 against 0.01 to 0.1 for the room
 //! the eyes and floors are in, and blue). `VICTORY_AMBIENT_SPECULAR` puts in,
 //! right after that program, the same estimate taken along the reflected
 //! direction ([`Role::Miss`]); the screen-space resolve that comes next
@@ -209,9 +209,11 @@ fn parse_alpha(set: &str) -> Option<Alpha> {
 
 /// `VICTORY_AMBIENT_SPECULAR_ALPHA`:
 /// - unset, `0`, `off` or `title`: the alpha layer is left as the title has
-///   it;
+///   it (its depth is the opaque surface behind the glass, so the estimate is
+///   wrong there: dark patches on water);
 /// - `1` or `estimate`: the estimate along the reflected direction, as the
-///   opaque layer gets;
+///   opaque layer gets (the upstream's default since 2026-11-27, kept here
+///   behind the switch: no new picture default for now);
 /// - `bound` or `bound:<k>` (k from 0.1 to 16): the title's sky light, no
 ///   brighter than 1 (or k) times the light around: the slow geometric mean
 ///   of the luminance of what the picture sends out. That reads neither the
@@ -1579,6 +1581,17 @@ mod tests {
         assert_eq!(parse_specular("0,0,occluded"), None);
     }
 
+    /// The alpha layer unset keeps the title's value (its depth is the opaque surface behind
+    /// the glass, so the estimate is wrong there: dark patches on water); the upstream's
+    /// estimate and the base's bound only when asked for.
+    #[test]
+    fn the_alpha_layer_unset_keeps_the_titles_value_and_the_others_are_asked_for() {
+        assert_eq!(parse_alpha(""), Some(Alpha::Title), "unset");
+        assert_eq!(parse_alpha("estimate"), Some(Alpha::Estimate));
+        assert_eq!(parse_alpha("1"), Some(Alpha::Estimate));
+        assert_eq!(parse_alpha("bound"), Some(Alpha::Bound(1.0)));
+    }
+
     /// Every form of `VICTORY_AMBIENT_SPECULAR_ALPHA`; `None` is off with a
     /// warning ([`alpha`]).
     #[test]
@@ -2044,6 +2057,10 @@ mod tests {
         // Half the cells send out 1, half 4 (grey: luminance as much).
         let cells: Vec<[f32; 4]> = (0..CELLS).map(|i| if i % 2 == 0 { [1.0, 1.0, 1.0, 1.0] } else { [4.0, 4.0, 4.0, 1.0] }).collect();
         warp::put_float4s(&pass.cells, 0, &cells);
+        // No history yet: the mean blends with what its slots hold when their alpha is set,
+        // and mapped memory is not promised to start at zero (1 run in 4 read another value).
+        warp::put_float4s(&pass.cells, CELLS, &[[0.0; 4]]);
+        warp::put_float4s(&pass.cells, GEO, &[[0.0; 4]]);
         let w = words(1.0, 0.0, 0.0, [64, 36]);
         // SAFETY: our open list; the mean reads and writes the cells alone.
         unsafe {

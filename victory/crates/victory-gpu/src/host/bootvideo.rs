@@ -9,10 +9,13 @@
 //! of three or four bytes a pixel. The video is not in any repository: it is
 //! read from that folder at run time.
 //!
-//! [`WORKERS`] threads decode ahead, in turn, into a ring of [`RING`] frames; a present takes the
+//! Threads decode ahead, in turn, into a ring of frames, both sized from the
+//! frame size and the slowest decode measured ([`pace`]: two and four at
+//! 1920 by 1080, as before; more at 3840 by 2160); a present takes the
 //! newest frame due at its time (frames late are skipped, never queued),
 //! scales it to the back buffer (letterboxed, nearest pixel: the menu's box
-//! filter is too slow for 24 a second at 3840 by 2160, see the `cost` test)
+//! filter is too slow for 24 a second at 3840 by 2160, see the `cost` test;
+//! a frame already the back buffer's size is not scaled)
 //! and copies it as the settings menu copies its picture. A frame not ready
 //! leaves the last one up. A frame that cannot be read ends the video with
 //! one warning. At the end the workers stop and everything is let go (the
@@ -30,7 +33,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM};
 
 use super::picture::{self, Buffers};
 use super::{Host, HostList, qoi};
@@ -38,11 +41,16 @@ use super::{Host, HostList, qoi};
 /// The same video over the world-loading screen (`VICTORY_BOOT_VIDEO_COVER=1`).
 pub(super) mod cover;
 
-/// Frames decoded ahead and being decoded, at most.
-const RING: usize = 4;
-/// Threads decoding: a frame's decode took up to 41.9 ms in a loaded start (a frame
-/// lasts 41.7 at 24 a second); two keep the ring ahead of the presents.
-const WORKERS: usize = 2;
+/// The slowest decode measured, in ms per million pixels: QOI's decode time
+/// goes with the pixels. 1920 by 1080 frames took up to 57.8 ms in a run (27.9
+/// ms a million pixels; 20.2 ms here, with nothing else running); 3840 by 2160
+/// ones up to 87.8 ms here (10.6), so about 230 ms in a run like that one.
+const SLOWEST_DECODE_MS_PER_MPIXEL: f64 = 27.9;
+/// Threads decoding, at least (the 1080p video's two) and at most.
+const MIN_WORKERS: usize = 2;
+const MAX_WORKERS: usize = 8;
+/// Frames decoded ahead of the presents, besides those being decoded.
+const AHEAD: usize = 2;
 /// Upload buffers written in turn, as the settings menu's.
 const UPLOADS: usize = 4;
 /// Presents the card's buffers are kept after the end, as the settings menu's.
@@ -128,6 +136,31 @@ fn plan_from(var: Option<OsString>, loops: Option<OsString>) -> Option<Result<Pl
     Some(Plan::read(&dir, loops))
 }
 
+/// How a video is decoded: `workers` threads, and at most `ring` frames
+/// decoded ahead and being decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pace {
+    workers: usize,
+    ring: usize,
+}
+
+/// The pace for frames `size` at `fps`, with `cores` threads on the machine:
+/// enough workers that frames decoding as slowly as the slowest measured
+/// still come faster than they are due ([`MIN_WORKERS`] to [`MAX_WORKERS`],
+/// and at most half the cores), and room for them and [`AHEAD`] more.
+fn pace(size: (u32, u32), fps: f64, cores: usize) -> Pace {
+    let slowest_ms = f64::from(size.0) * f64::from(size.1) / 1e6 * SLOWEST_DECODE_MS_PER_MPIXEL;
+    let needed = (slowest_ms * fps / 1e3).ceil();
+    let needed = if needed.is_finite() && needed > 0.0 { needed.min(MAX_WORKERS as f64) as usize } else { MIN_WORKERS };
+    let workers = needed.clamp(MIN_WORKERS, MAX_WORKERS.min(cores / 2).max(MIN_WORKERS));
+    Pace { workers, ring: workers + AHEAD }
+}
+
+/// The threads this machine runs at once.
+fn cores() -> usize {
+    std::thread::available_parallelism().map_or(MIN_WORKERS * 2, std::num::NonZero::get)
+}
+
 /// The frame shown `elapsed` seconds after the start: `None` once all are past.
 fn frame_at(elapsed: f64, fps: f64, total: u64) -> Option<u64> {
     let n = (elapsed.max(0.0) * fps).floor() as u64;
@@ -170,7 +203,41 @@ impl Rows {
 
 /// Writes `image` (red first) into `out` at `fit`, rows `pitch` bytes apart,
 /// as pixels of `format`: each pixel the nearest of the image's, black around it.
+/// An image already the size of `out` is not scaled: each row is written out as it is.
 fn write_frame(image: &qoi::Image, fit: &Fit, format: DXGI_FORMAT, out: &mut [u8], pitch: usize, rows: &mut Rows) {
+    if (image.width, image.height) == fit.out && fit.size == fit.out {
+        write_same(image, format, out, pitch, rows);
+    } else {
+        write_scaled(image, fit, format, out, pitch, rows);
+    }
+}
+
+/// [`write_frame`] for an image the size of `out`: no columns looked up, no
+/// row copied twice (and straight from the image into a four-byte BGRA out).
+fn write_same(image: &qoi::Image, format: DXGI_FORMAT, out: &mut [u8], pitch: usize, rows: &mut Rows) {
+    let (w, n) = (image.width as usize, image.channels);
+    let Some(bytes) = picture::pixel_bytes(format) else { return };
+    let row_bytes = w * bytes as usize;
+    for (from, to) in image.pixels.chunks_exact(w * n).zip(out.chunks_mut(pitch)) {
+        let to = &mut to[..row_bytes];
+        if format == DXGI_FORMAT_B8G8R8A8_UNORM {
+            for (p, q) in from.chunks_exact(n).zip(to.chunks_exact_mut(4)) {
+                q.copy_from_slice(&[p[2], p[1], p[0], 0xFF]);
+            }
+            continue;
+        }
+        if rows.rgbx.len() != w * 4 {
+            rows.rgbx = [0, 0, 0, 0xFF].repeat(w);
+        }
+        for (p, q) in from.chunks_exact(n).zip(rows.rgbx.chunks_exact_mut(4)) {
+            q[..3].copy_from_slice(&p[..3]);
+        }
+        picture::write_row(&rows.rgbx, format, to);
+    }
+}
+
+/// [`write_frame`] scaling: each pixel the nearest of the image's, black around it.
+fn write_scaled(image: &qoi::Image, fit: &Fit, format: DXGI_FORMAT, out: &mut [u8], pitch: usize, rows: &mut Rows) {
     let (frame, src, n) = (&image.pixels, (image.width, image.height), image.channels);
     let Some(bytes) = picture::pixel_bytes(format) else { return };
     let (ow, oh) = (fit.out.0 as usize, fit.out.1 as usize);
@@ -210,6 +277,8 @@ fn write_frame(image: &qoi::Image, fit: &Fit, format: DXGI_FORMAT, out: &mut [u8
 struct Shared {
     ring: Mutex<Ring>,
     wake: Condvar,
+    /// Frames decoded and being decoded, at most ([`Pace::ring`]).
+    room: usize,
 }
 
 #[derive(Default)]
@@ -251,13 +320,13 @@ fn decode_file(plan: &Plan, n: u64) -> Result<qoi::Image, String> {
 }
 
 /// One of the workers: takes the next frame (from the one due on) while the
-/// ring has room for it, at most [`RING`] decoded and being decoded, until
-/// the last, a failure, or `stop`.
+/// ring has room for it, at most [`Shared::room`] decoded and being decoded,
+/// until the last, a failure, or `stop`.
 fn work(total: u64, shared: &Shared, decode: &Decode) {
     loop {
         let n = {
             let mut ring = shared.ring.lock().unwrap_or_else(|e| e.into_inner());
-            while ring.ready.len() + ring.decoding >= RING && !ring.stop && ring.failed.is_none() {
+            while ring.ready.len() + ring.decoding >= shared.room && !ring.stop && ring.failed.is_none() {
                 ring = shared.wake.wait_timeout(ring, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
             }
             if ring.stop || ring.failed.is_some() {
@@ -318,15 +387,16 @@ struct Player {
 impl Player {
     fn start(plan: Plan) -> Result<Player, String> {
         let of_plan = plan.clone();
-        Player::start_with(plan, WORKERS, Arc::new(move |n| decode_file(&of_plan, n)))
+        let pace = pace(plan.size, plan.fps, cores());
+        Player::start_with(plan, pace, Arc::new(move |n| decode_file(&of_plan, n)))
     }
 
-    /// The video with `workers` threads decoding by `decode`.
-    fn start_with(plan: Plan, workers: usize, decode: Arc<Decode>) -> Result<Player, String> {
-        let shared = Arc::new(Shared { ring: Mutex::new(Ring::default()), wake: Condvar::new() });
+    /// The video with [`Pace::workers`] threads decoding by `decode`.
+    fn start_with(plan: Plan, pace: Pace, decode: Arc<Decode>) -> Result<Player, String> {
+        let shared = Arc::new(Shared { ring: Mutex::new(Ring::default()), wake: Condvar::new(), room: pace.ring.max(1) });
         let total = plan.total();
         let mut player = Player { plan, shared, workers: Vec::new(), shown: 0, due: 0, stopped: false.into() };
-        for i in 0..workers.max(1) {
+        for i in 0..pace.workers.max(1) {
             let (shared, decode) = (Arc::clone(&player.shared), Arc::clone(&decode));
             let worker = std::thread::Builder::new()
                 .name(format!("boot video {i}"))
@@ -535,7 +605,8 @@ pub(super) fn draw(host: &Host, list: &HostList, back: &ID3D12Resource, (width, 
                 None
             }
             Some(Ok(plan)) => {
-                tracing::info!(video = %plan.name(), frames = plan.frames, fps = plan.fps, w = plan.size.0, h = plan.size.1, loops = plan.loops, "boot video: playing");
+                let Pace { workers, ring } = pace(plan.size, plan.fps, cores());
+                tracing::info!(video = %plan.name(), frames = plan.frames, fps = plan.fps, w = plan.size.0, h = plan.size.1, loops = plan.loops, workers, ring, "boot video: playing");
                 match Player::start(plan) {
                     Ok(player) => {
                         // With the cover asked for, its keeper starts now, parked until the video ends.
@@ -653,6 +724,32 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_the_size_of_the_back_buffer_is_written_as_the_scaling_would() {
+        // Not scaled (its own path), and the same bytes as the scaling's, in
+        // each format, from three channels and four, at a pitch past the row.
+        let (w, h) = (7u32, 3u32);
+        assert_eq!(fit((w, h), (w, h)), Fit { out: (w, h), at: (0, 0), size: (w, h) });
+        for channels in [3usize, 4] {
+            let pixels: Vec<u8> = (0..(w * h) as usize * channels).map(|i| (i * 37 % 251) as u8).collect();
+            let image = qoi::Image { width: w, height: h, channels, pixels };
+            for format in [DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT] {
+                let pitch = (w * picture::pixel_bytes(format).expect("a format written")).next_multiple_of(256) as usize;
+                let (mut same, mut scaled) = (vec![9u8; pitch * h as usize], vec![9u8; pitch * h as usize]);
+                let mut rows = Rows::default();
+                write_frame(&image, &fit((w, h), (w, h)), format, &mut same, pitch, &mut rows);
+                assert!(rows.xs.is_empty() && rows.line.is_empty(), "{format:?}: not scaled");
+                write_scaled(&image, &fit((w, h), (w, h)), format, &mut scaled, pitch, &mut Rows::default());
+                assert_eq!(same, scaled, "{channels} channels, {format:?}");
+            }
+        }
+        // A frame of another size is scaled as before.
+        let image = qoi::Image { width: 4, height: 2, channels: 3, pixels: [1u8, 2, 3].repeat(8) };
+        let mut rows = Rows::default();
+        write_frame(&image, &fit((4, 2), (8, 4)), DXGI_FORMAT_B8G8R8A8_UNORM, &mut vec![0; 256 * 4], 256, &mut rows);
+        assert_eq!(rows.xs.len(), 8);
+    }
+
+    #[test]
     fn four_frames_made_here_play_in_order() {
         let dir = folder("order", 4, (8, 4));
         let plan = Plan::read(&dir, 1).expect("the plan");
@@ -707,10 +804,10 @@ mod tests {
     }
 
     /// Plays a video of `times.len()` frames at 24 a second whose frame `n`
-    /// takes `times[n]` ms to decode, with `workers` decoding and a present
+    /// takes `times[n]` ms to decode, decoded at `pace`, and a present
     /// every `present_ms`, all `scale` times as fast as in a run: frames shown
     /// and skipped, and the most bytes the ring held.
-    fn replay(times: &[f64], workers: usize, present_ms: f64, scale: f64) -> (u64, u64, usize) {
+    fn replay(times: &[f64], pace: Pace, present_ms: f64, scale: f64) -> (u64, u64, usize) {
         let plan = Plan {
             dir: PathBuf::from("replay"),
             frames: times.len() as u32,
@@ -725,7 +822,7 @@ mod tests {
             std::thread::sleep(Duration::from_secs_f64(times[n as usize % times.len()] / 1e3 / scale));
             Ok(qoi::Image { width: 2, height: 2, channels: 3, pixels: vec![0; 12] })
         });
-        let mut player = Player::start_with(plan, workers, decode).expect("workers");
+        let mut player = Player::start_with(plan, pace, decode).expect("workers");
         // The clock starts at the first frame shown, as `draw`'s does.
         let mut began: Option<Instant> = None;
         loop {
@@ -748,11 +845,11 @@ mod tests {
 
     /// The rules of [`work`] and [`Player::step`] in a clock of their own
     /// (no threads, so the answer does not depend on the machine's load):
-    /// `workers` take the next frame, from the one due on, while the frames
-    /// decoded and being decoded are fewer than [`RING`]; frame `n` takes
+    /// [`Pace::workers`] take the next frame, from the one due on, while the frames
+    /// decoded and being decoded are fewer than [`Pace::ring`]; frame `n` takes
     /// `times[n]` ms; a present comes at each of `presents` (ms) and takes the
     /// newest frame due; the clock starts at the first frame shown. Frames shown and skipped.
-    fn simulate(times: &[f64], workers: usize, presents: &[f64]) -> (u64, u64) {
+    fn simulate(times: &[f64], Pace { workers, ring }: Pace, presents: &[f64]) -> (u64, u64) {
         let total = times.len() as u64;
         let (mut ready, mut busy) = (BTreeMap::<u64, ()>::new(), vec![None::<(u64, f64)>; workers]);
         let (mut next, mut due, mut shown, mut began) = (0u64, 0u64, 0u64, None::<f64>);
@@ -770,7 +867,7 @@ mod tests {
             }
             for i in 0..workers {
                 let decoding = busy.iter().filter(|b| b.is_some()).count();
-                if busy[i].is_none() && ready.len() + decoding < RING {
+                if busy[i].is_none() && ready.len() + decoding < ring {
                     let n = next.max(due);
                     if n < total {
                         busy[i] = Some((n, t + times[n as usize]));
@@ -806,29 +903,89 @@ mod tests {
         (0..).map(|i| f64::from(i) * every).take_while(|t| *t < seconds * 1e3).collect()
     }
 
+    /// The 1080p video's pace (as before the pace was sized), and one worker with its ring.
+    const HD: Pace = Pace { workers: 2, ring: 4 };
+    const ONE: Pace = Pace { workers: 1, ring: 4 };
+
     #[test]
     fn decode_times_of_a_loaded_start_skip_no_frame() {
+        assert_eq!(pace((1920, 1080), 24.0, 32), HD, "a 1080p folder plays as before");
         let times = loaded_times();
         assert!(times.iter().copied().fold(0.0, f64::max) >= 41.7, "some decodes are longer than a frame");
-        assert_eq!(simulate(&times, WORKERS, &steady(1000.0 / 60.0, 12.0)), (241, 0));
-        assert_eq!(simulate(&times, WORKERS, &steady(1000.0 / 30.0, 12.0)), (241, 0));
+        assert_eq!(simulate(&times, HD, &steady(1000.0 / 60.0, 12.0)), (241, 0));
+        assert_eq!(simulate(&times, HD, &steady(1000.0 / 30.0, 12.0)), (241, 0));
         // Every decode longer than a frame: one worker falls behind and skips, two do not.
         let slow = vec![45.0; 241];
-        assert!(simulate(&slow, 1, &steady(1000.0 / 60.0, 14.0)).1 > 0);
-        assert_eq!(simulate(&slow, WORKERS, &steady(1000.0 / 60.0, 14.0)), (241, 0));
+        assert!(simulate(&slow, ONE, &steady(1000.0 / 60.0, 14.0)).1 > 0);
+        assert_eq!(simulate(&slow, HD, &steady(1000.0 / 60.0, 14.0)), (241, 0));
         // What decoding cannot help: the title presenting nothing for a while
         // (the start that skipped had presents at 0, 229 and 682 ms): frames due
         // in the gap are passed over (the clock is the wall clock).
         let gap: Vec<f64> = [0.0, 229.0].into_iter().chain(steady(1000.0 / 60.0, 12.0).into_iter().map(|t| t + 682.0)).collect();
-        let (shown, skipped) = simulate(&times, WORKERS, &gap);
+        let (shown, skipped) = simulate(&times, HD, &gap);
         assert!(skipped > 0 && skipped < 12, "{shown} shown, {skipped} skipped");
     }
 
+    #[test]
+    fn the_pace_goes_with_the_frame_size() {
+        // 1920 by 1080 (the slowest decode 57.8 ms, a frame 41.7): two, as before; frames made here too.
+        assert_eq!(pace((1920, 1080), 24.0, 32), HD);
+        assert_eq!(pace((8, 4), 24.0, 32), HD);
+        // 3840 by 2160: about 231 ms at the slowest, six workers and two frames ahead.
+        assert_eq!(pace((3840, 2160), 24.0, 32), Pace { workers: 6, ring: 8 });
+        assert_eq!(pace((3840, 2160), 30.0, 32), Pace { workers: 7, ring: 9 });
+        // The caps: at most eight, at most half the cores, never under two.
+        assert_eq!(pace((7680, 4320), 24.0, 32), Pace { workers: MAX_WORKERS, ring: MAX_WORKERS + AHEAD });
+        assert_eq!(pace((3840, 2160), 24.0, 8), Pace { workers: 4, ring: 6 });
+        assert_eq!(pace((3840, 2160), 24.0, 2), HD);
+    }
+
+    /// The 3840 by 2160 frames' decode times, measured here in tenths of a ms
+    /// (`replay_of_the_real_frames`, in the diag build, nothing else running):
+    /// median 71.5 ms, slowest 87.8.
+    const MEASURED_4K_TENTHS: [u16; 241] = [
+        603, 577, 634, 605, 586, 626, 650, 604, 605, 616, 640, 632, 687, 636, 643, 615,
+        621, 615, 620, 606, 630, 636, 671, 640, 641, 598, 615, 641, 658, 634, 677, 690,
+        621, 619, 618, 605, 599, 610, 608, 619, 670, 613, 645, 607, 628, 600, 616, 696,
+        715, 728, 725, 721, 738, 733, 720, 707, 722, 725, 726, 749, 725, 739, 731, 740,
+        739, 730, 746, 728, 727, 686, 742, 733, 747, 739, 734, 722, 743, 751, 770, 773,
+        757, 733, 721, 757, 740, 697, 698, 718, 724, 736, 729, 681, 706, 650, 684, 696,
+        643, 682, 695, 642, 660, 658, 682, 618, 620, 616, 619, 636, 635, 637, 631, 655,
+        717, 662, 648, 643, 609, 608, 606, 600, 603, 621, 615, 599, 655, 732, 716, 723,
+        732, 723, 724, 715, 725, 714, 725, 720, 716, 722, 720, 708, 716, 717, 718, 702,
+        717, 720, 729, 723, 716, 710, 704, 687, 733, 725, 722, 721, 733, 710, 704, 713,
+        723, 702, 702, 703, 726, 690, 707, 673, 708, 713, 726, 727, 741, 704, 703, 716,
+        720, 711, 708, 707, 695, 720, 718, 713, 718, 708, 709, 707, 705, 729, 693, 705,
+        695, 725, 712, 746, 737, 724, 731, 726, 734, 773, 772, 736, 731, 747, 717, 715,
+        741, 729, 720, 722, 797, 781, 792, 878, 742, 751, 729, 746, 751, 777, 753, 738,
+        729, 725, 754, 736, 764, 726, 727, 723, 739, 729, 717, 730, 790, 745, 743, 715,
+        740,
+    ];
+
+    #[test]
+    fn decode_times_of_the_4k_frames_skip_no_frame_at_their_pace() {
+        let measured: Vec<f64> = MEASURED_4K_TENTHS.iter().map(|&t| f64::from(t) / 10.0).collect();
+        // As slow as a run like the one whose 1080p frames took up to 57.8 ms (20.2 here).
+        let loaded: Vec<f64> = measured.iter().map(|t| t * 57.8 / 20.2).collect();
+        let slowest = |times: &[f64]| times.iter().copied().fold(0.0, f64::max);
+        assert!(slowest(&measured) > 41.7 * 2.0 && slowest(&loaded) > 41.7 * 6.0, "longer than two frames, and than six");
+        let uhd = pace((3840, 2160), 24.0, 32);
+        for presents in [steady(1000.0 / 60.0, 12.0), steady(1000.0 / 30.0, 12.0)] {
+            assert_eq!(simulate(&measured, uhd, &presents), (241, 0));
+            assert_eq!(simulate(&loaded, uhd, &presents), (241, 0));
+            // Every decode as slow as the slowest measured per pixel.
+            assert_eq!(simulate(&[SLOWEST_DECODE_MS_PER_MPIXEL * 3840.0 * 2160.0 / 1e6; 241], uhd, &presents), (241, 0));
+            // The 1080p video's two workers fall behind.
+            assert!(simulate(&loaded, HD, &presents).1 > 0);
+        }
+    }
+
     /// The real frames' decode times (`VICTORY_BOOT_VIDEO`), measured, then
-    /// played back with one worker and with [`WORKERS`], as they are and as
-    /// slow as in the loaded start (their slowest 41.9 ms): skips and the
-    /// ring's bytes. `cargo test --profile diag -p victory-gpu --lib
-    /// bootvideo::tests::replay_of_the_real_frames -- --ignored --nocapture`.
+    /// played back with one worker, the 1080p video's two and the pace for
+    /// their size, as they are and as slow as the slowest measured per pixel
+    /// ([`SLOWEST_DECODE_MS_PER_MPIXEL`]): skips and the ring's bytes; then
+    /// the times in tenths of a ms, in order. `cargo test --profile diag -p
+    /// victory-gpu --lib bootvideo::tests::replay_of_the_real_frames -- --ignored --nocapture`.
     #[test]
     #[ignore = "a measurement, in an optimised build, with the real frames"]
     fn replay_of_the_real_frames() {
@@ -848,15 +1005,31 @@ mod tests {
         let slowest = times.iter().copied().fold(0.0, f64::max);
         let mut sorted = times.clone();
         sorted.sort_by(f64::total_cmp);
-        println!("{} frames decoded: median {:.1} ms, slowest {slowest:.1} ms; a frame {bytes} bytes", times.len(), sorted[times.len() / 2]);
-        let loaded: Vec<f64> = times.iter().map(|t| t * 41.9 / slowest).collect();
-        for (what, times) in [("as measured", &times), ("as slow as the loaded start", &loaded)] {
-            for workers in [1, WORKERS] {
-                let (shown, skipped, most) = replay(times, workers, 1000.0 / 60.0, 1.0);
+        let mpixels = f64::from(plan.size.0) * f64::from(plan.size.1) / 1e6;
+        println!(
+            "{} frames {} x {} decoded: median {:.1} ms, slowest {slowest:.1} ms ({:.1} ms a million pixels); a frame {bytes} bytes",
+            times.len(),
+            plan.size.0,
+            plan.size.1,
+            sorted[times.len() / 2],
+            slowest / mpixels
+        );
+        let sized = pace(plan.size, plan.fps, cores());
+        let loaded: Vec<f64> = times.iter().map(|t| t * (SLOWEST_DECODE_MS_PER_MPIXEL * mpixels / slowest).max(1.0)).collect();
+        for (what, times) in [("as measured", &times), ("as slow as the slowest measured", &loaded)] {
+            for pace in [ONE, HD, sized] {
+                let (shown, skipped, most) = replay(times, pace, 1000.0 / 60.0, 1.0);
                 // (The replay's frames are 2 by 2, 12 bytes each.)
-                println!("{what}, {workers} worker(s): {shown} shown, {skipped} skipped; the ring held at most {} frames ({} bytes of these)", most / 12, most / 12 * bytes);
+                println!(
+                    "{what}, {pace:?}: {shown} shown, {skipped} skipped; the ring held at most {} frames decoded ({} bytes of these), {} with those being decoded",
+                    most / 12,
+                    most / 12 * bytes,
+                    pace.ring * bytes
+                );
             }
         }
+        let tenths: Vec<String> = times.iter().map(|t| format!("{}", (t * 10.0).round() as u32)).collect();
+        println!("tenths of a ms: {}", tenths.join(", "));
     }
 
     #[test]
@@ -939,6 +1112,19 @@ mod tests {
                     times[times.len() - 1],
                     pitch * out.1 as usize * (UPLOADS + 1)
                 );
+                if out == src {
+                    // The frames already the size: the scaling they skip, for comparison.
+                    let mut scaled: Vec<f64> = frames
+                        .iter()
+                        .map(|frame| {
+                            let t = Instant::now();
+                            write_scaled(frame, &f, format, &mut buffer, pitch, &mut rows);
+                            ms(t)
+                        })
+                        .collect();
+                    scaled.sort_by(f64::total_cmp);
+                    println!("  the same frames scaled instead: median {:.2} ms, slowest {:.2} ms", scaled[scaled.len() / 2], scaled[scaled.len() - 1]);
+                }
             }
             if out == (3840, 2160) {
                 let t = Instant::now();
@@ -948,8 +1134,9 @@ mod tests {
                 drop(boxed);
             }
         }
-        let ring = frames.iter().take(RING).map(|f| f.pixels.capacity()).sum::<usize>();
-        println!("the ring of {RING} frames: {ring} bytes");
+        let Pace { workers, ring } = pace(plan.size, plan.fps, cores());
+        let bytes = frames[0].pixels.capacity() * ring;
+        println!("{workers} workers, the ring of {ring} frames: {bytes} bytes");
         PHASE.store(OFF, Ordering::Relaxed);
         let t = Instant::now();
         let mut n = 0u32;

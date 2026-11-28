@@ -24,6 +24,7 @@
 #[cfg(windows)]
 mod console_insn;
 mod crash;
+pub mod frame_rate;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;
@@ -38,7 +39,6 @@ mod thunks;
 #[cfg(windows)]
 mod tls;
 #[cfg(windows)]
-#[path = "write_sites_absent.rs"]
 pub mod write_sites;
 #[cfg(windows)]
 mod windows;

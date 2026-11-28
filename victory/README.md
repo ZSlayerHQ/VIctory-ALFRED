@@ -43,8 +43,9 @@ The runtime is offline by design: no online play and no network features.
 ## In the game
 
 - **The top bar** shows the build's name and commit, the frame rate and frame time, and the draws in a frame.
-- **F1 opens the settings menu.** It saves only when `VICTORY_MENU_FILE=<file>` is set (the harness's
-  `--menu-file`), and what it saved applies at the next start.
+- **F1 opens the settings menu.** It saves to the file `VICTORY_MENU_FILE` names (`victory play` and the harness's
+  `--menu-file` set it), else to `victory-settings.txt` in `VICTORY_HOME` or `%LOCALAPPDATA%\victory`, the file
+  `victory play` reads at every start; what it saved applies at the next start.
 - **The menu's panel** is drawn from a `menu-art` folder beside the executable; `harness/snapshot-build.sh` copies
   it there from `scripts/overlay-art/assets/`. Without the folder, or with `VICTORY_MENU_PANEL=0`, the menu is
   plain text.
@@ -63,9 +64,9 @@ first reader meets:
 
 ## What this copy leaves out
 
-The base's source files that change the title's own code are not published here, and neither are its scripts that
-download other vendors' libraries. Its 1440p output mode, DLSS and frame generation depend on those files, so this
-copy does not have them. Small stand-ins that do nothing keep everything else building.
+The base's scripts that download other vendors' libraries and launch the title, and the MFG Unlocker mod for older
+cards. The program itself is the base's, the code that changes the title's own program for the 1440p outputs, DLSS
+and frame generation included; NVIDIA's and AMD's files are placed by hand, and a start without them says where.
 
 ## Tests
 

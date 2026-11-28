@@ -3712,8 +3712,7 @@ pub(crate) mod tests {
     #[test]
     fn a_compare_that_does_not_mask_the_access_is_no_waterfall() {
         // The compares are all there, but their result never narrows EXEC:
-        // every lane samples with the first lane's descriptor (reported by
-        // ifBars on upstream PR #566).
+        // every lane samples with the first lane's descriptor (upstream PR #566).
         let mut words = WATERFALL_JOINED_WAVE32.to_vec();
         let save = word_at(&words, 0xBE95_3C15);
         words[save] = 0xBE95_037E; // s_mov_b32 s21, exec_lo

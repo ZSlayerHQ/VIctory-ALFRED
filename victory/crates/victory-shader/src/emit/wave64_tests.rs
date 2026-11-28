@@ -292,6 +292,12 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
 /// Dword 0 of the UAV after `shader` ran with root constants `constants`; none without a
 /// device that takes it.
 fn dispatched(shader: &HostShader, constants: &[u32]) -> Option<u32> {
+    dispatched_words(shader, constants, 1).map(|words| words[0])
+}
+
+/// The first `dwords` dwords of the UAV after `shader` ran with root constants `constants`;
+/// none without a device that takes it.
+fn dispatched_words(shader: &HostShader, constants: &[u32], dwords: u32) -> Option<Vec<u32>> {
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 hardware device; not run");
@@ -316,13 +322,13 @@ fn dispatched(shader: &HostShader, constants: &[u32]) -> Option<u32> {
             &pso,
             &Dispatch {
                 roots: vec![(0, Root::Constants(ud))],
-                views: &[View::RawUav(1)],
+                views: &[View::RawUav(dwords)],
                 samplers: &[],
                 groups: [1, 1, 1],
             },
         )
         .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
-    Some(out[0][0])
+    Some(out[0][..dwords as usize].to_vec())
 }
 
 /// The same sum inside `if (t >= s0) { ... }` on a host of 64-lane waves: the lanes below s0
@@ -613,6 +619,43 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
         )
         .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
     Some(out[0][0])
+}
+
+/// A 64-bit mask the program does not track, read as a number by a select, in a console wave of
+/// 64 that runs as two host waves of 32 (the DPP move makes it take the console's lanes, so the
+/// halves form): `v_cndmask_b32` reads s[2:3] (root constants), so each lane takes its own bit of
+/// it, lanes 32-63 the high dword's. Their host lane numbers are 0-31 in the second host wave, so
+/// they must be numbered by their console lane, not by the host lane.
+#[test]
+fn lanes_past_32_take_the_high_dword_of_a_mask_held_as_a_number() {
+    let words = [
+        0x7E0E_02FA,
+        0xFFFF_B100, // v_mov_b32_dpp v7, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+        0xD501_0005,
+        0x0009_0280, // v_cndmask_b32 v5, 0, 1, s[2:3]
+        0x340C_0082, // v_lshlrev_b32 v6, 2, v0
+        0xE070_1000,
+        0x8002_0506, // buffer_store_dword v5, v6, s[8:11], 0 offen
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered_on(&native, &p, &HashSet::new(), 32).expect("lower");
+    for (lo, hi) in [(0x5555_0F0F, 0xA0F0_1234), (u32::MAX, 0), (0, u32::MAX)] {
+        let Some(out) = dispatched_words(&shader, &[0, 0, lo, hi], 64) else {
+            return;
+        };
+        for lane in 0..64u32 {
+            let bit = if lane < 32 {
+                (lo >> lane) & 1
+            } else {
+                (hi >> (lane - 32)) & 1
+            };
+            assert_eq!(
+                out[lane as usize], bit,
+                "lane {lane} of the mask {hi:08x}{lo:08x}"
+            );
+        }
+    }
 }
 
 /// A 32-lane console wave. A register holds a lane mask on one path (the lanes below s0)
@@ -1165,7 +1208,7 @@ fn an_lds_exchange_in_a_lane_branch_is_taken_wave_wide_with_the_switch_on() {
     eprintln!("ran on the hardware device: the exchange as the console runs it");
 }
 
-/// The same exchange in a per-lane loop of one console wave (Astra's counter-examples for a
+/// The same exchange in a per-lane loop of one console wave (a review's counter-examples for a
 /// console wave split in two: an unequal trip count between its halves, and a back edge only
 /// one half takes): lane t goes round (t >> 3) + 1 times, writing its sum to LDS and adding
 /// that of lane t ^ 32, so the lower host wave is done after 4 rounds and the upper one goes
@@ -1177,7 +1220,7 @@ fn an_lds_exchange_in_a_lane_branch_is_taken_wave_wide_with_the_switch_on() {
 /// halves going round as one). This test once expected the per-lane form at 32 lanes, which
 /// put the group barriers inside the loop: its values came out right only because NVIDIA
 /// counts a host wave that has exited as arrived at a group barrier, which D3D12 does not
-/// promise (Astra's point), and a later barrier in the short half would pair with the long
+/// promise (a review's point), and a later barrier in the short half would pair with the long
 /// half's next trip. Since the per-lane latch is in its own region (`lower::lane_regions_of`)
 /// that form is no longer made.
 #[test]

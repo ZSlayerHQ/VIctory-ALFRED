@@ -275,8 +275,8 @@ pub fn use_console_timers() {
 /// nobody else wants its core) and does all of the title's loading: a
 /// program that keeps the processors busy at normal priority (a build, a
 /// virus scan) starved it, loading took 40 to 60 s instead of 28 to 33, and
-/// the opening ran without the models that were to be there (runs cpu-1,
-/// play-1125-0203). The process runs above normal, as long as it runs.
+/// the opening ran without the models that were to be there (measured runs
+/// and a session). The process runs above normal, as long as it runs.
 /// `VICTORY_PROCESS_PRIORITY=normal`: as it was started.
 #[cfg(windows)]
 fn ahead_of_other_programs() {

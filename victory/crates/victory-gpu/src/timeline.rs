@@ -13,8 +13,7 @@
 //!   title's threads wait with (its imports are bound to wrappers) and those
 //!   our own code does (the entries of our own import table: every contended
 //!   lock, condition and park of the standard library is a `WaitOnAddress`),
-//!   each with the thread that woke it and where it waited (the public
-//!   tree leaves these wrappers out: its timelines have no waits);
+//!   each with the thread that woke it and where it waited;
 //! - kernel calls on the address space that took long;
 //! - the card: when each submission began and ended on it (timestamps).
 //!
@@ -22,7 +21,6 @@
 //! flag; a build without `diagnostics` has nothing of it.
 
 #[cfg(all(windows, feature = "diagnostics"))]
-#[path = "timeline/hooks_absent.rs"]
 mod hooks;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod record;

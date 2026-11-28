@@ -24,6 +24,8 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
+    #[cfg(windows)]
+    crate::pipeline::samplers::use_folder(dir.with_file_name("pipelines"));
     match Cache::open(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
@@ -58,39 +60,8 @@ fn build() -> [u8; 32] {
         bytes.extend_from_slice(&limit.to_le_bytes());
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
-        // So are the switches that pick the form of a wave64 program:
-        // without them here a run with `VICTORY_WAVE_WIDE=0` was
-        // served the translations an earlier run of the same
-        // executable had cached with the switch unset.
-        for name in [
-            "VICTORY_WAVE_WIDE",
-            "VICTORY_WAVE_DEEP_SKIPS",
-            "VICTORY_WAVE_OWN_BITS",
-            "VICTORY_WAVE_LOCAL",
-            "VICTORY_F16_NEAREST",
-            "VICTORY_FILTER_3D",
-            "VICTORY_HELPER_OWN",
-            "VICTORY_FIRSTLANE_OWN",
-            "VICTORY_FIRST_HALF",
-            "VICTORY_STRICT_JOINS",
-            "VICTORY_MESH_OUTPUT_STRICT",
-            "VICTORY_BVH_FENCES",
-            "VICTORY_BVH_BOUNDS",
-            "VICTORY_THREAD_TICKET",
-            // (the strip job's strict forms for wave64 programs in two host waves)
-            "VICTORY_STRICT_HALVES",
-            // (A program translated with it binds a table only a heap made
-            // with it has.)
-            "VICTORY_SLOT_ADDRESSES",
-            "VICTORY_PAIR_MEETINGS",
-        ] {
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.push(b'=');
-            if let Some(value) = std::env::var_os(name) {
-                bytes.extend_from_slice(value.as_encoded_bytes());
-            }
-            bytes.push(0);
-        }
+        // So are the switches that pick the form of a program ([`KEY_SWITCHES`]).
+        bytes.extend(switches(|name| std::env::var_os(name)));
         // So is whether pixel programs keep the console's early depth test
         // (`VICTORY_EARLY_DEPTH=1`): only while it is on, so that the
         // translations cached without it are still served without it.
@@ -99,6 +70,12 @@ fn build() -> [u8; 32] {
                 "VICTORY_EARLY_DEPTH=1: pixel programs whose console code tests depth before them get the host's early depth-stencil test"
             );
             bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
+            bytes.push(0);
+        }
+        // And whether compute programs take the number of their first
+        // group (`VICTORY_SPLIT_DISPATCH=1`): only while it is on, as above.
+        if victory_shader::emit::split_dispatch() {
+            bytes.extend_from_slice(b"VICTORY_SPLIT_DISPATCH=1");
             bytes.push(0);
         }
         // And which clean-up passes ran over the translated code.
@@ -111,6 +88,52 @@ fn build() -> [u8; 32] {
         hash.update(&value.to_le_bytes());
     }
     *hash.finalize().as_bytes()
+}
+
+/// The switches that pick the form of a translation: their values join the key
+/// ([`build`]). Without them here a run with `VICTORY_WAVE_WIDE=0` was served the
+/// translations an earlier run of the same executable had cached with the switch unset.
+const KEY_SWITCHES: &[&str] = &[
+    "VICTORY_WAVE_WIDE",
+    "VICTORY_WAVE_DEEP_SKIPS",
+    "VICTORY_WAVE_OWN_BITS",
+    "VICTORY_WAVE_LOCAL",
+    "VICTORY_F16_NEAREST",
+    "VICTORY_FILTER_3D",
+    "VICTORY_HELPER_OWN",
+    "VICTORY_FIRSTLANE_OWN",
+    "VICTORY_FIRST_HALF",
+    "VICTORY_STRICT_JOINS",
+    "VICTORY_MESH_OUTPUT_STRICT",
+    "VICTORY_BVH_FENCES",
+    "VICTORY_BVH_BOUNDS",
+    "VICTORY_THREAD_TICKET",
+    // (the strict forms for wave64 programs in two host waves)
+    "VICTORY_STRICT_HALVES",
+    // (A program translated with it binds a table only a heap made
+    // with it has.)
+    "VICTORY_SLOT_ADDRESSES",
+    "VICTORY_PAIR_MEETINGS",
+    "VICTORY_LDS_LOOP_ATOMICS",
+    "VICTORY_LDS_BOUNDS",
+    // (the loop step for 64-lane programs on 32-lane waves, and the first thread's set-up of
+    // shared memory: both change what is emitted, and were missing here)
+    "VICTORY_LOOPS_WAVE",
+    "VICTORY_LDS_FIRST_INIT",
+];
+
+/// [`KEY_SWITCHES`] with their values as `get` gives them (unset: empty), in the key's bytes.
+fn switches(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for name in KEY_SWITCHES {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(b'=');
+        if let Some(value) = get(name) {
+            bytes.extend_from_slice(value.as_encoded_bytes());
+        }
+        bytes.push(0);
+    }
+    bytes
 }
 
 /// What tells one set of translations from another ([`build`]).
@@ -137,12 +160,26 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     // hash a run's log gives them)
     let translate = |c: &[u8]| {
         let hash = blake3::hash(c).to_hex();
-        victory_shader::emit::with_program_strict(&hash[..16], || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+        let _ = victory_shader::emit::take_no_room();
+        let shader = victory_shader::emit::with_program_strict(&hash[..16], || victory_shader::emit::translate(c)).map_err(|e| e.to_string());
+        // Said once a program: it is translated once.
+        if victory_shader::emit::take_no_room() {
+            tracing::warn!(
+                program = &hash[..16],
+                "VICTORY_SPLIT_DISPATCH: the program's root signature has no room for the number of its first group; \
+                 its dispatches of more than 65,535 groups in x are cut, as without the switch"
+            );
+        }
+        shader
     };
-    match CACHE.get() {
+    let shader = match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
-    }
+    }?;
+    // Its static samplers into the list every process makes them from.
+    #[cfg(windows)]
+    crate::pipeline::samplers::know(&shader.static_samplers);
+    Ok(shader)
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -436,6 +473,32 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    /// A container cached with the loop step or the first thread's set-up of shared memory as
+    /// one run had them is translated again (cold) when the next run has them otherwise: both
+    /// change what is emitted (`victory_shader::emit::loops_wave`, `first_thread_init`).
+    #[test]
+    fn a_change_of_the_loop_step_or_the_first_threads_set_up_translates_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let key = |set: Option<(&str, &str)>| -> [u8; 32] {
+            let bytes = switches(|name| set.filter(|(n, _)| *n == name).map(|(_, v)| v.into()));
+            *blake3::hash(&bytes).as_bytes()
+        };
+        let container = b"a console compute container".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        assert_eq!(cached(&cache, &key(None), container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &key(None), container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "unchanged: from the cache");
+        for (n, name) in ["VICTORY_LOOPS_WAVE", "VICTORY_LDS_FIRST_INIT"].into_iter().enumerate() {
+            assert_eq!(cached(&cache, &key(Some((name, "0"))), container, translate), Ok(shader()));
+            assert_eq!(runs.load(Ordering::Relaxed), 2 + n as u64, "{name}=0: translated again, not served the unset one's");
+        }
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

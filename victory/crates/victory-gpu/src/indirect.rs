@@ -31,7 +31,9 @@
 //! shortcut: the bounds (below 2^23 vertices an instance, 2^26 vertex instances, 65,535
 //! groups per dimension, in x 2^20 ([`widest`]), and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
-//! the title needs more.
+//! the title needs more. With `VICTORY_SPLIT_DISPATCH=1` a one-dimensional
+//! dispatch of up to [`split`] x 65,535 groups by a program that takes the
+//! number of its first group runs in parts instead ([`bound_split`]).
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -305,8 +307,6 @@ fn rest() -> u32 {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    #[cfg(feature = "diagnostics")]
-    let batched = source == batch::SOURCE;
     let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -423,6 +423,186 @@ pub(crate) fn bound_ahead(
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+}
+
+/// The most groups of a part of a dispatch in parts ([`bound_split`]), and
+/// the bytes from one part's record to the next.
+pub(crate) const PART: u32 = 65_535;
+pub(crate) const PART_BYTES: u64 = 12;
+/// The parts of a dispatch in parts by default, and the most there are:
+/// sixteen are 1,048,560 groups, under the most one dispatch runs (the
+/// clamp's `GROUPS`, 2^20).
+const SPLIT: u32 = 2;
+const SPLIT_MOST: u32 = 16;
+const _: () = assert!(SPLIT_MOST * PART <= 1 << 20, "the parts must fit what one dispatch runs");
+/// The most bytes a clamp in parts writes: a record for each of the most
+/// parts (`crate::replay::edit` keeps that much of it).
+#[cfg(feature = "diagnostics")]
+pub(crate) const PARTS_MOST_BYTES: u64 = SPLIT_MOST as u64 * PART_BYTES;
+
+/// Whether the host runs dispatches of more than [`PART`] groups in x in
+/// parts (`VICTORY_SPLIT_DISPATCH=1`, `victory_shader::emit::split_dispatch`;
+/// after the change that split them): not where the card runs them whole ([`widest`],
+/// an AMD card's 2^20), which stays as it is.
+pub(crate) fn splits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = victory_shader::emit::split_dispatch()
+            && host().is_some_and(|h| widest(amd(&h.device)) == PART);
+        if on {
+            tracing::info!(parts = split(), "VICTORY_SPLIT_DISPATCH=1: dispatches of more than 65,535 groups in x run in parts");
+        }
+        on
+    })
+}
+
+/// The parts of an indirect dispatch in parts ([`bound_split`]):
+/// `VICTORY_SPLIT_PARTS=<n>`, read once, 2 to 16; unset (or anything else,
+/// with one warning) [`SPLIT`], 131,070 groups. At 3840x2160 a
+/// screen-sized pass asks for about 259,200, which takes 4.
+pub(crate) fn split() -> u32 {
+    static PARTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PARTS.get_or_init(|| {
+        let value = std::env::var_os("VICTORY_SPLIT_PARTS").map(|v| v.to_string_lossy().into_owned());
+        let (parts, taken) = split_from(value.as_deref());
+        if !taken {
+            tracing::warn!(value = value.as_deref().unwrap_or(""), "VICTORY_SPLIT_PARTS takes 2 to 16: 2 parts");
+        }
+        parts
+    })
+}
+
+/// The parts `value` (the setting's text, if set) asks for, and whether it
+/// was taken: unset is [`SPLIT`] and taken; anything but a number from
+/// [`SPLIT`] to [`SPLIT_MOST`] is [`SPLIT`] and not.
+fn split_from(value: Option<&str>) -> (u32, bool) {
+    match value.map(|v| v.trim().parse::<u32>()) {
+        None => (SPLIT, true),
+        Some(Ok(n)) if (SPLIT..=SPLIT_MOST).contains(&n) => (n, true),
+        Some(_) => (SPLIT, false),
+    }
+}
+
+/// The lines of [`SOURCE`] that the clamp of a dispatch in parts
+/// ([`parts_source`]) says otherwise: the bound of a dispatch's groups, and
+/// the store of its record.
+const BOUND_LINE: &str = "        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));\n";
+const STORE_LINE: &str = "        dst_args.Store3(dst_at, groups);\n";
+
+/// The clamp's text for one dispatch in `parts` parts ([`bound_split`]):
+/// [`SOURCE`], whose dispatch record of one dimension (y and z at most 1)
+/// and at most `parts` x 65,535 groups keeps its groups, and is written as
+/// `parts` records [`PART_BYTES`] apart: the k-th has the 65,535 groups in x
+/// from 65,535 k on, or what is left of them (none: an empty record), and
+/// y and z. Any other record is bounded as [`SOURCE`] bounds it, into the
+/// first record, and the others are empty. Only dispatch records are
+/// clamped with it. [`SOURCE`] itself is not changed: the clamp of every
+/// other execution, and of all with the switch off, is compiled from it.
+fn parts_source(parts: u32) -> String {
+    let bound = format!(
+        "{BOUND_LINE}        // In parts: one dimension, and not the garbage of a record nothing wrote.\n        \
+         if (wide.y <= 1u && wide.z <= 1u && wide.x <= PARTS * 65535u) {{\n            g.x = wide.x;\n        }}\n"
+    );
+    let store = "        for (uint part = 0; part < PARTS; part++) {\n            uint before = part * 65535u;\n            \
+                 uint x = groups.x > before ? min(groups.x - before, 65535u) : 0u;\n            \
+                 dst_args.Store3(dst_at + part * 12u, uint3(x, groups.yz));\n        }\n        return;\n";
+    let source = SOURCE
+        .replacen(BOUND_LINE, &format!("        uint3 wide = g;\n{bound}"), 1)
+        .replacen(STORE_LINE, store, 1);
+    format!("#define PARTS {parts}u\n{source}")
+}
+
+/// The clamp of dispatches in parts ([`parts_source`]), made at the first,
+/// under a name of its own ([`crate::replay::play::CLAMP_PARTS`]): the
+/// replayer's edits of clamps of one record must not take it for one.
+fn parts_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| {
+            let made = host().ok_or_else(windows::core::Error::empty).and_then(|h| make_from(&h.device, &parts_source(split())));
+            match made {
+                Ok(c) => {
+                    #[cfg(feature = "diagnostics")]
+                    crate::host::name(&c.pso, || crate::replay::play::CLAMP_PARTS.into());
+                    Some(c)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no clamp of dispatches in parts: they are clamped whole, as without the switch");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Whether dispatches can be clamped in parts: the clamp of parts is made.
+pub(crate) fn parts_ready() -> bool {
+    parts_clamp().is_some()
+}
+
+/// [`bound`] for one dispatch record at `src` (of the title's layout
+/// `spec`: a dispatch, one record) by a program that takes the number of its
+/// first group (`victory_shader::emit::USER_GROUP_BASE`): [`split`] records
+/// follow each other in the scratch buffer, a part each ([`parts_source`]),
+/// which [`execute_parts`] runs. The console runs a tile list of 67,440
+/// groups in one dispatch; clamped to what the host runs, the lowest tiles of
+/// the picture kept what they showed before. The scratch buffer, and whether
+/// it holds the parts: where they cannot be clamped, the record is clamped
+/// by [`bound`] for one execution, as without the switch. `None` only where
+/// [`bound`] gives none.
+pub(crate) fn bound_split(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+) -> Option<(ID3D12Resource, bool)> {
+    bound_parts_with(list, src, spec, parts_clamp())
+}
+
+/// [`bound_split`] with the clamp of parts `parts`, if there is one.
+fn bound_parts_with(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+    parts: Option<&Clamp>,
+) -> Option<(ID3D12Resource, bool)> {
+    let one = (2, 12, 1);
+    if let Some(c) = parts
+        && validate_layout(one, src.1, None).is_some()
+        && let Some(budget) = list.budget()
+        && let Some(dst) = list.indirect_scratch(u64::from(split()) * PART_BYTES)
+        && clamp_into(list, c, &dst, budget, src, None, one, false)
+    {
+        return Some((dst, true));
+    }
+    bound(list, src, None, spec).map(|dst| (dst, false))
+}
+
+/// Executes the `parts` records [`bound_split`] made in `scratch` with
+/// `signature` (one dispatch, records [`PART_BYTES`] apart), each after
+/// setting the program's first group (root parameter `param`, its dword
+/// `dword`) to that part's, and the word back to 0 after the last. A part
+/// with no groups is executed as it is, an empty dispatch.
+///
+/// # Safety
+///
+/// `list` is open, with the program's root signature, pipeline and
+/// bindings set; `scratch` holds `parts` records, in the indirect-argument
+/// state; `signature` is of one dispatch argument, [`PART_BYTES`] apart.
+pub(crate) unsafe fn execute_parts(
+    list: &ID3D12GraphicsCommandList,
+    signature: &ID3D12CommandSignature,
+    scratch: &ID3D12Resource,
+    (param, dword): (u32, u32),
+    parts: u32,
+) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        for part in 0..parts {
+            list.SetComputeRoot32BitConstant(param, part * PART, dword);
+            list.ExecuteIndirect(signature, 1, scratch, u64::from(part) * PART_BYTES, None, 0);
+        }
+        list.SetComputeRoot32BitConstant(param, 0, dword);
+    }
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -2697,7 +2877,10 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             sig.unwrap()
         };
-        // Three records of 65,535 x 16 groups: about half the budget each.
+        // Two records of 65,535 x 16 groups (64 threads each, 2^26 - 2,048
+        // threads), then one of 32 groups (2,048 threads): together exactly
+        // the budget, so the small record after them does not fit whether
+        // or not a record that does not fit takes the rest (`rest`).
         let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
             return;
         };
@@ -2710,7 +2893,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
             for i in 0..3 {
-                let words = [65535u32, 16, 1];
+                let words = if i < 2 { [65535u32, 16, 1] } else { [32, 1, 1] };
                 std::ptr::copy_nonoverlapping(
                     words.as_ptr().cast::<u8>(),
                     big_ptr.add(i * STRIDE as usize),
@@ -3028,6 +3211,294 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         }
     }
 
+    /// A program of ours with a first group, as a translated one takes it
+    /// (`victory_shader::emit::USER_GROUP_BASE`): one root constant, the
+    /// number of its first group, and a count for each group that ran.
+    /// (World 6d6d8423b's.)
+    const GROUPS_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer Base : register(b0) { uint base; };
+RWByteAddressBuffer ran : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 g : SV_GroupID) {
+    uint prev;
+    ran.InterlockedAdd((base + g.x) * 4u, 1u, prev);
+}
+"#;
+
+    /// One dispatch record `asked`, clamped and executed on the software
+    /// adapter by [`GROUPS_CS`]: in `parts` parts by the clamp of parts and
+    /// [`execute_parts`], as `crate::draw` does with the switch on, or with
+    /// `None` by the clamp of one and one execution, as with it off. How
+    /// often each of `slots` groups ran, and the records the clamp made.
+    fn ran_on_warp(warp: &mut WarpHarness, parts: Option<u32>, asked: [u32; 3], slots: usize) -> (Vec<u32>, Vec<[u32; 3]>) {
+        let clamp = parts.map(|n| make_from(&warp.device, &parts_source(n)).expect("the clamp of parts must compile on WARP"));
+        let program = compile_cs(&warp.device, GROUPS_CS).expect("the groups program must compile on WARP");
+        let signature = warp.signature(2, PART_BYTES as u32);
+        let records = parts.unwrap_or(1) as usize;
+        let bytes = records as u64 * PART_BYTES;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(16);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (_ran_buf, ran_ptr, ran_gpu) = warp.shared_buffer(slots as u64 * 4);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(bytes);
+        let dst_buf = warp.default_uav(bytes);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(asked.as_ptr().cast(), src_ptr, 12);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(ran_ptr, 0, slots * 4);
+            std::ptr::write_bytes(readback_ptr, 0xEE, bytes as usize);
+        }
+        let to = (&dst_buf, D3D12_RESOURCE_STATE_COMMON);
+        let c = clamp.as_ref().unwrap_or(&warp.clamp);
+        assert!(record_clamp_as(c, &warp.list, to, budget_gpu, (&src_buf, 0), None, (2, 12, 1), false));
+        // SAFETY: an open list; the program's own root signature and
+        // pipeline, its buffer bound; the scratch holds the records in the
+        // indirect-argument state, and is copied out for the check.
+        unsafe {
+            warp.list.SetComputeRootSignature(&program.root);
+            warp.list.SetPipelineState(&program.pso);
+            warp.list.SetComputeRoot32BitConstant(0, 0, 0);
+            warp.list.SetComputeRootUnorderedAccessView(1, ran_gpu);
+            match parts {
+                Some(n) => execute_parts(&warp.list, &signature, &dst_buf, (0, 0), n),
+                None => warp.list.ExecuteIndirect(&signature, 1, &dst_buf, 0, None, 0),
+            }
+            let (from, to) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            warp.list.ResourceBarrier(&[transition(&dst_buf, from, to)]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, bytes);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; the mappings hold `slots` counts and
+        // `records` records.
+        unsafe {
+            (
+                std::slice::from_raw_parts(ran_ptr.cast::<u32>().cast_const(), slots).to_vec(),
+                std::slice::from_raw_parts(readback_ptr.cast::<[u32; 3]>().cast_const(), records).to_vec(),
+            )
+        }
+    }
+
+    /// The groups below `first` that ran once, and the groups that ran
+    /// otherwise than once below `first` and never past it.
+    fn against(counts: &[u32], first: u32) -> (usize, usize) {
+        let once = counts[..first as usize].iter().filter(|&&n| n == 1).count();
+        let wrong = counts.iter().enumerate().filter(|&(i, &n)| n != u32::from(i < first as usize)).count();
+        (once, wrong)
+    }
+
+    /// An indirect dispatch of 70,000 groups in two parts runs every group
+    /// once; clamped as with the switch off it runs today's 65,535. So do
+    /// the title's 115,200 tiles at 2560x1440, and everything up to what
+    /// the parts hold; one group past them is cut as today. With 4 parts
+    /// (`VICTORY_SPLIT_PARTS=4`) a screen-sized pass at 3840x2160 (259,200)
+    /// runs whole.
+    #[test]
+    fn warp_a_dispatch_in_parts_runs_every_group_once() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let slots = 4 * PART as usize + 1024;
+        let mut seen = Vec::new();
+        for (parts, asked, runs) in [
+            (None, 70_000, PART),
+            (Some(SPLIT), 70_000, 70_000),
+            (Some(SPLIT), 115_200, 115_200),
+            (Some(SPLIT), 2 * PART, 2 * PART),
+            (Some(SPLIT), 2 * PART + 1, PART),
+            (Some(SPLIT), PART, PART),
+            (Some(SPLIT), 1, 1),
+            (Some(4), 259_200, 259_200),
+        ] {
+            let (counts, _) = ran_on_warp(&mut warp, parts, [asked, 1, 1], slots);
+            seen.push((parts, asked, against(&counts, runs)));
+        }
+        let want: Vec<_> = seen.iter().map(|&(parts, asked, _)| {
+            let runs = match (parts, asked) {
+                (None, _) | (_, 131_071) => PART,
+                _ => asked,
+            };
+            (parts, asked, (runs as usize, 0))
+        }).collect();
+        assert_eq!(seen, want, "(parts, asked, (groups run once, groups run otherwise))");
+    }
+
+    /// The records the clamp of parts makes: the groups past 65,535 in x in
+    /// the next record, a part with none left an empty record (y and z as
+    /// asked); a dispatch of two or three dimensions, or past the parts, is
+    /// bounded as the clamp of one bounds it, into the first record.
+    #[test]
+    fn warp_the_clamp_of_parts_writes_a_record_a_part() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        for (asked, made) in [
+            ([115_200, 1, 1], [[65_535, 1, 1], [49_665, 1, 1]]),
+            ([65_535, 1, 1], [[65_535, 1, 1], [0, 1, 1]]),
+            ([65_536, 1, 1], [[65_535, 1, 1], [1, 1, 1]]),
+            ([5, 3, 2], [[5, 3, 2], [0, 3, 2]]),
+            ([70_000, 2, 1], [[65_535, 2, 1], [0, 2, 1]]),
+            ([0, 1, 1], [[0, 1, 1], [0, 1, 1]]),
+            ([200_000, 1, 1], [[65_535, 1, 1], [0, 1, 1]]),
+        ] {
+            // (Room for every group a record may run: the program writes through a root view.)
+            let (_, records) = ran_on_warp(&mut warp, Some(SPLIT), asked, 2 * PART as usize + 1024);
+            assert_eq!(records, made, "{asked:?}");
+        }
+    }
+
+    /// The host's own list, as `crate::draw` records a dispatch in parts:
+    /// an indirect dispatch of 70,000 groups by a program with a first
+    /// group, clamped by [`bound_split`] and executed by [`execute_parts`],
+    /// runs every group once; clamped by [`bound`] and executed whole, as
+    /// with the switch off, today's first 65,535. With the debug layer on,
+    /// nothing recorded is invalid.
+    #[test]
+    fn host_list_runs_a_dispatch_in_parts() {
+        const ASKED: u32 = 70_000;
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let program = compile_cs(&host.device, GROUPS_CS).expect("the groups program must compile");
+        let signature = one_argument(&host.device, 2, PART_BYTES as u32);
+        let Some((args, args_ptr)) = host.shared_buffer(64) else {
+            return;
+        };
+        // SAFETY: inside the mapping; nothing runs.
+        unsafe { std::ptr::copy_nonoverlapping([ASKED, 1, 1].as_ptr(), args_ptr.cast::<u32>(), 3) };
+        let slots = ASKED as usize + 1024;
+        for in_parts in [true, false] {
+            let Some((ran, ran_ptr)) = host.shared_buffer(slots as u64 * 4) else {
+                return;
+            };
+            // SAFETY: the mapping holds `slots` counts; nothing runs.
+            unsafe { std::ptr::write_bytes(ran_ptr, 0, slots * 4) };
+            let scratch = if in_parts {
+                let (scratch, split) = bound_split(&list, (&args, 0), (2, 12, 1)).expect("the record is clamped");
+                assert!(split, "clamped in parts");
+                scratch
+            } else {
+                bound(&list, (&args, 0), None, (2, 12, 1)).expect("the record is clamped")
+            };
+            // SAFETY: an open list; the program's own root signature and
+            // pipeline; buffers the test holds until the list has run.
+            unsafe {
+                list.list.SetComputeRootSignature(&program.root);
+                list.list.SetPipelineState(&program.pso);
+                list.list.SetComputeRoot32BitConstant(0, 0, 0);
+                list.list.SetComputeRootUnorderedAccessView(1, ran.GetGPUVirtualAddress());
+                if in_parts {
+                    execute_parts(&list.list, &signature, &scratch, (0, 0), split());
+                } else {
+                    list.list.ExecuteIndirect(&signature, 1, &scratch, 0, None, 0);
+                }
+            }
+            list.close();
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the list has run; the mapping holds `slots` counts.
+            let counts = unsafe { std::slice::from_raw_parts(ran_ptr.cast::<u32>().cast_const(), slots).to_vec() };
+            // Clamped whole, what one dispatch runs on this card (an AMD
+            // card's runs all of them).
+            let runs = if in_parts { ASKED } else { widest(amd(&host.device)).min(ASKED) };
+            assert_eq!(against(&counts, runs), (runs as usize, 0), "in parts {in_parts}: groups run once, groups run otherwise");
+        }
+    }
+
+    /// Without the clamp of parts (it could not be made) a dispatch of a
+    /// program with a first group is clamped as without the switch, for one
+    /// execution: not dropped. Its first 65,535 groups run (all of them on an
+    /// AMD card), and a small one runs whole.
+    #[test]
+    fn host_list_without_the_clamp_of_parts_clamps_whole() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let program = compile_cs(&host.device, GROUPS_CS).expect("the groups program must compile");
+        let signature = one_argument(&host.device, 2, PART_BYTES as u32);
+        for asked in [70_000u32, 3] {
+            let Some((args, args_ptr)) = host.shared_buffer(64) else {
+                return;
+            };
+            // SAFETY: inside the mapping; nothing runs.
+            unsafe { std::ptr::copy_nonoverlapping([asked, 1, 1].as_ptr(), args_ptr.cast::<u32>(), 3) };
+            let slots = 70_000 + 1024;
+            let Some((ran, ran_ptr)) = host.shared_buffer(slots as u64 * 4) else {
+                return;
+            };
+            // SAFETY: the mapping holds `slots` counts; nothing runs.
+            unsafe { std::ptr::write_bytes(ran_ptr, 0, slots * 4) };
+            let (scratch, split) = bound_parts_with(&list, (&args, 0), (2, 12, 1), None).expect("clamped whole, not dropped");
+            assert!(!split);
+            // SAFETY: an open list; the program's own root signature and
+            // pipeline; buffers the test holds until the list has run.
+            unsafe {
+                list.list.SetComputeRootSignature(&program.root);
+                list.list.SetPipelineState(&program.pso);
+                list.list.SetComputeRoot32BitConstant(0, 0, 0);
+                list.list.SetComputeRootUnorderedAccessView(1, ran.GetGPUVirtualAddress());
+                list.list.ExecuteIndirect(&signature, 1, &scratch, 0, None, 0);
+            }
+            list.close();
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the list has run; the mapping holds `slots` counts.
+            let counts = unsafe { std::slice::from_raw_parts(ran_ptr.cast::<u32>().cast_const(), slots).to_vec() };
+            let runs = widest(amd(&host.device)).min(asked);
+            assert_eq!(against(&counts, runs), (runs as usize, 0), "{asked} asked: groups run once, groups run otherwise");
+        }
+    }
+
+    /// `VICTORY_SPLIT_PARTS`: unset is two parts; 2 to 16 are taken;
+    /// anything else is two parts and not taken (one warning, [`split`]).
+    #[test]
+    fn split_parts_setting_takes_two_to_sixteen() {
+        assert_eq!(split_from(None), (2, true));
+        for (text, parts) in [("2", 2), ("4", 4), (" 8 ", 8), ("16", 16)] {
+            assert_eq!(split_from(Some(text)), (parts, true), "{text:?}");
+        }
+        for text in ["0", "1", "17", "-4", "four", "", "4.0", "99999999999"] {
+            assert_eq!(split_from(Some(text)), (2, false), "{text:?}");
+        }
+    }
+
+    /// FNV-1a, 64 bits: a fingerprint of a text.
+    fn fnv(text: &str) -> u64 {
+        text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    /// The clamp of every execution but a dispatch in parts, and of all
+    /// with the switch off, is compiled from the base's text, byte for byte
+    /// (its length and fingerprint before the parts); the
+    /// clamp of parts says its two lines otherwise and keeps the rest.
+    #[test]
+    fn the_clamp_of_one_keeps_its_text_and_the_clamp_of_parts_two_lines() {
+        assert_eq!((SOURCE.len(), fnv(SOURCE)), (7340, 0x2e58_920c_eede_e1a1), "the clamp's text changed");
+        assert_eq!((SOURCE.matches(BOUND_LINE).count(), SOURCE.matches(STORE_LINE).count()), (1, 1));
+        for parts in SPLIT..=SPLIT_MOST {
+            let text = parts_source(parts);
+            let (head, body) = text.split_once('\n').unwrap();
+            assert_eq!(head, format!("#define PARTS {parts}u"));
+            assert_eq!(body.matches(STORE_LINE).count(), 0, "{parts}: the record is stored a part each");
+            assert_eq!(body.matches("        uint3 wide = g;\n").count(), 1, "{parts}");
+            // What is left of the text outside the two lines is the clamp of one's.
+            let (before, _) = SOURCE.split_once(BOUND_LINE).unwrap();
+            let (_, after) = SOURCE.split_once(STORE_LINE).unwrap();
+            assert!(body.starts_with(before) && body.ends_with(after), "{parts}");
+        }
+    }
+
     /// What a batch's table says of records added to it: one job per
     /// record, charged for every execution that reads it, and none for what
     /// the pass cannot read.
@@ -3193,7 +3664,20 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            // Each record's job charges 2^26 for every execution, in order:
+            // one that does not fit takes the rest with `REST`, else nothing.
+            let rest = super::rest() != 0;
+            let expected = (0..records).fold(0u32, |at, _| {
+                let cost = (1u32 << 26) * times;
+                if BUDGET - at >= cost {
+                    at + cost
+                } else if rest {
+                    BUDGET
+                } else {
+                    at
+                }
+            });
+            assert_eq!(spent, expected, "{times} times {records}");
         }
     }
 
@@ -3530,7 +4014,6 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
@@ -3877,7 +4360,6 @@ void work() {
                     heap_pairs,
                     tables,
                     targets,
-                    depth_written,
                     depth_tested,
                     stamps,
                     back,

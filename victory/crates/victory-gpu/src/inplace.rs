@@ -169,7 +169,6 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 
 /// Something placed elsewhere (`crate::port`) in the same form: counted as
 /// [`place_for`] counts, so that [`gone`] takes it off again.
-#[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
 pub(crate) fn counted(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_add(1, Ordering::Relaxed);
@@ -540,13 +539,11 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
 /// another in memory and in one section alike, if the range is one run of a
 /// section ([`Cover::Run`]): its first address, its bytes, the section and
 /// the offset of its first byte in it.
-#[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
 pub(crate) fn stretch(at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
     let v = views();
     stretch_in(&v.views, at, len)
 }
 
-#[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
 fn stretch_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
     let Cover::Run(section, offset) = cover_in(views, at, len) else {
         return None;
@@ -616,7 +613,6 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
 /// and every address the title sees it at (0: no more); `None` if the page is
 /// in no view of a section, or in very many. While the caller holds
 /// `crate::watch::title_memory_reading`.
-#[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
 pub(crate) fn beside_page(page: usize) -> Option<(usize, [usize; 8])> {
     for asked in [false, true] {
         {

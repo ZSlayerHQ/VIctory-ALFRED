@@ -4,8 +4,10 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
-#[path = "image_patch_absent.rs"]
-mod image_patch;
+#[path = "native_1440p.rs"]
+mod native_1440p;
+#[path = "upscaler_patch.rs"]
+mod upscaler_patch;
 
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
@@ -38,6 +40,70 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// The executable a run was pointed at: the file itself, or, given a folder, the one
+/// executable in it (of several, the one whose name begins with `game`).
+/// What to tell when the executable is not the retail build that the 1440p
+/// and DLSS patches know: often it is that build, changed in place by
+/// another tool (an FPS unlock changed 6 bytes and kept the stock file as
+/// `.exe.bak`: issue #6 of the public repository). A file beside it whose
+/// name begins as the executable's, of the same size, that hashes to the
+/// retail build is named.
+fn changed_copy(exe: &Path) -> String {
+    let len = std::fs::metadata(exe).map_or(0, |m| m.len());
+    let stem = exe.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let stock = exe
+        .parent()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.as_path() != exe
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_ascii_lowercase().starts_with(&stem))
+                && std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() == len)
+        })
+        .find(|p| std::fs::read(p).is_ok_and(|bytes| blake3::hash(&bytes).to_hex().as_str() == upscaler_patch::RETAIL_BUILD));
+    match stock {
+        Some(stock) => format!(
+            "{} is not the unchanged retail executable: it was changed in place (for example by an FPS patch). The unchanged one is {}: copy it back over the changed one, or choose the 1080p class or DLSS off. (For more than 30 fps use the launcher's frame-rate setting.)",
+            exe.display(),
+            stock.display()
+        ),
+        None => format!(
+            "{} is not the unchanged retail executable of version 1.0.2.1 (another build, or changed in place, for example by an FPS patch). 1440p output and DLSS need the unchanged file: restore it, or choose the 1080p class or DLSS off.",
+            exe.display()
+        ),
+    }
+}
+
+fn title_executable(given: &Path) -> Result<std::path::PathBuf> {
+    if !given.is_dir() {
+        anyhow::ensure!(given.exists(), "{} does not exist: give the title's executable, or the folder it is in", given.display());
+        return Ok(given.to_path_buf());
+    }
+    let mut exes: Vec<std::path::PathBuf> = std::fs::read_dir(given)
+        .with_context(|| format!("listing {}", given.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")))
+        .collect();
+    exes.sort();
+    let game = |p: &std::path::PathBuf| {
+        p.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().starts_with("game"))
+    };
+    if exes.len() > 1 && exes.iter().filter(|p| game(p)).count() == 1 {
+        exes.retain(game);
+    }
+    match exes.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => anyhow::bail!(
+            "{} is a folder with no executable in it: give the title's executable, or the folder it is in",
+            given.display()
+        ),
+        _ => anyhow::bail!("{} is a folder with {} executables in it: give the title's own", given.display(), exes.len()),
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -59,8 +125,7 @@ pub fn run(
     // DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`): Streamline
     // is loaded before anything of the title or the host GPU, and fails soft;
     // only if it offers one of them does the title render through its
-    // FidelityFX path, which DLSS takes over (`image_patch::prepare_upscaler`;
-    // this build does not have that patch).
+    // FidelityFX path, which DLSS takes over (`upscaler_patch::prepare_upscaler`).
     let mut asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
     asked.series_s = matches!(console, Console::SeriesS);
     let available = victory_hle::streamline::init(&asked);
@@ -86,6 +151,10 @@ pub fn run(
             upscaler.map(|m| format!(", scene at the {} scale ({})", m.name(), m.scale())).unwrap_or_default()
         );
     }
+    // A folder in place of the executable: the title's executable in it (reading a folder
+    // as a file fails with "Access is denied", which says nothing of the mistake).
+    let found = title_executable(exe)?;
+    let exe = found.as_path();
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -94,20 +163,72 @@ pub fn run(
         None => println!("build          unknown ({hash})"),
     }
 
-    // A 1440p output instead of the Series X's 4K one patches the title's
-    // image, which this build does not have: the switches are refused here,
-    // and taken out of the environment, so that nothing after (the GPU side
-    // reads `VICTORY_NATIVE_1440P`) takes the output for 1440p.
-    if ["VICTORY_RENDER_1080P", "VICTORY_NATIVE_1440P"].iter().any(|v| std::env::var(v).as_deref() == Ok("1")) {
-        println!("display        1440p output is not in this build: the title's own output");
-        // SAFETY: nothing else runs yet.
-        unsafe {
-            std::env::remove_var("VICTORY_RENDER_1080P");
-            std::env::remove_var("VICTORY_NATIVE_1440P");
+    // A 1440p output instead of the Series X's 4K one (`native_1440p`): the
+    // patched image goes to a folder of its own, beside the stock one.
+    let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
+    let native_1440p = render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1");
+    // A 1080p output with its scene at 1080p (no upscaling): the 1440p switches win.
+    let output_1080p = !native_1440p && std::env::var("VICTORY_OUTPUT_1080P").as_deref() == Ok("1");
+    let images = if native_1440p {
+        anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output needs the Series X profile");
+        if upscaler.is_some() && render_1080p {
+            println!("display        VICTORY_RENDER_1080P is left out: VICTORY_DLSS_MODE sets the scene's size");
         }
-    }
-    let images = if let Some(mode) = upscaler {
-        match image_patch::prepare_upscaler(&mut prepared, mode) {
+        let (w, h) = native_1440p::prepare(&mut prepared, render_1080p && upscaler.is_none())
+            .map_err(|e| if victory_game::identify(&hash).is_some() { e } else { e.context(changed_copy(exe)) })?;
+        // SAFETY: nothing else runs yet; the title and the display mode list
+        // read these later.
+        unsafe {
+            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{}x{}", native_1440p::WIDTH, native_1440p::HEIGHT));
+            std::env::set_var("VICTORY_NATIVE_1440P", "1");
+            // (Unset unless both were asked for: the GPU side reads it as the 1080p output.)
+            std::env::remove_var("VICTORY_OUTPUT_1080P");
+        }
+        match upscaler.map(|mode| (mode, upscaler_patch::prepare_upscaler(&mut prepared, mode))) {
+            Some((mode, Ok(()))) => {
+                let [rw, rh] = mode.render_size([native_1440p::WIDTH, native_1440p::HEIGHT]);
+                println!(
+                    "display        {}x{} SDR, scene {rw}x{rh} through the title's FidelityFX path ({})",
+                    native_1440p::WIDTH,
+                    native_1440p::HEIGHT,
+                    mode.name()
+                );
+                cfg.cache_subdir(&format!("images/native-1440p-upscaler-{}-sdr", mode.name()))?
+            }
+            other => {
+                if let Some((_, Err(e))) = other {
+                    println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
+                }
+                println!("display        {}x{} SDR, scene {w}x{h}", native_1440p::WIDTH, native_1440p::HEIGHT);
+                cfg.cache_subdir(if render_1080p { "images/1080p-to-1440p-sdr" } else { "images/native-1440p-sdr" })?
+            }
+        }
+    } else if output_1080p {
+        anyhow::ensure!(matches!(console, Console::SeriesX), "1080p output needs the Series X profile");
+        let (ow, oh) = native_1440p::OUTPUT_1080P;
+        let (w, h) = native_1440p::prepare_output(&mut prepared, native_1440p::OUTPUT_1080P, native_1440p::OUTPUT_1080P)
+            .map_err(|e| if victory_game::identify(&hash).is_some() { e } else { e.context(changed_copy(exe)) })?;
+        // SAFETY: nothing else runs yet; the title, the display mode list and
+        // the GPU side (`VICTORY_OUTPUT_1080P`, still set) read these later.
+        unsafe {
+            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{ow}x{oh}"));
+        }
+        match upscaler.map(|mode| (mode, upscaler_patch::prepare_upscaler(&mut prepared, mode))) {
+            Some((mode, Ok(()))) => {
+                let [rw, rh] = mode.render_size([ow, oh]);
+                println!("display        {ow}x{oh} SDR, scene {rw}x{rh} through the title's FidelityFX path ({})", mode.name());
+                cfg.cache_subdir(&format!("images/native-1080p-upscaler-{}-sdr", mode.name()))?
+            }
+            other => {
+                if let Some((_, Err(e))) = other {
+                    println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
+                }
+                println!("display        {ow}x{oh} SDR, scene {w}x{h}, no upscaling");
+                cfg.cache_subdir("images/native-1080p-sdr")?
+            }
+        }
+    } else if let Some(mode) = upscaler {
+        match upscaler_patch::prepare_upscaler(&mut prepared, mode) {
             Ok(()) => {
                 println!("display        the title's output, scene at {} of it through its FidelityFX path ({})", mode.scale(), mode.name());
                 cfg.cache_subdir(&format!("images/upscaler-{}", mode.name()))?
@@ -158,6 +279,12 @@ pub fn run(
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
+    // The F1 menu's save sharing, and an import it staged put in place before the title runs.
+    if let Some(data) = storage.parent()
+        && let Some(line) = victory_hle::save_share::start(data, title_dir)
+    {
+        println!("saves          {line}");
+    }
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
     victory_hle::console::set(match console {
         Console::SeriesX => victory_hle::console::Console::SeriesX,
@@ -234,12 +361,27 @@ pub fn run(
         unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
     }
     // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
-    // clock ticks at that interval (victory-gpu). The title's own rate is
-    // patched to match in the private build; this one does not have that
-    // patch, so the title keeps its own rate, as `VICTORY_TITLE_FPS=off` does.
+    // clock ticks at that interval (victory-gpu), and the title is given
+    // the matching rate in place of its setting's 30 (VICTORY_TITLE_FPS
+    // overrides it; `off` leaves the title alone).
     #[cfg(windows)]
-    if execute && std::env::var_os("VICTORY_FRAME_INTERVAL_MS").is_some() {
-        println!("frame rate: the title's own rate is left as it is (patching it is not in this build)");
+    if execute && let Some(ms) = victory_loader::frame_rate::asked_interval_ms() {
+        use victory_loader::frame_rate::{Patched, SITES, apply, title_interval_us, title_rate};
+        let asked = std::env::var("VICTORY_TITLE_FPS").ok();
+        match title_rate(ms, asked.as_deref()) {
+            Some(rate) => {
+                let size = image.info().size_of_image as usize;
+                // SAFETY: the image stays mapped and nothing of it has run yet.
+                let done = unsafe { apply(image.base(), size, rate, &SITES) };
+                let patched = done.iter().filter(|d| **d == Patched::Done).count();
+                println!(
+                    "frame rate: our clock {ms} ms; the title's rate {rate} ({patched} of {} reads of its setting patched; it asks for {} us at 60 Hz)",
+                    SITES.len(),
+                    title_interval_us(rate, false)
+                );
+            }
+            None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
+        }
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
@@ -309,7 +451,7 @@ fn watch(base: usize, size: usize) {
     let rvas: Vec<usize> = list
         .split(',')
         .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva + 4 <= size)
+        .filter(|&rva| rva.checked_add(4).is_some_and(|end| end <= size))
         .collect();
     std::thread::spawn(move || {
         let mut seen = vec![None; rvas.len()];
@@ -328,19 +470,48 @@ fn watch(base: usize, size: usize) {
 }
 
 /// Debugging aid: `VICTORY_TIMER_LOG=1` logs the title's timers once a
-/// second in the private build, which knows where they are in the title's
-/// data. This build does not: it says so, once (victory-gpu's own log of how
-/// even the frames are, under the same switch, stays).
+/// second (`victory_loader::frame_rate`): its frame time and limiter flag,
+/// and each timer's two times, step in seconds and in milliseconds. Whether
+/// game time keeps to the wall clock at any frame rate is read from these.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn timers(_base: usize, _size: usize) {
-    if std::env::var("VICTORY_TIMER_LOG").ok().as_deref() == Some("1") {
-        eprintln!("VIctory: VICTORY_TIMER_LOG: the title's timers are not in this build; only our frame times are logged");
+fn timers(base: usize, size: usize) {
+    use victory_loader::frame_rate::{FRAME_US, LIMITER_ON, TIMERS};
+    if std::env::var("VICTORY_TIMER_LOG").ok().as_deref() != Some("1") {
+        return;
     }
+    if TIMERS.iter().chain([&FRAME_US, &LIMITER_ON]).any(|&rva| rva + 0x14 > size) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let u32_at = |rva: usize| {
+            // SAFETY: inside the mapped image (checked above), title data.
+            unsafe { ((base + rva) as *const u32).read_volatile() }
+        };
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let timers: Vec<String> = TIMERS
+                .iter()
+                .map(|&t| {
+                    let step = f32::from_bits(u32_at(t + 0xc));
+                    format!("{} {} {step:.4} {}", u32_at(t), u32_at(t + 4), u32_at(t + 0x10))
+                })
+                .collect();
+            eprintln!(
+                "VIctory: the title's timers at {} ms: frame_us {} limiter {} frames {}; timers (time ms, frames, step s, step ms): {}",
+                start.elapsed().as_millis(),
+                u32_at(FRAME_US),
+                u32_at(LIMITER_ON) & 0xff,
+                victory_hle::frames_begun(),
+                timers.join(" | ")
+            );
+        }
+    });
 }
 
 /// Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at
 /// each title+rva twice a second. A title that ends itself when its main
-/// loop has not ticked for a while (the title: 30 s) runs on
+/// loop has not ticked for a while (the game: 30 s) runs on
 /// through slower frames with its tick flag poked. The address must be
 /// writable title data.
 #[cfg(all(windows, feature = "diagnostics"))]

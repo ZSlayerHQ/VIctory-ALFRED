@@ -897,4 +897,76 @@ mod tests {
             ]
         );
     }
+
+    /// Real threads, real waits: what the wrappers record names who ended
+    /// them, and the chain leads to the thread that worked.
+    #[test]
+    fn real_waits_are_recorded_with_who_ended_them() {
+        use super::super::{hooks, record, span};
+        use std::sync::{Arc, Condvar, Mutex};
+        hooks::wrap_own();
+        record::make_room();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let lock = Arc::new(Mutex::new(()));
+        record::begin();
+        record::frame();
+        let first = super::super::record::ticks();
+        let worker = {
+            let (gate, lock) = (gate.clone(), lock.clone());
+            std::thread::spawn(move || {
+                let held = lock.lock().unwrap();
+                let working = span("the work of a test");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                let spun = std::time::Instant::now();
+                while spun.elapsed().as_millis() < 30 {
+                    std::hint::spin_loop();
+                }
+                working.end();
+                drop(held);
+                *gate.0.lock().unwrap() = true;
+                gate.1.notify_all();
+                record::thread()
+            })
+        };
+        {
+            let mut open = gate.0.lock().unwrap();
+            while !*open {
+                open = gate.1.wait(open).unwrap();
+            }
+        }
+        let last = super::super::record::ticks();
+        let me = record::thread();
+        let other = worker.join().unwrap();
+        // A contended lock.
+        let held = lock.lock().unwrap();
+        let second = {
+            let lock = lock.clone();
+            std::thread::spawn(move || {
+                drop(lock.lock().unwrap());
+                record::thread()
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(held);
+        let second = second.join().unwrap();
+        let data = record::end();
+        assert_eq!(data.lost, 0);
+        let trace = Trace::new(data.events, &[]);
+        let chain = trace.chain(me, last, first);
+        let work: u64 = chain.iter().filter(|p| p.thread == other && p.cause == "the work of a test").map(|p| p.to - p.from).sum();
+        assert!(ms(work) >= 20.0, "{chain:?}");
+        let contended = trace.waits[&second]
+            .iter()
+            .filter(|w| ms(w.t1 - w.t0) >= 10.0)
+            .find_map(|w| trace.waker(second, w));
+        assert_eq!(contended.map(|c| c.0), Some(me));
+        let mut names = Names::new();
+        let sites: Vec<String> = data.stacks.iter().map(|s| names.site(s)).collect();
+        assert!(sites.iter().any(|s| s.contains("real_waits_are_recorded")), "{sites:?}");
+        let mut json = Vec::new();
+        chrome(&trace, &mut names, &data.stacks, &Threads::now(), &mut json).unwrap();
+        assert!(json.starts_with(b"{\"traceEvents\""));
+        let text = summary(&trace, &mut names, &data.stacks, &Threads::now(), &Threads::now());
+        assert!(text.contains("frames in"));
+    }
 }

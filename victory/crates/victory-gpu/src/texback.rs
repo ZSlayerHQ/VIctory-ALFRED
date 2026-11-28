@@ -4,7 +4,7 @@
 //! in the texture's host copy. The title's ocean is one: its wave passes write
 //! a 256x256 height map (R32_FLOAT) and a displacement map (R32G32_FLOAT), and
 //! its CPU code samples both, which is what boats float on; it read memory
-//! nothing had written (run rw1, `VICTORY_READ_WATCH=1`: about 30 places in
+//! nothing had written (a measured run, `VICTORY_READ_WATCH=1`: about 30 places in
 //! the title read those two kinds), and boats sank.
 //!
 //! For textures of the kinds in `VICTORY_TEXTURE_BACK` (comma-separated

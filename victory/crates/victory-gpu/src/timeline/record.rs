@@ -15,10 +15,8 @@ pub(super) enum Kind {
     Calls,
     /// A wait on the object `a` (an address, or a handle's value); `b`: the
     /// value of the host's fence it stands for (0: none, [`COPY_QUEUE`]).
-    #[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
     Wait,
     /// The object `a` is signalled or released.
-    #[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
     Wake,
     /// A call of the kernel's that took long; `a` its bytes.
     Kernel,
@@ -119,6 +117,10 @@ pub(super) fn put(kind: Kind, name: &'static str, t: (u64, u64), a: u64, b: u64,
 
 /// Records an event of `thread`.
 fn put_of(thread: u32, kind: Kind, name: &'static str, (t0, t1): (u64, u64), a: u64, b: u64, stack: u32) {
+    // After `end`, a place would be one of the next recording's.
+    if !on() {
+        return;
+    }
     let slots = SLOTS.load(Ordering::Acquire);
     if slots.is_null() {
         return;
@@ -140,6 +142,9 @@ fn put_of(thread: u32, kind: Kind, name: &'static str, (t0, t1): (u64, u64), a: 
 
 /// The caller's stack: its place, plus one.
 fn stack() -> u32 {
+    if !on() {
+        return 0;
+    }
     let stacks = STACK.load(Ordering::Acquire);
     if stacks.is_null() {
         return 0;
@@ -269,7 +274,6 @@ impl Drop for CardWait {
 }
 
 /// This thread waited on `object` with `name` since `t0`.
-#[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
 pub(super) fn waited(name: &'static str, object: u64, t0: u64) {
     let t1 = ticks();
     let us = micros(t1 - t0);
@@ -280,14 +284,12 @@ pub(super) fn waited(name: &'static str, object: u64, t0: u64) {
 }
 
 /// `object` is about to be signalled.
-#[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
 pub(super) fn woken(name: &'static str, object: u64) {
     let t = ticks();
     put(Kind::Wake, name, (t, t), object, 0, 0);
 }
 
 /// A call of the kernel's on `bytes` began at `t0`.
-#[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
 pub(super) fn kernel(name: &'static str, bytes: u64, t0: u64) {
     let t1 = ticks();
     if micros(t1 - t0) >= 20 {
@@ -496,7 +498,6 @@ fn asked() -> Option<&'static Asked> {
 }
 
 /// Whether a timeline was asked for.
-#[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
 pub(super) fn wanted() -> bool {
     asked().is_some()
 }
@@ -649,24 +650,20 @@ pub(super) fn end() -> Data {
 
 /// Objects threads stand at now, by a hash of theirs: releases of a lock
 /// nobody waits for are not recorded.
-#[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
 static STOOD_AT: [AtomicU32; 4096] = [const { AtomicU32::new(0) }; 4096];
 
-#[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
 fn place(object: u64) -> &'static AtomicU32 {
     &STOOD_AT[(object.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52) as usize]
 }
 
 /// This thread is about to wait for `object`, until what comes back is
 /// dropped.
-#[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
 pub(super) fn standing(object: u64) -> Standing {
     place(object).fetch_add(1, Ordering::SeqCst);
     Standing(object)
 }
 
 /// See [`standing`].
-#[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
 pub(super) struct Standing(u64);
 
 impl Drop for Standing {
@@ -676,7 +673,6 @@ impl Drop for Standing {
 }
 
 /// Whether a thread may wait for `object`.
-#[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
 pub(super) fn stood_at(object: u64) -> bool {
     place(object).load(Ordering::SeqCst) != 0
 }

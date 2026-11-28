@@ -1150,6 +1150,13 @@ if node "$TOOLS/summarize-run.mjs" "$LOG" >"$LOG.md.tmp" 2>>"$LOG"; then
 fi
 rm -f "$LOG.md.tmp"
 printf 'harness: summary exit=%s\n' "$SUMMARY_RC" >>"$LOG"
+# The run's result file in its capture folder, for the stream's best-run card (scripts/run-result.mjs). It is made
+# from the summary and the log's head; a failure here costs the run nothing.
+RESULT_TOOL=$TOOLS/../scripts/run-result.mjs
+if [ "$SUMMARY_RC" = 0 ] && [ -f "$RESULT_TOOL" ] && [ -n "${CAPTURE:-}" ] && [ -d "$CAPTURE" ]; then
+  RESULT_LINE=$(RUN_RESULT_LOGS=$(dirname "$LOG") node "$RESULT_TOOL" "$CAPTURE" 2>&1 | head -1)
+  printf 'harness: result file: %s\n' "$RESULT_LINE" >>"$LOG"
+fi
 [ "$SUMMARY_RC" = 0 ] && cat "$LOG.md" | public_line
 say "victory exit=$RC"
 [ "$GPU_TRACE" = 1 ] && say "profiled: this code is Nsight's, not the title's"

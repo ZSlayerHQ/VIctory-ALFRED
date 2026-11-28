@@ -16,6 +16,7 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod ahead;
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
@@ -53,7 +54,6 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
-#[path = "port_absent.rs"]
 mod port;
 #[cfg(windows)]
 mod land;
@@ -75,6 +75,7 @@ pub mod replay;
 #[cfg(windows)]
 mod residency;
 pub mod resource;
+pub mod save_share;
 pub mod root;
 #[cfg(windows)]
 mod safecopy;
@@ -100,7 +101,6 @@ mod tdr;
 mod texture;
 pub mod timeline;
 #[cfg(windows)]
-#[path = "titlewrite_absent.rs"]
 pub mod titlewrite;
 #[cfg(windows)]
 mod upload;

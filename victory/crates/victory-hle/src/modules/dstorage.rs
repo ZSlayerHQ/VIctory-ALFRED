@@ -439,7 +439,7 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     /// Read at a time.
     const MOST: usize = 1 << 20;
     let sector = SECTOR as u64;
-    if offset % sector == 0 && out.len() % SECTOR == 0 && out.as_ptr() as usize % SECTOR == 0 {
+    if offset.is_multiple_of(sector) && out.len().is_multiple_of(SECTOR) && (out.as_ptr() as usize).is_multiple_of(SECTOR) {
         return read_overlapped(file, out, offset);
     }
     thread_local! {
@@ -629,16 +629,38 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        // As many workers as processors (`VICTORY_DSTORAGE_WORKERS=<n>`: that many), below
+        // normal priority (`VICTORY_DSTORAGE_PRIORITY=<-2..2>`, 0: normal, as before
+        // 2026-11-27). While a scene streams in, all of them unpack at once: in a crowded
+        // cutscene (timeline tl5, 176 s into a new game, 62 ms a frame) 16 workers ran 10 ms
+        // a frame each beside 8 listing threads of 20 ms, and the threads a frame waits for
+        // stood "woken, not running yet" for 9.5 ms of each frame's chain. Below them in
+        // priority the workers take the processors nobody of the frame wants. The process
+        // runs above normal (`runtime::ahead_of_other_programs`), so they still come before
+        // other programs' threads.
+        let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<i32>().ok());
+        let workers = match number("VICTORY_DSTORAGE_WORKERS") {
+            Some(n) if n > 0 => n as usize,
+            _ => std::thread::available_parallelism().map_or(4, |n| n.get()),
+        };
+        let priority = number("VICTORY_DSTORAGE_PRIORITY").map_or(-1, |p| p.clamp(-2, 2));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || {
+                        #[cfg(windows)]
+                        if priority != 0 {
+                            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+                            // SAFETY: this thread's own priority.
+                            unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+                        }
+                        work(scheduler)
+                    })
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, priority, "dstorage: workers (VICTORY_DSTORAGE_WORKERS, VICTORY_DSTORAGE_PRIORITY)");
     });
     Some(scheduler)
 }
@@ -2283,7 +2305,7 @@ mod tests {
         for round in 0..2 {
             for mode in [Io::One, Io::Handles, Io::Overlapped, Io::Direct] {
                 let file = Files::open_for_test(&path, mode);
-                let at: Vec<u64> = (0..READS).map(|_| random() % (len - SIZE as u64) & !15).collect();
+                let at: Vec<u64> = (0..READS).map(|_| (random() % (len - SIZE as u64)) & !15).collect();
                 for pass in ["cold", "again"] {
                     let next = std::sync::atomic::AtomicUsize::new(0);
                     let busy = AtomicU64::new(0);
@@ -2542,12 +2564,9 @@ mod tests {
         .unwrap();
     }
 
-    /// A DirectStorage worker that unpacks a BCPack request runs below normal
-    /// priority while it does (the title's threads run at normal) and is back
-    /// at normal once it is done.
-    #[test]
-    fn a_worker_unpacks_below_normal_and_gets_its_priority_back() {
-        use windows_sys::Win32::System::Threading::{THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL};
+    /// A BCPack request unpacked on a worker: the workers that did it, with their priority
+    /// during the unpack and after it.
+    fn unpacked_on_workers() -> Vec<(String, i32, i32)> {
         with_test_tables();
         let (_dir, file) = file_with(&BC4_STREAM);
         let (queue, array) = (new_queue(0), status_array(1));
@@ -2559,9 +2578,51 @@ mod tests {
         assert_eq!(out, bc4_blocks());
         let seen = BCPACK_PRIORITIES.lock().unwrap().clone();
         assert!(seen.iter().any(|(name, ..)| name.starts_with("dstorage ")), "a worker unpacked: {seen:?}");
-        for (name, during, after) in &seen {
+        for (name, ..) in &seen {
             assert!(name.starts_with("dstorage "), "unpacked on {name}");
-            assert_eq!((*during, *after), (THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL), "{name}");
+        }
+        seen
+    }
+
+    /// A DirectStorage worker that unpacks a BCPack request runs below normal
+    /// priority while it does and is back at the priority it had before once it
+    /// is done: the workers' own, `VICTORY_DSTORAGE_PRIORITY` (the upstream's
+    /// default since 2026-11-27: -1, below normal, so the unpack's guard gives
+    /// back -1; [`a_worker_at_normal_unpacks_below_normal_and_is_back_at_normal`]
+    /// has the workers at normal).
+    #[test]
+    fn a_worker_unpacks_below_normal_and_gets_its_priority_back() {
+        use windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL;
+        // (as the workers are started, `scheduler`)
+        let own = std::env::var("VICTORY_DSTORAGE_PRIORITY").ok().and_then(|v| v.trim().parse::<i32>().ok()).map_or(-1, |p| p.clamp(-2, 2));
+        for (name, during, after) in unpacked_on_workers() {
+            assert_eq!((during, after), (THREAD_PRIORITY_BELOW_NORMAL, own), "{name}");
+        }
+    }
+
+    /// With the workers at normal priority (`VICTORY_DSTORAGE_PRIORITY=0`, as before the
+    /// upstream's change) a worker unpacks below normal and is back at normal after it. Run in a
+    /// child process of its own: the workers take the switch once, when the first request
+    /// starts them, and this process's other tests start them at their default.
+    #[test]
+    fn a_worker_at_normal_unpacks_below_normal_and_is_back_at_normal() {
+        use windows_sys::Win32::System::Threading::{THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL};
+        const CHILD: &str = "VICTORY_DSTORAGE_PRIORITY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = "modules::dstorage::tests::a_worker_at_normal_unpacks_below_normal_and_is_back_at_normal";
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("VICTORY_DSTORAGE_PRIORITY", "0")
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && text.contains("1 passed"), "{text}{}", String::from_utf8_lossy(&out.stderr));
+            return;
+        }
+        assert_eq!(std::env::var("VICTORY_DSTORAGE_PRIORITY").as_deref(), Ok("0"));
+        for (name, during, after) in unpacked_on_workers() {
+            assert_eq!((during, after), (THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL), "{name}");
         }
     }
 

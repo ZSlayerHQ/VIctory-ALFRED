@@ -184,7 +184,7 @@ pub(crate) fn cards() -> bool {
 ///   and the card was 97% busy at 3 fps; at 2048 (1,979 MB on the card) the
 ///   three heaviest took 0.19, 0.25 and 0.41 ms, all of the title's commands
 ///   27-44 ms a frame, and the release build ran gameplay at 21-25 fps
-///   (2026-11-26, logs coolfox-20261126-134258 / -140021 / -140546).
+///   (three measured runs of 2026-11-26).
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
 ///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
 /// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
@@ -209,7 +209,7 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
 /// Resolve `(min_bytes, max_bytes)` from the adapter's local VRAM budget and
 /// optional explicit MiB overrides from `VICTORY_CARD_BUFFERS_MIN_MB` /
 /// `VICTORY_CARD_BUFFERS_MB`.
-fn resolve_card_limits(
+pub(crate) fn resolve_card_limits(
     local_vram_budget: Option<u64>,
     min_mb_override: Option<u64>,
     max_mb_override: Option<u64>,
@@ -228,7 +228,7 @@ fn resolve_card_limits(
 /// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
 /// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override.
-fn card_limits() -> (u64, u64) {
+pub(crate) fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
@@ -425,6 +425,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
+    crate::ahead::want_card();
     // Only while the card has room: with this copy on it, a fifth of the
     // budget the system gives us must still be free. Copies are made when
     // the world loads, before the textures fill the card; the texture
@@ -463,7 +464,9 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    // (one made ahead, if it is of that size and one is in store: `crate::ahead`)
+    let ahead = if size == crate::ahead::SIZE { crate::ahead::card() } else { None };
+    let buffer = ahead.or_else(|| host.uav_buffer(size));
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
@@ -1344,7 +1347,7 @@ fn pooled(n: usize) -> Vec<u8> {
 /// most are of copies of their own; with two or three frames in the air eight
 /// buffers were the eight largest, and every other snapshot was memory fresh
 /// from the kernel and given back to it: 11 % of the submitting thread in the
-/// opening (profile cpu-1: `NtAllocateVirtualMemory` under
+/// opening (by a profile: `NtAllocateVirtualMemory` under
 /// [`Shadow::writing`]), and the page faults of filling it.
 fn snapshots_kept() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -1409,9 +1412,36 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         .map(|i| chunk * DIFF_CHUNK + i)
 }
 
+/// Cut backwards to a piece boundary inside the span being scanned. The
+/// first cut of a span that does not start on a piece is the span's start:
+/// subtracting its offset into the piece would run below it (and wrap).
+fn scan_boundary(start: usize, from: usize, at: usize) -> usize {
+    at.saturating_sub((start + at) % PIECE).max(from)
+}
+
 #[cfg(test)]
 mod difference_tests {
-    use super::{first_difference, last_difference};
+    use super::{PIECE, first_difference, last_difference, scan_boundary};
+
+    #[test]
+    fn unaligned_parallel_scan_covers_the_first_piece() {
+        let span = 48 << 20;
+        for start in [0, 1, 31, PIECE - 1] {
+            for from in [0, 1, 31, PIECE - 1, PIECE + 3] {
+                let end = from + span;
+                let cuts = [
+                    scan_boundary(start, from, from),
+                    scan_boundary(start, from, from + span / 3),
+                    scan_boundary(start, from, from + 2 * span / 3),
+                    end,
+                ];
+                assert_eq!(cuts[0], from);
+                assert!(cuts.windows(2).all(|pair| pair[0] < pair[1]));
+                assert_eq!((start + cuts[1]) % PIECE, 0);
+                assert_eq!((start + cuts[2]) % PIECE, 0);
+            }
+        }
+    }
 
     /// The chunk searches agree with a byte-wise scan across chunk boundaries.
     #[test]
@@ -1526,6 +1556,90 @@ struct Workers {
     more: std::sync::Condvar,
     /// How many jobs there are, for [`spin`].
     there: std::sync::atomic::AtomicUsize,
+    /// How many [`Hot`] stand: while one does, an idle helper waits awake
+    /// ([`passes_hot_us`]).
+    hot: AtomicUsize,
+    /// [`now_us`] of the last job begun or ended, or of the last [`hot`].
+    busy_at: AtomicU64,
+}
+
+/// Microseconds since the first call (for [`Workers::busy_at`]).
+fn now_us() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+}
+
+static HOT_US: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// `VICTORY_PASSES_HOT` (read here; microseconds, `0` by default: off, as
+/// before): while a submission is prepared ([`hot`], from its start to its
+/// end) the helpers are woken at its start, and an idle one waits awake for
+/// the next pass instead of sleeping, up to this long after the last work
+/// or the start, giving way to other threads of its core now and then
+/// (`yield_now`). A pass then finds them awake, and the waking at the start
+/// overlaps the submission's asking and planning. Only when work starts
+/// changes, not what is done nor by whom it may be done.
+///
+/// Measured in the title with `1` (the helpers woken at each submission's
+/// start, back asleep soon after; RTX 4090, Ryzen 9 7950X3D, DLSS Quality,
+/// the walking route through the first boat mission at the 30 fps cap): the
+/// longest frame walking went from 525 to 145 ms, 29.1 to 29.3 fps. Longer
+/// values keep cores spinning: in `wide_tests::pass_overhead` 2000 (with the
+/// submitting thread also waiting awake at the join) cut a pass's cost
+/// beyond its work from 18 to 3 us on an idle machine, but with more
+/// threads busy than cores (40 on 32) it grew from 28 to 119 us, the
+/// spinning helpers taking the cores the submitting thread and the title
+/// need.
+pub(crate) fn passes_hot_us() -> u64 {
+    let v = HOT_US.load(Ordering::Relaxed);
+    if v != u64::MAX {
+        return v;
+    }
+    let v = std::env::var("VICTORY_PASSES_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+    HOT_US.store(v, Ordering::Relaxed);
+    v
+}
+
+/// Tests and benchmarks: [`passes_hot_us`] (`None`: as the environment
+/// says).
+#[cfg(test)]
+pub(crate) fn set_passes_hot(hot: Option<u64>) {
+    HOT_US.store(hot.unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+/// While held, the helpers of [`wide`] are kept awake ([`passes_hot_us`]).
+pub(crate) struct Hot(bool);
+
+/// Keeps the helpers awake for a while ([`passes_hot_us`]): taken where a
+/// submission's preparing begins, dropped where it ends.
+pub(crate) fn hot() -> Hot {
+    if passes_hot_us() == 0 {
+        return Hot(false);
+    }
+    let workers = workers();
+    workers.busy_at.store(now_us(), Ordering::Relaxed);
+    if workers.hot.fetch_add(1, Ordering::AcqRel) == 0 {
+        // Woken now, they are awake when the first pass comes.
+        let _queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        workers.more.notify_all();
+    }
+    Hot(true)
+}
+
+impl Drop for Hot {
+    fn drop(&mut self) {
+        if self.0 {
+            workers().hot.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// With [`hot`]: whether an idle helper is to stay awake.
+fn stay_awake(workers: &Workers) -> bool {
+    let most = passes_hot_us();
+    most != 0
+        && workers.hot.load(Ordering::Acquire) > 0
+        && now_us().saturating_sub(workers.busy_at.load(Ordering::Relaxed)) < most
 }
 
 /// Waits awake until `there` says so, `VICTORY_WIDE_SPIN` microseconds at
@@ -1545,9 +1659,20 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`]: three eighths of the logical processors, 2 to 8
+/// (`VICTORY_WIDE_THREADS=<n>`, 1 to 32, in its place). A quarter of them, 2 to 6, until
+/// 2026-11-27: on 16 logical processors 4 threads; with 8, the opening's cutscenes had 13
+/// seconds of 256 at 40 ms a frame or more in place of 28, and the stretch in which a scene
+/// streams in 38.9 ms a frame in place of 41.6 (measured runs; gameplay not measured, the
+/// title's own threads want processors there, hence 6 of 16).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static ASKED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
+        let n = std::env::var("VICTORY_WIDE_THREADS").ok()?.trim().parse::<usize>().ok()?.clamp(1, 32);
+        tracing::info!(n, "threads kept for refreshes on several threads (VICTORY_WIDE_THREADS)");
+        Some(n)
+    });
+    asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() * 3 / 8).clamp(2, 8))
 }
 
 fn workers() -> &'static Workers {
@@ -1557,6 +1682,8 @@ fn workers() -> &'static Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
         more: std::sync::Condvar::new(),
         there: std::sync::atomic::AtomicUsize::new(0),
+        hot: AtomicUsize::new(0),
+        busy_at: AtomicU64::new(0),
     });
     STARTED.call_once(|| {
         for i in 0..wide_threads() {
@@ -1566,21 +1693,41 @@ fn workers() -> &'static Workers {
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     priority.keep();
-                    let job = {
+                    let job = 'found: loop {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.
                         spin(|| workers.there.load(Ordering::Acquire) > 0);
-                        let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
-                        loop {
-                            if let Some(job) = jobs.pop_front() {
-                                workers.there.fetch_sub(1, Ordering::AcqRel);
-                                break job;
+                        // While a submission is prepared: awake until work
+                        // comes (`passes_hot_us`).
+                        let mut turns = 0u32;
+                        while workers.there.load(Ordering::Acquire) == 0 && stay_awake(workers) {
+                            for _ in 0..32 {
+                                std::hint::spin_loop();
                             }
-                            jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                            turns = turns.wrapping_add(1);
+                            if turns.is_multiple_of(16) {
+                                std::thread::yield_now();
+                            }
                         }
+                        let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(job) = jobs.pop_front() {
+                            workers.there.fetch_sub(1, Ordering::AcqRel);
+                            break 'found job;
+                        }
+                        if stay_awake(workers) {
+                            continue;
+                        }
+                        jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                        if let Some(job) = jobs.pop_front() {
+                            workers.there.fetch_sub(1, Ordering::AcqRel);
+                            break 'found job;
+                        }
+                        // (Woken by `hot`, or for a job another took.)
                     };
+                    workers.busy_at.store(now_us(), Ordering::Relaxed);
                     let _working = crate::timeline::span("a job for another thread");
                     job();
+                    workers.busy_at.store(now_us(), Ordering::Relaxed);
                 }
             });
         }
@@ -1866,6 +2013,86 @@ mod wide_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Waits awake `us` microseconds.
+    fn busy(us: u64) {
+        let began = std::time::Instant::now();
+        while (began.elapsed().as_micros() as u64) < us {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// What a pass costs beyond its work (`VICTORY_PASSES_HOT`): passes of
+    /// as many pieces as there are threads, each 20 us of work, with 300 us
+    /// of the submitting thread's own work between them (as between a
+    /// submission's passes), as before (the helpers asleep between passes)
+    /// and with the helpers kept awake. Run with `cargo test --release -p
+    /// victory-gpu -- --ignored --nocapture pass_overhead`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn pass_overhead() {
+        const WORK: u64 = 20;
+        const PASSES: usize = 400;
+        let pieces = super::wide_threads() + 1;
+        // `VICTORY_BENCH_LOAD=n`: n threads busy beside, as the title's are.
+        let load: usize = std::env::var("VICTORY_BENCH_LOAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let busy_threads: Vec<_> = (0..load)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut x = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        for i in 0..10_000u64 {
+                            x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(i));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for (name, hot) in [("as before", 0), ("helpers hot", 2000)] {
+            super::set_passes_hot(Some(hot));
+            let _hot = super::hot();
+            let mut took: Vec<f64> = Vec::with_capacity(PASSES);
+            for _ in 0..PASSES {
+                busy(300);
+                let began = std::time::Instant::now();
+                super::wide_each(pieces, |_| busy(WORK));
+                took.push(began.elapsed().as_secs_f64() * 1e6 - WORK as f64);
+            }
+            took.sort_by(f64::total_cmp);
+            let mean = took.iter().sum::<f64>() / PASSES as f64;
+            println!(
+                "{name} ({load} threads busy beside): {pieces} pieces of {WORK} us on {} threads and this one: beyond the work \
+                 {mean:.1} us a pass in the mean, median {:.1}, p90 {:.1}; for 24 passes {:.2} ms",
+                super::wide_threads(),
+                took[PASSES / 2],
+                took[PASSES * 9 / 10],
+                mean * 24.0 / 1000.0
+            );
+        }
+        super::set_passes_hot(None);
+        stop.store(true, Ordering::Relaxed);
+        busy_threads.into_iter().for_each(|t| t.join().unwrap());
+    }
+
+    /// With the helpers kept awake ([`super::hot`]), every job still runs
+    /// once, and `wide` returns only when all have.
+    #[test]
+    fn hot_helpers_run_every_job() {
+        super::set_passes_hot(Some(2000));
+        let hot = super::hot();
+        for n in [2usize, 3, 7, 40, 1000] {
+            let done = Arc::new(AtomicUsize::new(0));
+            let seen = done.clone();
+            super::wide_each(n, move |_| {
+                seen.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(done.load(Ordering::Relaxed), n);
+        }
+        drop(hot);
+        super::set_passes_hot(None);
+    }
+
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.
     #[test]
@@ -2088,7 +2315,7 @@ const KERNEL_PAGE: usize = 4096;
 /// any other (it cannot be told as the guards' blocks can, `crate::land`), and
 /// the next refresh of it copied the pages and sent them up again: in the dorm
 /// 14.4 MB a frame of one copy of 90 MB whose 263 pieces were all fetched and
-/// all sent, 28 of 72 MB over the bus in all (run submit-2). Only pages a
+/// all sent, 28 of 72 MB over the bus in all (a measured run). Only pages a
 /// landing was noted in are compared, 4 KiB at a time: a page that is not the
 /// same goes up whole, as before, and so does every other.
 fn land_echo() -> bool {
@@ -2233,8 +2460,8 @@ fn wc_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
 /// Whether a refresh of a copy in the card's memory takes, and sends up,
 /// the dwords that title memory changed and no others
 /// (`VICTORY_SEND_CHANGED=1`; off: the 64 KiB pages written since it last
-/// took them, whole). Off since run tile1-0: the room lost its indirect light
-/// and geometry exploded; run bis1-0, the same but for this, was right.
+/// took them, whole). Off since a measured run: the room lost its indirect light
+/// and geometry exploded; a measured run, the same but for this, was right.
 ///
 /// A page that counts as written is mostly not the title's doing, or not all
 /// of it: a word the title wrote, and around it what shaders wrote and the
@@ -2315,7 +2542,7 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
 /// 12 MB this way and finds 80,000 runs.
 fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
-    if at % 4 == 0 && title.len() % 4 == 0 && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
+    if at.is_multiple_of(4) && title.len().is_multiple_of(4) && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the processor has AVX2, and the lengths are the same.
         return unsafe { word_runs_avx2(title, held) };
     }
@@ -2380,7 +2607,7 @@ fn under_wide() -> bool {
 /// threads, or data streamed in, may have written the bytes between (a heap
 /// holds what shaders write beside what the CPU does), and those writes were
 /// undone. Beside running title threads (the relay) that is a piece of
-/// memory going back in time now and then: runs pool1, blame1 and seriess2
+/// memory going back in time now and then: measured runs
 /// ended in the title decoding garbage.
 ///
 /// shortcut: a piece with very many runs has them joined over small gaps,
@@ -2804,7 +3031,7 @@ mod piece_tests {
 /// at `written` alone, so a page of a range shaders may be writing that the
 /// copy never took, and the title had not written lately, was neither
 /// merged nor a reason to settle; the refresh leaves such ranges alone, and
-/// shaders read zeros there (fxceless/victory-fork#206: missing geometry
+/// shaders read zeros there (an issue reported on another fork: missing geometry
 /// with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
 fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
     (a / PAGE..e.div_ceil(PAGE))
@@ -3566,7 +3793,7 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            scan_boundary(start, from, at)
         };
         let scan = &scan;
         std::thread::scope(|s| {
@@ -4965,7 +5192,7 @@ mod land_tests {
             });
             let mut now = vec![0u8; LEN];
             for round in 1..200u32 {
-                for block in (0..BLOCKS).filter(|b| (*b as u32 * 5 + round) % 3 != 0) {
+                for block in (0..BLOCKS).filter(|b| !(*b as u32 * 5 + round).is_multiple_of(3)) {
                     for i in (block * PIECE / 4 + 3..(block + 1) * PIECE / 4).step_by(4) {
                         now[i * 4..i * 4 + 4].copy_from_slice(&(round << 20 | i as u32).to_le_bytes());
                     }
@@ -5171,6 +5398,22 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
+}
+
+/// Whether a host copy made of title memory in `[address, address + len)`
+/// has one side only, in the PC's memory: the card reads the very buffer
+/// a submission's refreshes write (no card side, or title memory in place).
+/// Looked up as [`peek`] does, among the 64 buffers that start nearest
+/// below the range's end (the count of copies kept under flights, `crate::host`).
+pub(crate) fn one_sided_over(address: u64, len: u64) -> bool {
+    let Some(end) = address.checked_add(len.max(1)) else {
+        return false;
+    };
+    buffers_read()
+        .range(..(end, 0))
+        .rev()
+        .take(64)
+        .any(|(_, e)| e.end > address && e.shadow.as_ref().is_some_and(|s| !s.carded()))
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {

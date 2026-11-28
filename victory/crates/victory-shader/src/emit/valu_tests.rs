@@ -90,6 +90,125 @@ const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
+/// The first group's number the host gives the programs that ask for it.
+const GROUP_BASE: u32 = 65_535;
+
+/// `COMPUTE_PGM_RSRC2` bits: the group's number in x, and in y, in the SGPRs after the user
+/// data.
+const GROUP_X: u32 = 1 << 7;
+const GROUP_Y: u32 = 1 << 8;
+
+/// A compute program that reads its group's number in x alone adds the number of the first
+/// group, with `VICTORY_SPLIT_DISPATCH=1`: a dispatch of more groups than the host runs comes
+/// in parts. Not one that reads y, none with the switch off, and none whose root signature has
+/// no room for the word.
+#[test]
+fn a_group_number_in_x_counts_from_the_host_s_first_group() {
+    let program = |y: bool| -> Vec<u32> {
+        // s12 and s13: the group's number in x and in y (s5 and s6, after
+        // the 5 user SGPRs).
+        let mut words = vec![s_mov_b32(12, 5)];
+        if y {
+            words.push(s_mov_b32(13, 6));
+        }
+        words.push(s_mov_b32(5, 0x80));
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+        words.push(vop1(0x001, 1, sgpr(if y { 13 } else { 12 }))); // v_mov_b32 v1
+        words.push(vop1(0x001, 0, sgpr(12))); // v_mov_b32 v0, s12
+        // With y: what is stored is the number in y.
+        if y {
+            words.push(vop1(0x001, 0, vgpr(1))); // v_mov_b32 v0, v1
+        }
+        words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+        words.push(S_ENDPGM);
+        words
+    };
+    // A root parameter at user-data dword 64: the word would come after it, past what a host
+    // root signature holds. Lowered again without it, and said.
+    super::first_group::set_for_tests(Some(true));
+    let _ = super::take_no_room();
+    let far = RootParam { root: RootType::Constants, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 64, slot: 2 };
+    let shader = lower_words_with(program(false), 1, 0, GROUP_X, &[far]);
+    assert!(!shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_GROUP_BASE)), "no room");
+    assert!(super::take_no_room(), "the lack of room is told");
+    assert!(!super::take_no_room(), "and told once");
+    for on in [true, false] {
+        super::first_group::set_for_tests(Some(on));
+        let base = if on { GROUP_BASE } else { 0 };
+        for (enabled, y, expected) in [(GROUP_X, false, base), (GROUP_X | GROUP_Y, false, base), (GROUP_X | GROUP_Y, true, 0)] {
+            let shader = lower_words(program(y), 1, 0, enabled);
+            let asks = shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_GROUP_BASE));
+            assert_eq!(asks, expected != 0, "switch {on}, y {y}");
+            run_cases_on(&shader, &[[1, 2, 3, 4]], &[("warp", true)], |label, _, _, out| {
+                assert_eq!(out, expected, "{label}: switch {on}, y {y}");
+            });
+        }
+    }
+    super::first_group::set_for_tests(None);
+}
+
+/// A dispatch of 70,000 groups as the host runs it with `VICTORY_SPLIT_DISPATCH=1`, on WARP:
+/// two parts, of 65,535 groups and of the 4,465 after them, each told the number of its first
+/// group. The program adds 1 at its group's number (`buffer_atomic_add`): every group is
+/// counted once. (Without the first group the second part counts the first 4,465 groups
+/// again, and the last 4,465 never.)
+#[test]
+fn a_dispatch_in_parts_runs_every_group_once() {
+    const GROUPS: u32 = 70_000;
+    const PARTS: [(u32, u32); 2] = [(0, 65_535), (65_535, GROUPS - 65_535)];
+    let [load, load_offset] = s_load_dwordx4(8, 4);
+    let words = vec![
+        s_mov_b32(12, 5), // the group's number in x
+        s_mov_b32(5, 0x80),
+        load,
+        load_offset,
+        vop1(0x001, 1, sgpr(12)), // v_mov_b32 v1, s12
+        vop2(0x01A, 1, 130, 1),   // v_lshlrev_b32 v1, 2, v1
+        vop1(0x001, 2, 129),      // v_mov_b32 v2, 1
+        0xE0C8_1000,
+        0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen
+        S_ENDPGM,
+    ];
+    super::first_group::set_for_tests(Some(true));
+    let shader = lower_words(words, 1, 0, GROUP_X);
+    super::first_group::set_for_tests(None);
+    let base = shader.user_data.iter().find(|u| u.root == RootType::Other(super::USER_GROUP_BASE));
+    let base = base.map(|u| u.index);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = match Host::new(true) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 WARP device ({e}); skipped");
+            return;
+        }
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+    let mut counts = vec![0u32; GROUPS as usize];
+    for (first, groups) in PARTS {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        if let Some(base) = base {
+            ud[base as usize] = first;
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(GROUPS)],
+                    samplers: &[],
+                    groups: [groups, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        for (count, ran) in counts.iter_mut().zip(&out[0]) {
+            *count += ran;
+        }
+    }
+    let wrong: Vec<(usize, u32)> = counts.iter().copied().enumerate().filter(|&(_, n)| n != 1).collect();
+    assert_eq!((wrong.len(), wrong.first()), (0, None), "every group of {GROUPS} once (first group {base:?})");
+}
+
 /// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
@@ -112,9 +231,19 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    lower_words(words, threads, lds_bytes, 0)
+}
 
+/// Lowers a whole program of [`build_cs`]'s layout; `rsrc2`: more bits of
+/// that register.
+fn lower_words(words: Vec<u32>, threads: u32, lds_bytes: u32, rsrc2: u32) -> HostShader {
+    lower_words_with(words, threads, lds_bytes, rsrc2, &[])
+}
+
+/// [`lower_words`] with `more` root parameters in the layout.
+fn lower_words_with(words: Vec<u32>, threads: u32, lds_bytes: u32, rsrc2: u32, more: &[RootParam]) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
+    let mut native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 8,
@@ -147,11 +276,12 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
+            rsrc2: rsrc2 | (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
             threads: [threads, 1, 1],
         }),
         code,
     };
+    native.layout.extend_from_slice(more);
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
@@ -235,6 +365,7 @@ fn run_cases_on(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
                     (RootType::Table, 1) => 0,
+                    (RootType::Other(super::USER_GROUP_BASE), _) => GROUP_BASE,
                     other => panic!("unexpected user data {other:?}"),
                 };
             }

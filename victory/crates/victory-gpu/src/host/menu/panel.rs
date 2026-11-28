@@ -10,8 +10,8 @@ use super::art::{self, Lettering, Scaled};
 pub(super) enum Entry {
     Heading(&'static str),
     Blank,
-    /// A setting (with a value) or an action (without).
-    Line { label: &'static str, mark: &'static str, value: String, picked: bool },
+    /// A setting (with a value), an action or a save to import (without).
+    Line { label: String, mark: &'static str, value: String, picked: bool },
 }
 
 /// What the panel shows: the list, the picked row's help (one or more

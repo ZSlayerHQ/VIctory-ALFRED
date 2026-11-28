@@ -1,12 +1,11 @@
-//! The meetings of a console wave's two host waves as group barriers (board W35 P2,
+//! The meetings of a console wave's two host waves as group barriers (
 //! `VICTORY_PAIR_MEETINGS=barrier`): thread groups of two console waves of 64, each run as two
 //! host waves of 32 ([`lower::with_pair_meetings`]). Each fixture is one of the design note's
 //! correctness checks. Where values are compared, the console's are the 64-lane model's
 //! ([`super::wave_model`], one run per console wave); the translation's come from a device
-//! with 32-lane waves, which the software adapter is not (G-127): there the comparison is
+//! with 32-lane waves, which the software adapter is not: there the comparison is
 //! skipped with a line, and the shape of the emitted program is what is checked. A program
-//! with a group barrier on a cycle of its control flow goes to the software adapter only
-//! (G-106).
+//! with a group barrier on a cycle of its control flow goes to the software adapter only.
 
 use std::collections::HashSet;
 
@@ -177,12 +176,12 @@ fn meetings_in_group_uniform_code_are_one_barrier_each_and_no_loop() {
     eprintln!("ran: both console waves' exchanges, as the console runs them");
 }
 
-/// Check 2, Astra's counter-examples: a per-lane loop with an exchange of LDS between the
+/// Check 2, a review's counter-examples: a per-lane loop with an exchange of LDS between the
 /// halves each round (lane t writes its sum and adds lane t ^ 63's), its back edge taken per
 /// console wave. `rounds` sets v7 to the lane's rounds: a back edge only the upper half takes
 /// (1 and 2 rounds), unequal trips between the halves of one console wave (2 and 4), unequal
 /// trips between the console waves (2 and 4). The loop's latch decides per console wave, which
-/// the group need not share: refused as group barriers (P3 would take it group-wide).
+/// the group need not share: refused as group barriers (group-wide branches would take it).
 #[test]
 fn meetings_in_loops_a_console_wave_goes_round_its_own_way_are_refused_as_barriers() {
     let cases: [(&str, [u32; 4]); 3] = [
@@ -320,7 +319,7 @@ fn a_meeting_behind_a_scalar_branch_on_a_per_wave_load_is_refused_as_a_barrier()
 /// every thread of the group goes round alike. As group barriers its one meeting a turn is one
 /// barrier (the spin form's is three, two of them around its poll) and the exchange buffer
 /// flips each turn; the values are the console's. The barrier stands on the loop, so the run
-/// is on the software adapter only (G-106), which has no 32-lane waves (G-127): there the
+/// is on the software adapter only, which has no 32-lane waves: there the
 /// values are not compared.
 #[test]
 fn an_exchange_in_a_loop_of_several_turns_flips_its_buffer_each_turn() {

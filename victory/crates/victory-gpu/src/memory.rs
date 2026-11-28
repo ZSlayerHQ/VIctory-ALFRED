@@ -8,8 +8,8 @@
 //! copy ([`crate::shadow`]), which every other access uses. A page outside
 //! buffers has a page of its own in an **arena**: memory of ours with a copy
 //! on the card ([`crate::shadow::by_address`]). The streamed structures lie
-//! anywhere between other data (6.6 GB of title memory in 4 MiB windows, run
-//! light-1; 8 GB in windows of 256 KiB, light-2), so a page is what is kept.
+//! anywhere between other data (6.6 GB of title memory in 4 MiB windows in
+//! one measured run; 8 GB in windows of 256 KiB in another), so a page is what is kept.
 //!
 //! This module keeps what a shader needs to find the pages:
 //!
@@ -51,7 +51,7 @@
 //! dwords that changed since they were last taken go up. A packed structure
 //! goes up whole when the builder comes to it, whatever is known of it: the
 //! same bytes streamed in again do not differ from those last taken, and the
-//! card holds them unpacked (run light-3: a quarter of the structures
+//! card holds them unpacked (a measured run: a quarter of the structures
 //! unpacked a second time, into garbage all over their neighbours).
 //!
 //! **Stores are bounded**: a structure the builder misreads makes it store
@@ -103,7 +103,7 @@ const BUILT: u64 = 4 << 20;
 const BACK: u64 = 256 << 10;
 /// Pages taken from the faults, of one frame and in all, at most: a ray in a
 /// structure that is not right goes anywhere, and 2,048 a frame took all the
-/// pages there are in the first seconds (run light-4).
+/// pages there are in the first seconds (a measured run).
 const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
 /// Frames over which every page is looked at once.
@@ -834,9 +834,9 @@ const SIZES: usize = usize::MAX - (9 << 33);
 /// Whether a submission that asks for the sizes of structures is waited for,
 /// and landed, before the title goes on (`VICTORY_BVH_SIZES_WAIT=1`; off).
 ///
-/// Off: it does not help. In run light-15, with it, 33 of 154 copies had the
+/// Off: it does not help. In a measured run, with it, 33 of 154 copies had the
 /// slot's old size still (all of them recorded one frame after the size was
-/// asked for) against 53 of 230 in light-11, 48 of 275 dynamic structures
+/// asked for) against 53 of 230 in the run without it, 48 of 275 dynamic structures
 /// were good, and the title asks in every frame, so every frame waits (109 ms
 /// against 90). The title reads the slot before our submission of the asking
 /// list is through, or reads it for another purpose; not known.
@@ -846,7 +846,7 @@ const SIZES: usize = usize::MAX - (9 << 33);
 /// without looking whether it is there, takes memory of that size and copies
 /// the structure into it. With submissions that land up to two frames late it
 /// read what the slot held before, some other structure's size, and the copy
-/// wrote over its neighbours: of 230 such copies of run light-11, 99 were
+/// wrote over its neighbours: of 230 such copies of a measured run, 99 were
 /// asked for two frames earlier and landed in that frame, none of those with
 /// the right size.
 fn sizes_wait() -> bool {
@@ -1083,7 +1083,7 @@ pub(crate) fn ready(
     // recorded was brought up to date by that list's submission alone, which
     // may run after this one's (structures unpacked from zeros, and then
     // written over by the arena's first upload: in frames that stream much in
-    // half of them, run light-8).
+    // half of them, a measured run).
     let first_read = list.first_use(READ);
     if list.first_use(usize::MAX - (6 << 33) - m.copies.len()) {
         m.bring_up(list);

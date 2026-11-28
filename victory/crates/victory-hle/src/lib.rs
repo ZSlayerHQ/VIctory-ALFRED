@@ -12,7 +12,6 @@
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
 mod host;
-#[path = "image_watch_absent.rs"]
 mod image_watch;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::frame_phase;
@@ -28,6 +27,7 @@ pub use victory_gpu::console;
 /// DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`).
 #[cfg(windows)]
 pub use victory_gpu::streamline;
+pub use victory_gpu::save_share;
 #[cfg(windows)]
 pub use victory_gpu::reserve_upload_space;
 #[cfg(all(windows, feature = "diagnostics"))]

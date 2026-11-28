@@ -32,6 +32,11 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+#[cfg(feature = "diagnostics")]
+mod guard_asked;
+#[cfg(feature = "diagnostics")]
+use guard_asked::{GuardPlace, title_asked_guard};
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -106,6 +111,9 @@ pub extern "system" fn XMemVirtualAlloc(
         },
     };
     let asked = protect;
+    // The title's own protection, before the console bits are masked off.
+    #[cfg(feature = "diagnostics")]
+    title_asked_guard(GuardPlace::XMemVirtualAlloc, base as usize, size, protect);
     let mut protect = match protect & HOST_PROTECTION {
         0 => PAGE_NOACCESS,
         p => p,
@@ -188,7 +196,7 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && asked & 0x400 != 0 {
         victory_gpu::title_memory_write_combined(at as usize, size);
     }
-    // (the title asks for its 32-bit heap with kind 0x42000,
+    // (the game asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)
     if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
@@ -547,6 +555,48 @@ struct Pages {
     pages: HashMap<usize, Slice>,
 }
 
+/// The first page number given out; 0 stays unused.
+const FIRST_PAGE: usize = 0x10_0000;
+/// Numbers from here on do not survive the title's 21-bit `number >> 4`
+/// ([`FRAMES`]).
+const PAGE_LIMIT: usize = 1 << 25;
+
+impl Pages {
+    /// The first of `n` numbers, [`FRAMES`] apart, for new pages: after the
+    /// last given while they fit the title's 21 bits (as before), then the
+    /// lowest run of `n` freed ones. `None` if there is no such run.
+    fn take(&mut self, n: usize) -> Option<usize> {
+        let len = n.checked_mul(FRAMES)?;
+        let end = self.next_page.checked_add(len);
+        if let Some(end) = end.filter(|&end| end <= PAGE_LIMIT) {
+            let first = self.next_page;
+            self.next_page = end;
+            return Some(first);
+        }
+        static REUSING: std::sync::Once = std::sync::Once::new();
+        REUSING.call_once(|| {
+            tracing::info!("page numbers reach the title's 21 bits: freed ones given again");
+        });
+        let mut used: Vec<usize> = self.pages.keys().copied().collect();
+        used.sort_unstable();
+        free_run(used, len)
+    }
+}
+
+/// The lowest `start` from [`FIRST_PAGE`] where `len` (a multiple of
+/// [`FRAMES`]) numbers up to [`PAGE_LIMIT`] are all outside `used`
+/// (sorted).
+fn free_run(used: impl IntoIterator<Item = usize>, len: usize) -> Option<usize> {
+    let mut start = FIRST_PAGE;
+    for at in used.into_iter().chain([PAGE_LIMIT]) {
+        if at.checked_sub(start).is_some_and(|gap| gap >= len) {
+            return Some(start);
+        }
+        start = start.max(at.checked_add(FRAMES)?);
+    }
+    None
+}
+
 /// Where the title sees its pages: [`Physical::views`] the other way.
 /// Locked apart from them, and only for a moment ([`PAGES`]).
 #[derive(Default)]
@@ -663,8 +713,8 @@ impl Drop for Held {
 /// where both are.
 static PAGES: LazyLock<RwLock<Pages>> = LazyLock::new(|| {
     RwLock::new(Pages {
-        // Page numbers are opaque to titles; 0 stays unused.
-        next_page: 0x10_0000,
+        // Page numbers are opaque to titles.
+        next_page: FIRST_PAGE,
         pages: HashMap::new(),
     })
 });
@@ -731,8 +781,14 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
     });
     let mut table = page_table_mut();
-    let first = table.next_page;
-    table.next_page += n * FRAMES;
+    let Some(first) = table.take(n) else {
+        drop(table);
+        // The title keeps 21 bits of a number (`FRAMES`).
+        tracing::warn!(n, "XMemAllocatePhysicalPages: out of page numbers");
+        // SAFETY: checked non-null. The section goes with `section`.
+        unsafe { count.write(0) };
+        return 0;
+    };
     for index in 0..n {
         let slice = Slice {
             section: section.clone(),
@@ -1110,7 +1166,7 @@ impl Drop for Costed {
 /// pages of a batch and then submits it. Each call waits for the process's
 /// one address-space lock, behind the guards' and the driver's: 200 to 400
 /// us a page in the world against 10 in a menu, 2 to 4 s of every 5 s of
-/// that thread (runs stream-1 and -2; all six stacks taken of it in the
+/// that thread (measured runs; all six stacks taken of it in the
 /// opening were in these calls), so that models came as fast as their pages
 /// could be mapped. A page took up to four calls (unmap, split, map,
 /// commit), twice: the title maps a page into its pool and then has the GPU
@@ -1143,21 +1199,15 @@ pub(crate) fn lift_thread() {
     }
 }
 
-/// Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`): xmem's part is [`arrange`],
-/// the GPU side's half is `victory_gpu`'s `port`, which the public tree
-/// leaves out. So the switch is refused here, with one line, and is off.
+/// Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`; the GPU side's half is
+/// `victory_gpu`'s `port`): read here for xmem's part, [`arrange`].
 fn port_on() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| {
-        if std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1") {
-            tracing::warn!("VICTORY_PORT_CONSTANTS=1: renderer port 1 is not in this build; off");
-        }
-        false
-    });
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"));
     *ON
 }
 
 /// The title's reservations of 64 KiB pages for 32-bit graphics memory:
-/// base and bytes (one, of 185 MB, in the title).
+/// base and bytes (one, of 185 MB, in the game).
 static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// Pages given another place in their section so far by [`arrange`], and
@@ -1171,7 +1221,7 @@ static ARRANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// reservation), so that the reservation becomes one stretch of the section
 /// and the GPU side can open it as one heap.
 ///
-/// The title takes all the pages of its 185 MB heap in one call
+/// The game takes all the pages of its 185 MB heap in one call
 /// and maps its five pieces in another order than their addresses (run
 /// port1-1: "Scattered"). Only fresh slices are exchanged: never mapped,
 /// never written (no commit bit), so every page still reads as zeros and
@@ -1524,7 +1574,7 @@ fn runs_of(slices: &[Slice]) -> Vec<usize> {
 ///
 /// Each view is a system call to map and one to unmap again (unmapping is
 /// the dearest: 110 us a view in a cutscene, 330,000 of them in 4 minutes
-/// of run x1440-streamlog), so a run of n pages in one view costs 2 calls
+/// of a measured run), so a run of n pages in one view costs 2 calls
 /// where it cost 2n. The streaming log's last two fields say how many of
 /// the copies' pages continue a run. What it may cost: a later change of a
 /// single page inside such a view unmaps all of it and maps the rest again
@@ -2173,7 +2223,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
 /// one touched is let go with no system call at all.
 ///
 /// Why: the title maps the pages it streams into one call a page (365,000
-/// calls in 4 minutes of run x1440-streamlog, 25.7 s), and DirectStorage
+/// calls in 4 minutes of a measured run, 25.7 s), and DirectStorage
 /// fills them through views of its own of the pages (by page number); the
 /// GPU side's page-mapping copies read what the pool shows from our books
 /// alone. Each such view was a map (45 us) and later an unmap (110 us, the
@@ -2210,7 +2260,7 @@ const SOFT_COPIES: u8 = 2;
 ///
 /// Why: every view of the host's is a call to map it (45 us) and one to
 /// unmap it (93 us), each waiting for a lock of the kernel's that our
-/// guards' protection changes take too. In 143 s of run stream2: 445,503
+/// guards' protection changes take too. In 143 s of a measured run: 445,503
 /// maps (20.1 s) and 349,175 unmaps (32.6 s); the title's 359,969 mapping
 /// calls took 23.8 s and its 3,294 page-mapping copies 33.7 s, one of them
 /// 467 ms of a frame of 608 (timeline tl.120). A view kept in the books is
@@ -2779,9 +2829,48 @@ extern "system" fn title_virtual_query(address: *const c_void, out: *mut MEMORY_
 /// The title's own `VirtualProtect`, as [`title_virtual_query`].
 extern "system" fn title_virtual_protect(address: *const c_void, size: usize, protect: u32, old: *mut u32) -> BOOL {
     use windows_sys::Win32::System::Memory::VirtualProtect;
+    #[cfg(feature = "diagnostics")]
+    title_asked_guard(GuardPlace::VirtualProtect, address as usize, size, protect);
     materialize_for(address as usize, size, Touch::TitleCall);
     // SAFETY: the title's own arguments.
     unsafe { VirtualProtect(address, size, protect, old) }
+}
+
+/// The title's own `VirtualProtect` without [`soft_views`], with
+/// `VICTORY_LOG_GUARD_ASKS=1` ([`seen_exports`]): the host's, with the
+/// guard-page line ([`title_asked_guard`]).
+#[cfg(feature = "diagnostics")]
+extern "system" fn title_virtual_protect_seen(address: *const c_void, size: usize, protect: u32, old: *mut u32) -> BOOL {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    title_asked_guard(GuardPlace::VirtualProtect, address as usize, size, protect);
+    // SAFETY: the title's own arguments.
+    unsafe { VirtualProtect(address, size, protect, old) }
+}
+
+/// The title's own `VirtualAlloc`, with `VICTORY_LOG_GUARD_ASKS=1`
+/// ([`seen_exports`]): the host's, with the guard-page line
+/// ([`title_asked_guard`]).
+#[cfg(feature = "diagnostics")]
+extern "system" fn title_virtual_alloc_seen(address: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+    title_asked_guard(GuardPlace::VirtualAlloc, address as usize, size, protect);
+    // SAFETY: the title's own arguments.
+    unsafe { VirtualAlloc(address, size, kind, protect) }
+}
+
+/// The pass-throughs the guard-page line needs, when it is asked for
+/// (`log`, [`guard_asked::on`]): the title's `VirtualAlloc`, and its
+/// `VirtualProtect` unless soft views hook that already (`soft`). Not asked
+/// for, none: the title's imports bind as without the line.
+#[cfg(feature = "diagnostics")]
+fn seen_exports(log: bool, soft: bool) -> Vec<crate::HleExport> {
+    if !log {
+        return Vec::new();
+    }
+    let mut seen = vec![crate::HleExport { name: "VirtualAlloc", address: title_virtual_alloc_seen as *const () as usize }];
+    if !soft {
+        seen.push(crate::HleExport { name: "VirtualProtect", address: title_virtual_protect_seen as *const () as usize });
+    }
+    seen
 }
 
 pub(crate) fn module() -> HleModule {
@@ -2792,10 +2881,17 @@ pub(crate) fn module() -> HleModule {
         crate::HleExport { name: "VirtualQuery", address: title_virtual_query as *const () as usize },
         crate::HleExport { name: "VirtualProtect", address: title_virtual_protect as *const () as usize },
     ];
+    // With `VICTORY_LOG_GUARD_ASKS=1` (diagnostics builds) the title's
+    // `VirtualAlloc`, and its `VirtualProtect` without soft views, for the
+    // guard-page line alone: the host's calls, passed through as they were.
+    #[cfg(feature = "diagnostics")]
+    let seen = seen_exports(guard_asked::on(), soft);
+    #[cfg(not(feature = "diagnostics"))]
+    let seen = Vec::new();
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
-        exports: soft.then_some(asks).into_iter().flatten().chain([
+        exports: soft.then_some(asks).into_iter().flatten().chain(seen).chain([
             crate::HleExport { name: "VirtualFree", address: title_virtual_free as *const () as usize },
             hle_export!(XMemAlloc),
             hle_export!(XMemFree),
@@ -2818,6 +2914,21 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without `VICTORY_LOG_GUARD_ASKS` no pass-through is installed; with
+    /// it, the title's `VirtualAlloc`, and its `VirtualProtect` unless soft
+    /// views hook that. And the registry holds what the switch says.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn the_guard_line_unasked_installs_nothing() {
+        let names = |log, soft| seen_exports(log, soft).iter().map(|e| e.name).collect::<Vec<_>>();
+        assert_eq!(names(false, false), Vec::<&str>::new());
+        assert_eq!(names(false, true), Vec::<&str>::new());
+        assert_eq!(names(true, false), ["VirtualAlloc", "VirtualProtect"]);
+        assert_eq!(names(true, true), ["VirtualAlloc"]);
+        // (This process's own switch, as the registry was built with it.)
+        assert_eq!(crate::registry::lookup("kernel32.dll", "VirtualAlloc").is_some(), guard_asked::on());
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
@@ -2962,6 +3073,28 @@ mod tests {
     }
 
     #[test]
+    fn page_numbers_freed_are_given_again_past_the_title_s_21_bits() {
+        let mut table = Pages {
+            next_page: PAGE_LIMIT - 2 * FRAMES,
+            pages: HashMap::new(),
+        };
+        // The last numbers that fit, as before.
+        assert_eq!(table.take(2), Some(PAGE_LIMIT - 2 * FRAMES));
+        assert_eq!(table.next_page, PAGE_LIMIT);
+        // Then the lowest free run, still packed into 21 bits.
+        assert_eq!(table.take(3), Some(FIRST_PAGE));
+        assert_eq!(table.take(usize::MAX), None);
+        let f = |k: usize| FIRST_PAGE + k * FRAMES;
+        assert_eq!(free_run([f(0), f(1), f(3)], FRAMES), Some(f(2)));
+        assert_eq!(free_run([f(0), f(1), f(3)], 2 * FRAMES), Some(f(4)));
+        assert_eq!(free_run([], PAGE_LIMIT - FIRST_PAGE), Some(FIRST_PAGE));
+        assert_eq!(free_run([f(0)], PAGE_LIMIT - FIRST_PAGE), None);
+        assert_eq!(free_run([], PAGE_LIMIT - FIRST_PAGE + FRAMES), None);
+        let p = free_run([PAGE_LIMIT - FRAMES], FRAMES).unwrap();
+        assert_eq!((p >> 4 & 0x1f_ffff) << 4, p);
+    }
+
+    #[test]
     fn physical_pages_map_alias_and_unmap() {
         let mut pages = [0usize; 3];
         let mut n = 3;
@@ -3091,7 +3224,7 @@ mod tests {
         assert!(lazy(c));
         assert_eq!(map_pages(c, 3, std::ptr::null(), true), c);
         assert!(!lazy(c));
-        assert!(physical().views.get(&(c as usize)).is_none());
+        assert!(!physical().views.contains_key(&(c as usize)));
         assert_eq!(host(c), MEM_RESERVE);
         assert_eq!(map_pages(c, 3, pages.as_ptr(), false), c);
         // SAFETY: mapped.
@@ -3102,7 +3235,7 @@ mod tests {
         assert_eq!(map_pages(d, 3, pages.as_ptr(), true), d);
         assert_eq!(map_pages(at(d, 1), 1, std::ptr::null(), true), at(d, 1));
         assert!(lazy(d) && lazy(at(d, 2)));
-        assert!(physical().views.get(&(at(d, 1) as usize)).is_none());
+        assert!(!physical().views.contains_key(&(at(d, 1) as usize)));
         assert!(materialize(at(d, 2) as usize, 1));
         assert!(!lazy(at(d, 2)) && lazy(d));
         // SAFETY: mapped now.
@@ -3195,7 +3328,7 @@ mod tests {
         assert_eq!(read(heap, 1), ((true, 1), vec![2]));
         // Unmapped: gone, with no view of the host's ever there.
         assert!(alias_as((heap + PAGE) as u64, 0, PAGE as u64, false, true));
-        assert!(!lazy(heap + PAGE) && physical().views.get(&(heap + PAGE)).is_none());
+        assert!(!lazy(heap + PAGE) && !physical().views.contains_key(&(heap + PAGE)));
         assert_eq!(soft_runs(heap, 4 * PAGE), [(heap, PAGE), (heap + 2 * PAGE, PAGE)]);
         assert_eq!(read(heap + PAGE, 2 * PAGE).0, (false, PAGE));
         // The CPU touches one: the handler maps it with its page's bytes,

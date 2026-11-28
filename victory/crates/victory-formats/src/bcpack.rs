@@ -1936,8 +1936,7 @@ mod tests {
     /// may hold them); the fast path must pack them as `decode` does.
     const NOT_BC7_SHAPES: [u16; 5] = [0x0091, 0x00c6, 0x0544, 0x00a7, 0xc046];
 
-    /// Mode 0 words the packer reads by the base's two BC7 fixes
-    /// (`docs/findings.md`): mode 0 rotated (rotation is only in modes 4 and
+    /// Mode 0 words the packer reads by the base's two BC7 fixes: mode 0 rotated (rotation is only in modes 4 and
     /// 5, so it is ignored) and mode 0 with partitions 16, 20, 36 and 52
     /// (its partition is four bits, header and anchors alike). Each decodes,
     /// through both paths alike.

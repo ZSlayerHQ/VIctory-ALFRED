@@ -55,15 +55,18 @@ faults. Measured on 2026-11-28 on an NVIDIA RTX 5090, at the larger console's pr
 | 🟡 | Frame time | about 40 to 45 ms (22 to 25 fps) against a 33 ms (30 fps) target |
 | 🟡 | Picture | grain on shadow, hair and beard edges; red blocks at the bottom and right edges; distant characters' heads ([KNOWN-FAULTS.md](KNOWN-FAULTS.md)) |
 | 🟡 | Interior light | a stand-in by default; the title's own ray-traced bounce light works behind a switch and costs about 12 ms a frame |
-| 🟡 | Water's own lighting | off by default: on, it still draws dark blocks |
+| 🟡 | Water's own lighting | on by default; the dark blocks it drew are fixed in the base, not yet re-checked here (`VICTORY_WATER_LIGHT=0` leaves it out on cards that run 32 lanes at a time, such as NVIDIA's) |
 | ⬜ | Ray tracing on the card's ray-tracing hardware | not yet: the title's rays run as ordinary compute work |
-| ⬜ | DLSS, frame generation, the 1440p output mode | coming to the public build; not in this copy (see below) |
+| ✅ | DLSS and frame generation | in this build; NVIDIA's files are placed by hand (see below) |
+| 🟡 | Output resolution | 3840 x 2160 and the two 1440p choices work; 1920 x 1080 stops the next start ([KNOWN-FAULTS.md](KNOWN-FAULTS.md)) |
 | ⬜ | Video memory on smaller cards | not yet measured on this base; the goal is to fit 12 GB cards |
 | ⬜ | Cards other than the RTX 5090 | untested ([Graphics cards](#graphics-cards)) |
 
-**Not in this copy yet: DLSS, frame generation and the 1440p output mode.** They work by changing the title's own
-code, and the files that do that are not published here; small stand-ins that do nothing keep the rest building.
-The settings menu shows their rows marked *(not in this build)*. They are coming to the public build.
+**NVIDIA's files are placed by hand.** This build downloads nothing. For DLSS and DLSS frame generation, put the
+`Streamline` folder of NVIDIA's Streamline SDK into `nvidia-sdk` under `%LOCALAPPDATA%\victory`, so that
+`Streamline\bin\x64\sl.interposer.dll` is there; a start without them says where they go and runs with the title's
+own upscaling. AMD's two FSR 3 frame generation DLLs go into `amd-fidelityfx` there. The MFG Unlocker mod, for DLSS
+frame generation on RTX 20 and 30 cards, is not in this build.
 
 <details>
 <summary><b>Being worked on now</b></summary>
@@ -76,7 +79,7 @@ The settings menu shows their rows marked *(not in this build)*. They are coming
   and being checked in play.
 - **Memory:** a lock that the runtime's memory guards wait on, and the copies between the memory the title shares
   with its GPU and the card's own.
-- **DLSS and frame generation** in the public build.
+- **The 1920 x 1080 output:** the title stops at the start with it chosen.
 
 The full list of what is wrong, and what is known of each cause, is in [KNOWN-FAULTS.md](KNOWN-FAULTS.md).
 
@@ -144,15 +147,18 @@ target\diag\victory.exe play "<path to the title's executable>"
 
 | Option | What it does |
 |---|---|
-| *(none)* | the larger console's profile, the stock 3840 x 2160 output, no frame-rate cap |
+| *(none)* | the larger console's profile, 2560 x 1440 output, DLSS Quality where NVIDIA's files are, frame generation off, no frame-rate cap |
+| `--res 4k` / `1080to1440` | the stock 3840 x 2160 output / a 1920 x 1080 scene upscaled by the title to 1440p (`1080`, a 1920 x 1080 output, does not work yet) |
+| `--dlss off` / `dlaa` / `balanced` / `performance` | the title's own upscaling, or another DLSS mode |
+| `--framegen 2` to `6` | frame generation on from the start: frames shown for each one rendered |
+| `--framegen-ready` | frame generation made ready but off, so that the F1 menu can switch it while playing (costs frame rate) |
+| `--fg-type auto` / `dlss` / `fsr` | which frame generation: DLSS where the card has it (RTX 40 and later), else AMD's FSR 3 (2x at most) |
 | `--series-s` | the smaller console's profile (lower detail, faster). Not a way to reach the project's target |
 | `--fps 30` / `60` / `120` | a frame-rate cap (30 is the console's own) |
 | `--preload` | prepare every shader before the title starts |
 | `--set VICTORY_X=1` | add or override any switch |
 
-`--res`, `--dlss`, `--framegen` and `--fg-type` belong to the parts this copy leaves out: a start here says so and
-goes on with the stock output and the title's own upscaling. What the F1 menu saved goes over these options at every
-start.
+What the F1 menu saved goes over these options at every start.
 
 </details>
 
@@ -175,8 +181,9 @@ flags, and [victory/README.md](victory/README.md) the build, the configuration a
 **Up / Down** move · **Left / Right** change · **Enter** selects · **F1** or **Esc** closes.
 
 Each row has a help line, and *(recommended)* marks the default choice. A change marked **Live** applies at once;
-the others apply after a restart. Saved settings apply at the next start. The menu saves when the title was started
-with `victory play` (or the harness's `--menu-file`). The panel is drawn from a `menu-art` folder beside the
+the others apply after a restart. Saved settings apply at the next start. The menu saves to the file `victory play` (or the
+harness's `--menu-file`) names, and otherwise, however the title was started, to `victory-settings.txt` in
+`VICTORY_HOME` or `%LOCALAPPDATA%\victory`, the file `victory play` reads at every start. The panel is drawn from a `menu-art` folder beside the
 executable, which `harness/snapshot-build.sh` copies from [`scripts/overlay-art/`](scripts/overlay-art/); without
 it, or with `VICTORY_MENU_PANEL=0`, the menu is plain text.
 
@@ -185,13 +192,14 @@ it, or with `VICTORY_MENU_PANEL=0`, the menu is plain text.
 
 | Group | Rows |
 |---|---|
-| **Graphics** | Resolution (only 3840 x 2160 in this build) · Console profile · Borderless fullscreen · DLSS upscaling and DLSS model preset *(not in this build)* |
-| **Frame rate** | FPS limit (Unlimited, 120, 60, 30) · Frame generation, Frame gen type and MFG unlocker *(not in this build)* |
-| **Lighting and water** | Real bounce light (the title's own ray-traced light; about a quarter of the frame rate today) · Ambient light fallback · Reflection fallback · Fog brightness clamp · Ray tracing: full BVH (experimental: a few frames a second) · Water lighting (dark blocks for now) · Heat haze and decal defrag (skipped by default: expensive for now) |
+| **Graphics** | DLSS Super Resolution · DLSS model preset · Resolution (3840 x 2160 and the two 1440p choices; 1920 x 1080 does not work yet) · Render resolution (in its place on the smaller console's profile) · Console profile · Borderless fullscreen |
+| **Frame rate** | Frame generation · Frame generation type · MFG unlocker mod *(not in this build)* · FPS limit (Unlimited, 120, 60, 30) |
+| **Lighting and water** | Real bounce light (the title's own ray-traced light; about a quarter of the frame rate today) · Ambient light fallback · Reflection fallback · Fog brightness clamp · Ray tracing: full BVH (experimental: a few frames a second) · Water lighting (on by default) · Heat haze and decal defrag (skipped by default: expensive for now) |
 | **Overlay** | FPS counter · Performance overlay (F3), both live |
 | **Input** | Lock cursor to window · Force English keyboard layout |
-| **Advanced** | Early depth test · Skip large GPU readbacks · Soft views (no hitch at cuts) · Async texture uploads · Command relay · GPU-side copies · Draw call batching · Compare on the card from. Leave these alone unless a task asks |
-| **Actions** | Apply and restart · Save (applies at next launch) · Precompile shaders (restarts the game) · Reset to defaults · Close |
+| **Advanced** | Early depth test · Skip large GPU readbacks · Soft views (no hitch at cuts) · Async texture uploads · Command relay · GPU-side copies · Draw call batching · Compare on the card from · In-place constant buffers (experimental). Leave these alone unless a task asks |
+| **Advanced: command submission** | Thin command lists · Join submission parts · Async submission |
+| **Actions** | Apply and restart · Save (applies at next launch) · Precompile shaders (restarts the game) · Reset to defaults · Export save (to the `Saves` folder beside the title's executable) · Import save (picked from that folder; put in place at the next start, the save it replaces zipped first, the game's own settings kept) · Close |
 
 </details>
 
@@ -203,7 +211,7 @@ Every switch is an environment variable named `VICTORY_…`, described in the so
 | Switch | What it does |
 |---|---|
 | `VICTORY_RT_RESOLVE=1` with `VICTORY_ACTIVATE_RAYS=1` | the title's own ray-traced light instead of the stand-in (about 12 ms a frame more) |
-| `VICTORY_WATER_LIGHT=1` | the water's own tiled lighting (still draws dark blocks) |
+| `VICTORY_WATER_LIGHT=0` | the water's own tiled lighting left out, on cards that run 32 lanes at a time such as NVIDIA's (it is on by default; elsewhere the switch does nothing) |
 | `VICTORY_STRICT_HALVES=1` | refuse the 64-lane programs that have only an approximate form on 32-lane cards |
 | `VICTORY_WAVE_WIDE=1` | an exact last-resort form for those programs: slower, and it can hang the card |
 | `VICTORY_FPS_LINE=0` / `VICTORY_PANEL=1` | the FPS counter off / the F3 overlay on |
@@ -261,11 +269,10 @@ If you have one of the untested cards, a run and its results sheet are the most 
 
 1. **A correct picture.** Fix the grain, the blocks at the screen's edge, and the faults that show when the title's
    own ray-traced light is switched on.
-2. **DLSS, frame generation and the 1440p mode** in the public build.
-3. **30 frames a second on the development card.** Cut the work on the one preparing thread and the waiting
+2. **30 frames a second on the development card.** Cut the work on the one preparing thread and the waiting
    between the processor and the card, and move the ray work onto ray-tracing hardware.
-4. **Smaller cards.** Make memory use follow the card's budget so that 12 GB cards can run it.
-5. **60 frames a second.**
+3. **Smaller cards.** Make memory use follow the card's budget so that 12 GB cards can run it.
+4. **60 frames a second.**
 
 The target is the larger console's profile at 1440p or 4K native, or upscaled to 4K from 1080p or 1440p. A lowered
 render resolution and the smaller console's profile are not ways to reach it.

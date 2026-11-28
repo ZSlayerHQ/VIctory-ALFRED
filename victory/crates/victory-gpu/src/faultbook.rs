@@ -36,7 +36,6 @@ pub(crate) enum What {
     Site = 9,
     /// A store (the instruction at `a`) was done beside the guard of block
     /// `b`.
-    #[allow(dead_code, reason = "its only callers outside the tests are modules the public tree leaves out")]
     Stored = 10,
     /// A write fault opened block `a` without the guards' lock
     /// (`VICTORY_FAULT_UNLOCKED`); b: other views of its page told as

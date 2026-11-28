@@ -12,7 +12,7 @@
 //! their old one). Each lane stores what it got; a refusal is reported as one, not as a
 //! disagreement.
 //!
-//! The software adapter has no 32-lane waves (G-127): there the fixtures translate, validate
+//! The software adapter has no 32-lane waves: there the fixtures translate, validate
 //! and stop before the dispatch. Their verdict comes from the card.
 
 use super::host::{Dispatch, Host, Root, View};
@@ -218,7 +218,7 @@ fn translated(native: &NativeProgram) -> Result<HostShader, ShaderError> {
 
 /// The UAV (`dwords` long) after `shader` ran once (one group) with root constants
 /// `constants`, on the host's adapter or, with `card` false, on the software adapter only (a
-/// loop that could hang a card at a group barrier: G-106, G-127); None (and a line) where
+/// loop that could hang a card at a group barrier); None (and a line) where
 /// the adapter does not take it.
 fn dispatched(shader: &HostShader, constants: [u32; 4], dwords: usize, card: bool) -> Option<Vec<u32>> {
     let Ok(host) = Host::new(!card) else {
@@ -305,7 +305,7 @@ fn family(f: &Fixture, cases: &[[u32; 4]]) -> Vec<String> {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).unwrap_or_else(|e| panic!("{}: DXIL validation failed: {e}", f.name));
     }
-    // The hang rule (G-106): a group barrier on a cycle of the emitted control flow may wait
+    // The hang rule: a group barrier on a cycle of the emitted control flow may wait
     // for a host wave that left the loop; such a program never goes to the card from here.
     let looped = super::bitcode::census::take_looped(&shader.dxil).expect("the module this thread wrote");
     if looped > 0 && f.card {
@@ -314,7 +314,7 @@ fn family(f: &Fixture, cases: &[[u32; 4]]) -> Vec<String> {
     }
     // Only a run in host waves of 32 says what a 32-lane card does: a program that fixes
     // that size runs nowhere else; one that fixes none runs in whatever waves the adapter
-    // has, which on the software adapter are not 32 lanes (G-127).
+    // has, which on the software adapter are not 32 lanes.
     let wave = required_wave(&shader.dxil);
     let warp = !f.card || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
     eprintln!("{}: translated, wave size {wave:?}", f.name);
@@ -485,7 +485,7 @@ fn scalar_loop_of_the_wave() -> Vec<u32> {
 
 /// In a group of two console waves, a varying first-lane read inside a loop the two console
 /// waves may go round different numbers of times (its count is a scalar of each wave's own)
-/// emits no group barrier there: it is refused (Astra's review of the strip tip, finding 1).
+/// emits no group barrier there: it is refused (a review's finding).
 #[test]
 fn a_first_lane_read_in_a_scalar_loop_of_each_console_wave_has_no_group_barrier() {
     let words = scalar_loop_of_the_wave();
@@ -602,7 +602,7 @@ fn plain_jump_loop_then_first_lane() -> Vec<u32> {
 
 /// After a loop the group's console waves may go round unequally and the iteration limit
 /// may return threads from (a plain back jump), a varying first-lane read is refused in a
-/// group of 128 (Astra's review of the census follow-up, 1); in one console wave both
+/// group of 128 (a review's finding); in one console wave both
 /// halves go round alike and keep the exchange.
 #[test]
 fn a_first_lane_read_after_a_loop_the_limit_may_return_some_waves_from_is_refused() {
@@ -616,7 +616,7 @@ fn a_first_lane_read_after_a_loop_the_limit_may_return_some_waves_from_is_refuse
 /// A root constant chooses between the end and a loop with no way out (only the iteration
 /// limit returns from it); inside, a branch on each console wave's first thread index (0 or
 /// 64) runs a varying first-lane read in one console wave only, then both jump back from one
-/// latch (Astra's review of the census follow-up, 2).
+/// latch (a review's finding).
 fn closed_loop_one_wave_reads() -> Vec<u32> {
     let mut a = Asm::default();
     a.sop1(3, 5, I(0))
@@ -651,8 +651,7 @@ fn a_first_lane_read_in_a_closed_loop_one_console_wave_runs_is_refused() {
 /// With `VICTORY_GROUP_SYNC=0` the exchange's group barriers keep their fence and lose the
 /// wait, so the other host wave's first lane may not be written yet: a varying first-lane
 /// read across the halves is refused, in one console wave (straight-line code) and in a
-/// group of two (a root-constant loop), as W35's meetings are (Astra's review of the census
-/// follow-up, 4).
+/// group of two (a root-constant loop), as the pairs' meetings are (a review's finding).
 #[test]
 fn a_first_lane_read_across_the_halves_is_refused_with_group_barriers_off() {
     let looped = first_lane_loop(|a| {
@@ -692,7 +691,7 @@ fn descriptor_count_loop(soffset: u32) -> Vec<u32> {
 /// A count loaded through a descriptor the table gives at a fixed place, a read-only view, is
 /// alike in every console wave; one at that place plus a root constant (s2) may be the UAV
 /// past it, which two console waves can read differently: the varying first-lane read in its
-/// loop is refused in a group of 128 (Astra's review of the census follow-up, 3).
+/// loop is refused in a group of 128 (a review's finding).
 #[test]
 fn a_first_lane_read_in_a_loop_counted_through_a_dynamically_offset_descriptor_is_refused() {
     let fixed = translated(&native_with_srv_then_uav(&descriptor_count_loop(125), 128)).expect("the fixed view translates");
@@ -704,7 +703,7 @@ fn a_first_lane_read_in_a_loop_counted_through_a_dynamically_offset_descriptor_i
     }
 }
 
-/// `VICTORY_STRICT_HALVES` off (the default outside tests): the lowering before the strip job,
+/// `VICTORY_STRICT_HALVES` off (the default outside tests): the lowering before the strict forms,
 /// which takes each host wave's own first lane, so the 128-thread program the strict form
 /// refuses translates again, with no group barrier on its loop (the program that draws the
 /// player's body was refused this way on a 32-lane host).
@@ -721,8 +720,8 @@ fn with_strict_halves_off_the_scalar_loop_translates_as_before() {
 
 /// A per-lane loop inside a loop on a scalar count, a first-lane read in the inner one: the
 /// inner loop's body is the inner loop alone, so its per-lane exit makes it one the two
-/// halves may go round unequally, and the local-wave form refuses the read there (Astra's
-/// finding 3) rather than give each half its own first lane.
+/// halves may go round unequally, and the local-wave form refuses the read there (a review's
+/// finding) rather than give each half its own first lane.
 fn nested_loops() -> Vec<u32> {
     let mut a = Asm::default();
     a.sop1(3, 5, I(0))
@@ -1075,7 +1074,7 @@ fn looped_barriers(words: &[u32]) -> Result<u32, ShaderError> {
 /// From the emitted control flow (no run): no group barrier stands in a loop whose back edge
 /// each lane takes on its own, where the two host waves of a console wave may go round
 /// different numbers of times and pair one trip's barrier with another's (or wait at it for
-/// a half that left: G-106). The exchange goes outside the loop, or the program is refused.
+/// a half that left). The exchange goes outside the loop, or the program is refused.
 #[test]
 fn no_group_barrier_stands_in_a_loop_the_two_halves_may_go_round_unequally() {
     for (name, words) in [("loop first-lane", per_lane_loop(true)), ("loop wave OR", per_lane_loop(false))] {
@@ -1095,9 +1094,9 @@ fn a_loop_both_halves_go_round_together_keeps_its_exchange_inside() {
 }
 
 /// After the loop fix, on the card: a program with a group barrier on a loop never goes
-/// there from [`family`] (G-106). The console's answer is the model's.
+/// there from [`family`]. The console's answer is the model's.
 #[test]
-#[ignore = "fails by design until the exact wave-wide loop form lands (board W34)"]
+#[ignore = "fails by design until the exact wave-wide loop form lands (a later step)"]
 fn a_first_lane_read_in_a_loop_one_half_goes_round_again_alone_is_the_consoles() {
     let f = Fixture {
         name: "loop first-lane",
@@ -1112,7 +1111,7 @@ fn a_first_lane_read_in_a_loop_one_half_goes_round_again_alone_is_the_consoles()
 /// [`a_first_lane_read_in_a_loop_one_half_goes_round_again_alone_is_the_consoles`] for the
 /// wave OR.
 #[test]
-#[ignore = "fails by design until the exact wave-wide loop form lands (board W34)"]
+#[ignore = "fails by design until the exact wave-wide loop form lands (a later step)"]
 fn a_wave_or_in_a_loop_one_half_goes_round_again_alone_is_the_consoles() {
     let f = Fixture {
         name: "loop wave OR",

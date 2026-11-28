@@ -459,6 +459,50 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// Before a draw with `this`: if its host pipeline is not made yet and the
+/// draw is one of the title's bakes (by the pipeline's shaders, else by
+/// `by_targets`, the draw's targets), waits for it ([`make::wait_if_bake`]).
+#[cfg(windows)]
+pub(crate) fn wait_if_bake(this: This, by_targets: impl FnOnce() -> bool) {
+    if this.is_null() {
+        return;
+    }
+    make::wait_if_bake(&pipeline(this).host, by_targets);
+}
+
+#[cfg(all(test, windows))]
+pub(crate) use make::test_settings;
+
+/// Tests: a shader of `stage` whose hash, as logged, is `hash` (its
+/// container is empty and does not translate).
+#[cfg(all(test, windows))]
+pub(crate) fn named_shader(stage: &'static str, hash: &str) -> Arc<Shader> {
+    Arc::new(Shader {
+        stage,
+        hash: hash.to_owned(),
+        container: Vec::new(),
+        ambient: None,
+        translated: OnceLock::new(),
+    })
+}
+
+/// Tests: a title pipeline of `shaders` whose host pipeline is `made`, given
+/// by its making only `delay` after a worker takes it up
+/// ([`make::Pending::held_back`]). Never released.
+#[cfg(all(test, windows))]
+pub(crate) fn held_back(shaders: Vec<Arc<Shader>>, delay: std::time::Duration, made: host::HostPipeline) -> This {
+    let host = Arc::new(make::Pending::held_back(shaders.clone(), delay, made));
+    let pipeline = Box::new(Pipeline {
+        object: Object::new(&FUNCTIONS),
+        packet: [0; 8],
+        shaders,
+        bound: std::sync::atomic::AtomicBool::new(false),
+        host,
+        builder: false,
+    });
+    Box::into_raw(pipeline).cast()
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -770,6 +814,20 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+pub(crate) mod samplers;
+
+/// For the F1 menu: whether this start runs the title's ray-tracing resolve (the bounce light).
+#[cfg(windows)]
+pub(crate) fn bounce_light_runs() -> bool {
+    !make::rt_resolve_left_out()
+}
+
+/// For the F1 menu: whether this start runs the water's tiled light.
+#[cfg(windows)]
+pub(crate) fn water_light_runs() -> bool {
+    !make::water_light_left_out_here()
+}
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

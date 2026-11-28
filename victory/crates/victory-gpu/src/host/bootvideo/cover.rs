@@ -39,10 +39,8 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
-use super::{Plan, Player, Rows, Step, decode_file, fit, qoi, write_frame};
+use super::{Plan, Player, Rows, Step, cores, decode_file, fit, pace, qoi, write_frame};
 
-/// Decode workers (as the boot video's).
-const WORKERS: usize = 2;
 /// Upload buffers, each reused once the copy out of it has run.
 const UPLOADS: usize = 3;
 /// Allocators, each reset once its list has run.
@@ -775,7 +773,9 @@ fn presenter(mut surface: Surface, plan: Plan, shared: Arc<Shared>) {
     let mut along = plan.clone();
     along.loops = u32::MAX;
     let decoded = plan.clone();
-    let player = Player::start_with(along, WORKERS, Arc::new(move |pos| decode_file(&decoded, u64::from(path_frame(pos, frames)))));
+    // Decode workers and ring as the boot video's, for its frame size.
+    let pace = pace(plan.size, plan.fps, cores());
+    let player = Player::start_with(along, pace, Arc::new(move |pos| decode_file(&decoded, u64::from(path_frame(pos, frames)))));
     let _unwinding = FailOnUnwind(Arc::clone(&shared));
     let mut player = match player {
         Ok(p) => p,

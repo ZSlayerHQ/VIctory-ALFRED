@@ -387,8 +387,8 @@ fn no_wait() -> bool {
 /// runtime was remapping at that moment, its levels became zeros on the
 /// card, good ones too: of 16,135 textures a recorded frame's slots show,
 /// 2,382 had zeros in the first level shown; 137 of that frame's 787 repeated
-/// uploads put zeros over a filled level (run pic1-1; 68,700 refreshes left
-/// in the 150 s of world of run play1).
+/// uploads put zeros over a filled level (a measured run; 68,700 refreshes left
+/// in the 150 s of world of a measured run).
 fn fill_unlocked() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FILL").is_none_or(|v| v != "0"))
@@ -1980,7 +1980,7 @@ fn committed_there(at: *const u8, len: usize) -> bool {
 /// they were (`VICTORY_COMMITTED_QUERY=1`). `VirtualQuery` answers with the
 /// length of the run of pages in the same state, which it finds by walking
 /// the page tables to the run's end: 8.8 ms for one question in the title's
-/// 1.1 GB block (round 6). The pass over the heap's views asks three or
+/// 1.1 GB block (a measured round). The pass over the heap's views asks three or
 /// more of them for every texture slot that is due, 3,000 slots a frame
 /// when the card has no room (run 75): that pass then ran 208-264 ms, and
 /// while it ran the submitting thread's write-watch askings waited behind
@@ -2579,7 +2579,7 @@ mod allocation_costs {
                 seen.push(digest(&bytes));
             }
         }
-        let text: Vec<u8> = (0..400u32).map(|i| (i * 37 >> 2) as u8).collect();
+        let text: Vec<u8> = (0..400u32).map(|i| ((i * 37) >> 2) as u8).collect();
         for at in 0..399 {
             let mut bytes = text.clone();
             bytes.swap(at, at + 1);

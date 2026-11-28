@@ -6,7 +6,7 @@
 use super::abi;
 
 /// `VICTORY_DLSS_MODE`: the render scale asked for (the title's renderer is
-/// patched to it in the full build, which the public tree leaves out), named as
+/// patched to it, see the app's `upscaler_patch::prepare_upscaler`), named as
 /// DLSS names its modes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
