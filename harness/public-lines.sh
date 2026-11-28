@@ -82,7 +82,7 @@ public_line() {
       'harness: '*|'heartbeat: '*|'log: '*|'capture: '*|'profile: '*|'restore: '*|'saved: '*|\
       'warm-up: '*|'warm-up mode: '*|'live: '*|'victory exit='*|'gpu-trace: '*|'renderdoc: '*|\
       'pipeline library: '*|'refused: '*|'warning: '*|'unknown argument: '*|'--'*|'no '*|\
-      'contact sheets: '*|'save-as failed'*|'usage: '*|\
+      'contact sheets: '*|'save-as failed'*|'usage: '*|'menu file: '*|\
       '# Run summary'*|'Range: '*|'Ending: '*|'watchdog: '*|'Screen record: '*|'FPS: '*|'PresentMon: '*|\
       'comparable: '*|'Last frame: '*|'Captured: '*|'Profiled: '*|'Scene '*|'## '*|'- '*|'  - '*)
         printf '%s\n' "$line"

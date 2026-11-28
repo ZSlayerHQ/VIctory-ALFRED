@@ -1140,3 +1140,218 @@ fn the_model_sums_every_trip_of_the_wave_whichever_half_goes_round() {
     // trip 1: every lane, all 32 bits; trips 2, 3: lanes 0-31, the low 16
     assert!(mem[2 * LANES..3 * LANES].iter().all(|&x| x == u32::MAX.wrapping_add(2 * 0xFFFF)));
 }
+
+/// A wave32 program (one console wave in a group of 32) with a scalar register that holds a
+/// number on one path and a lane mask from EXEC on the other, built into a key and compared
+/// per lane: the shape of the shadow-ray tracer's packed key (`CS_TraceShadowRays_FullAdaptive`).
+/// s0 == 0 takes the mask path: s27 = (t < s2) & exec; else s27 = s1 & 0x1fffff. After the
+/// join, s35 = (s3 << 5) | (s27 & 0x1fffff). Each lane stores whether s35 differs from its
+/// own (s3 << 5) | t (row 0), then which way `s_cbranch_vccnz` on s35 != s3 << 5 went (row 1:
+/// 1 taken, 2 not).
+fn joined_key() -> Vec<u32> {
+    let mut a = Asm::default();
+    a.sop1(3, 5, I(0)) // s_mov_b32 s5, 0
+        .raw(&[0x3D << 26 | 0x02 << 18 | 8 << 6 | 2, 125 << 25]) // s_load_dwordx4 s[8:11], s[4:5], 0
+        .vop2(0x1A, 3, I(2), 0) // v_lshlrev_b32 v3, 2, v0
+        .vop1(1, 6, I(1)) // v_mov_b32 v6, 1
+        .sopc(6, S(0), I(0)) // s_cmp_eq_u32 s0, 0
+        .branch(5, "mask") // s_cbranch_scc1
+        .sop2(0xE, 27, S(1), Lit(0x1F_FFFF)) // s_and_b32 s27, s1, 0x1fffff
+        .branch(2, "join")
+        .label("mask")
+        .vopc(0xC4, S(2), 0) // v_cmp_gt_u32 vcc_lo, s2, v0
+        .sop2(0xE, 27, S(VCC), S(EXEC)) // s_and_b32 s27, vcc_lo, exec_lo
+        .label("join")
+        .sop2(0xE, 31, S(27), Lit(0x1F_FFFF)) // s_and_b32 s31, s27, 0x1fffff
+        .sop2(0x1E, 32, S(3), I(5)) // s_lshl_b32 s32, s3, 5
+        .sop2(0x10, 35, S(32), S(31)) // s_or_b32 s35, s32, s31
+        .vop1(1, 5, S(32)) // v_mov_b32 v5, s32
+        .vop2(0x1C, 5, V(5), 0) // v_or_b32 v5, v5, v0
+        .vopc(0xC5, S(35), 5) // v_cmp_ne_u32 vcc_lo, s35, v5
+        .vop2(1, 2, I(0), 6) // v_cndmask_b32 v2, 0, v6, vcc_lo
+        .store(2, 3, 0)
+        .vop1(1, 5, S(32)) // v_mov_b32 v5, s32
+        .vopc(0xC5, S(35), 5) // v_cmp_ne_u32 vcc_lo, s35, v5
+        .sop2(0xE, VCC, S(EXEC), S(VCC)) // s_and_b32 vcc_lo, exec_lo, vcc_lo
+        .branch(7, "taken") // s_cbranch_vccnz
+        .vop1(1, 2, I(2))
+        .branch(2, "out")
+        .label("taken")
+        .vop1(1, 2, I(1))
+        .label("out")
+        .store(2, 3, 128)
+        .endpgm();
+    a.finish()
+}
+
+/// s0..s3 of [`joined_key`]: the number path with no low bits, with lane 7's, with every
+/// low bit; the mask path with no lane, lanes 0-2 (7), lanes 0-4 (31), every lane.
+const KEYS: [[u32; 4]; 7] = [
+    [1, 0, 0, 3],
+    [1, 7, 0, 3],
+    [1, u32::MAX, 0, 0],
+    [0, 0, 0, 3],
+    [0, 0, 3, 3],
+    [0, 0, 5, 0],
+    [0, 0, 32, 1],
+];
+
+#[test]
+fn a_wave32_mask_joined_with_a_number_and_compared_per_lane_is_the_consoles_number() {
+    const W: usize = 32;
+    let words = joined_key();
+    let native = NativeProgram { wave64: false, ..native_of(&words, W as u32) };
+    let names: Vec<&str> = crate::gfx10::decode(&native.code).expect("decode").iter().map(|i| i.name().unwrap_or("?")).collect();
+    for want in ["s_and_b32", "s_or_b32", "s_lshl_b32", "v_cmp_ne_u32", "s_cbranch_vccnz", "s_cbranch_scc1"] {
+        assert!(names.contains(&want), "{want} is not among {names:?}");
+    }
+    // the model: s35 is the number the registers hold on either path
+    for k in KEYS {
+        let low = if k[0] == 0 { ((1u64 << k[2].min(32)) - 1) as u32 } else { k[1] } & 0x1F_FFFF;
+        let key = k[3] << 5 | low;
+        let mem = super::wave_model::console_of(&words, &k, 2 * W, W);
+        for t in 0..W as u32 {
+            assert_eq!(mem[t as usize], u32::from(key != (k[3] << 5 | t)), "{k:?}: lane {t}'s compare");
+        }
+        let way = if key != k[3] << 5 { 1 } else { 2 };
+        assert!(mem[W..].iter().all(|&x| x == way), "{k:?}: the branch went {:?}", &mem[W..]);
+    }
+    let shader = translated(&native).unwrap_or_else(|e| panic!("refused: {e}"));
+    match validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        Ok(mut v) => {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).unwrap_or_else(|e| panic!("DXIL validation failed: {e}"));
+            eprintln!("joined key: validated");
+        }
+        Err(e) => eprintln!("joined key: no validator ({e}); not validated"),
+    }
+    let wave = required_wave(&shader.dxil);
+    assert_eq!(wave, Some(32), "one host wave of 32 is the console wave");
+    eprintln!("joined key: translated, wave size {wave:?}");
+    if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+        eprintln!("joined key: a wave32 program; not compared on the software adapter (it has no 32-lane waves)");
+        return;
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut found = Vec::new();
+    for k in KEYS {
+        let want = super::wave_model::console_of(&words, &k, 2 * W, W);
+        let Some(got) = dispatched(&shader, k, 2 * W, true) else { return };
+        if let Some(l) = (0..2 * W).find(|&l| want[l] != got[l]) {
+            found.push(format!("{k:?}: dword {l}: console {:#x}, ours {:#x}", want[l], got[l]));
+        }
+    }
+    eprintln!("joined key: {} cases run on the device, {} disagreements", KEYS.len(), found.len());
+    verdict(found);
+}
+
+/// [`joined_key`]'s start: the UAV's descriptor, v3 = 4 t, v6 = 1, s32 = s3 << 5.
+fn key_prologue(a: &mut Asm) {
+    a.sop1(3, 5, I(0)) // s_mov_b32 s5, 0
+        .raw(&[0x3D << 26 | 0x02 << 18 | 8 << 6 | 2, 125 << 25]) // s_load_dwordx4 s[8:11], s[4:5], 0
+        .vop2(0x1A, 3, I(2), 0) // v_lshlrev_b32 v3, 2, v0
+        .vop1(1, 6, I(1)) // v_mov_b32 v6, 1
+        .sop2(0x1E, 32, S(3), I(5)); // s_lshl_b32 s32, s3, 5
+}
+
+/// [`joined_key`]'s end: s35 = s32 | (s27 & 0x1fffff); each lane stores whether s35 differs
+/// from s32 (row 0).
+fn key_epilogue(a: &mut Asm) {
+    a.sop2(0xE, 31, S(27), Lit(0x1F_FFFF)) // s_and_b32 s31, s27, 0x1fffff
+        .sop2(0x10, 35, S(32), S(31)) // s_or_b32 s35, s32, s31
+        .vop1(1, 5, S(32)) // v_mov_b32 v5, s32
+        .vopc(0xC5, S(35), 5) // v_cmp_ne_u32 vcc_lo, s35, v5
+        .vop2(1, 2, I(0), 6) // v_cndmask_b32 v2, 0, v6, vcc_lo
+        .store(2, 3, 0)
+        .endpgm();
+}
+
+/// The key's join decided by a branch on a lane mask: only lane 0 has VCC (t == 0), and
+/// `s_cbranch_vccnz` takes the whole wave to the mask arm (s27 = vcc & exec = 1), the other
+/// arm giving 0. On the console every lane sees s35 = s32 | 1; a lowering that took the
+/// branch per lane would give lanes 1-31 the other arm's 0.
+fn key_behind_a_lane_branch() -> Vec<u32> {
+    let mut a = Asm::default();
+    key_prologue(&mut a);
+    a.vopc(0xC2, I(0), 0) // v_cmp_eq_u32 vcc_lo, 0, v0
+        .branch(7, "mask") // s_cbranch_vccnz
+        .sop1(3, 27, I(0)) // s_mov_b32 s27, 0
+        .branch(2, "join")
+        .label("mask")
+        .sop2(0xE, 27, S(VCC), S(EXEC)) // s_and_b32 s27, vcc_lo, exec_lo
+        .label("join");
+    key_epilogue(&mut a);
+    a.finish()
+}
+
+/// The key through two joins, every branch on a scalar: s0 != 0 gives s27 = s1 & 0x1fffff;
+/// else s2 != 0 gives 7 and s2 == 0 gives `s_cselect_b32 s27, exec_lo, s1` under EXEC
+/// narrowed to t < 16 (that EXEC where s3 == 0, else s1), a mask whose number the ballot
+/// cannot give (lanes 16-31 do not run there) and no form makes. The outer join is read; the
+/// inner one only through it.
+fn key_through_two_joins() -> Vec<u32> {
+    let mut a = Asm::default();
+    key_prologue(&mut a);
+    a.sopc(6, S(0), I(0)) // s_cmp_eq_u32 s0, 0
+        .branch(5, "inner") // s_cbranch_scc1
+        .sop2(0xE, 27, S(1), Lit(0x1F_FFFF)) // s_and_b32 s27, s1, 0x1fffff
+        .branch(2, "join")
+        .label("inner")
+        .sopc(6, S(2), I(0)) // s_cmp_eq_u32 s2, 0
+        .branch(4, "number") // s_cbranch_scc0
+        .sop1(3, 40, S(EXEC)) // s_mov_b32 s40, exec_lo
+        .vopc(0xD4, I(16), 0) // v_cmpx_gt_u32 exec_lo, 16, v0
+        .sopc(6, S(3), I(0)) // s_cmp_eq_u32 s3, 0
+        .sop2(0xA, 27, S(EXEC), S(1)) // s_cselect_b32 s27, exec_lo, s1
+        .sop1(3, EXEC, S(40)) // s_mov_b32 exec_lo, s40
+        .branch(2, "inner join")
+        .label("number")
+        .sop1(3, 27, I(7)) // s_mov_b32 s27, 7
+        .label("inner join")
+        .vop1(1, 7, I(0)) // v_mov_b32 v7, 0
+        .label("join");
+    key_epilogue(&mut a);
+    a.finish()
+}
+
+/// `words` (a wave32 program in a group of 32) as the runtime translates it for a host of
+/// 32-lane waves, with the instructions it must decode to.
+fn translated32(words: &[u32], has: &[&str]) -> Result<HostShader, ShaderError> {
+    let native = NativeProgram { wave64: false, ..native_of(words, 32) };
+    let names: Vec<&str> = crate::gfx10::decode(&native.code).expect("decode").iter().map(|i| i.name().unwrap_or("?")).collect();
+    for want in has {
+        assert!(names.contains(want), "{want} is not among {names:?}");
+    }
+    translated(&native)
+}
+
+#[test]
+fn a_mask_number_through_a_join_a_lane_branch_decides_is_refused() {
+    // the console: the whole wave takes the mask arm, so every lane's s35 differs from s32
+    let words = key_behind_a_lane_branch();
+    let mem = super::wave_model::console_of(&words, &[0, 0, 0, 3], 32, 32);
+    assert!(mem.iter().all(|&x| x == 1), "the console's lanes: {mem:?}");
+    match translated32(&words, &["s_cbranch_vccnz", "s_or_b32"]) {
+        Err(ShaderError::Unsupported { what, .. }) => assert_eq!(what, lower::MASK_ELSEWHERE),
+        Err(e) => panic!("refused for another reason: {e}"),
+        Ok(_) => panic!("emitted: lanes 1-31 would take the other arm's 0, not the console's 1"),
+    }
+}
+
+#[test]
+fn a_mask_number_through_a_join_only_another_join_reads_is_refused() {
+    // the console: s0 == 0, s2 == 0, s3 == 0: s27 is the narrowed EXEC (lanes 0-15), so s35
+    // differs from s32
+    let words = key_through_two_joins();
+    let mem = super::wave_model::console_of(&words, &[0, 0, 0, 0], 32, 32);
+    assert!(mem.iter().all(|&x| x == 1), "the console's lanes: {mem:?}");
+    let mem = super::wave_model::console_of(&words, &[0, 0, 1, 0], 32, 32);
+    assert!(mem.iter().all(|&x| x == 1), "s27 = 7: {mem:?}");
+    let mem = super::wave_model::console_of(&words, &[1, 0, 0, 0], 32, 32);
+    assert!(mem.iter().all(|&x| x == 0), "s27 = s1 & 0x1fffff = 0: {mem:?}");
+    match translated32(&words, &["s_cselect_b32", "s_cbranch_scc0", "s_or_b32"]) {
+        Err(ShaderError::Unsupported { what, .. }) => assert_eq!(what, lower::MASK_ELSEWHERE),
+        Err(e) => panic!("refused for another reason: {e}"),
+        Ok(_) => panic!("emitted: the inner join's mask, which nothing gives, would come as 0"),
+    }
+}

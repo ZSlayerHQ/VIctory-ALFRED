@@ -3994,6 +3994,8 @@ fn late_line(frames: f64) {
 
 pub(crate) mod aside;
 pub(crate) mod awake;
+/// The boot video (`VICTORY_BOOT_VIDEO`), over the title's first screens.
+mod bootvideo;
 /// The fuller caption, with `VICTORY_CAPTION_STATS` (on unless `0`)
 /// ([`caption::on`]); off by default.
 mod caption;
@@ -4004,7 +4006,9 @@ mod menu;
 #[cfg(test)]
 mod order_tests;
 mod panel;
+mod picture;
 mod place;
+mod qoi;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
@@ -9396,6 +9400,7 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
+    overlay_blend: picture::Blend,
     /// The numbers panel (F3), in every build.
     panel: panel::Panel,
     /// What the card does for frame generation, for the first seconds.
@@ -9627,6 +9632,17 @@ impl Meter {
                         all.saturating_sub(looks + mapped + same + staged + made + views),
                         crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                         crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20
+                    );
+                }
+                let [whole, read, nanos, found, past] = crate::draw::HEAP_TEXTURES_WHOLE.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+                if whole + past > 0 {
+                    tracing::info!(
+                        "whole looks again at textures picked by index in the last 5 seconds: {whole} made, {} MB read in \
+                         {:.1} ms, {found} changes found that the fingerprint did not see, {past} looks left to the \
+                         fingerprint by the frame's budget (VICTORY_RECHECK_WHOLE_MB of bytes, and a start budget \
+                         of 1 ms: a frame spends up to 1 ms plus one look)",
+                        read >> 20,
+                        nanos as f64 / 1e6
                     );
                 }
                 let served = crate::descriptor::host::SERVED.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
@@ -9870,7 +9886,16 @@ impl Meter {
             buffer.truncate(n.max(0) as usize);
             self.caption = Some(buffer);
         }
-        let Some(caption) = &self.caption else { return };
+        let Some(own) = &self.caption else { return };
+        // The shaders' status after the window's own text while it has one (`menu::status`).
+        let with_status: Vec<u16>;
+        let caption = match menu::status::line() {
+            Some(words) => {
+                with_status = own.iter().copied().chain(format!(" | {words}").encode_utf16()).collect();
+                &with_status
+            }
+            None => own,
+        };
         // Off, the text as before ([`meter_text`]); with
         // `VICTORY_CAPTION_STATS` (on unless `0`, [`caption::on`]) the window's text and
         // the figures, which the thread below finishes with a sample of the
@@ -10002,6 +10027,7 @@ impl Host {
                 Ok(()) => {
                     if p.format != format {
                         p.composer = None;
+                        p.overlay_blend = picture::Blend::default();
                     }
                     (p.width, p.height, p.format) = (width, height, format);
                     tracing::info!(
@@ -10165,9 +10191,10 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
-            p.panel.draw(self, copy, &back, (width, height), format);
+            bootvideo::draw(self, copy, &back, (width, height), format);
+            p.panel.draw(&mut p.overlay_blend, self, copy, &back, (width, height), format);
             p.notice.draw(self, copy, &back, (width, height), format);
-            p.menu.draw(self, copy, &back, (width, height), format);
+            p.menu.draw(&mut p.overlay_blend, self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -10319,6 +10346,8 @@ impl Host {
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
+            // The window the loading cover lies over, if it is asked for.
+            bootvideo::cover::title_window_is(hwnd);
             Ok(Presenter {
                 swap_chain,
                 width,
@@ -10329,6 +10358,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
+                overlay_blend: picture::Blend::default(),
                 panel: panel::Panel::new(),
                 notice: panel::Notice::new(),
                 menu: menu::Menu::new(),
@@ -10347,6 +10377,7 @@ fn title_window() -> Option<HWND> {
             GetWindowThreadProcessId(hwnd, Some(&mut process));
             if process == windows::Win32::System::Threading::GetCurrentProcessId()
                 && IsWindowVisible(hwnd).as_bool()
+                && !bootvideo::cover::is_cover(hwnd)
             {
                 *(found.0 as *mut Option<HWND>) = Some(hwnd);
                 return false.into();

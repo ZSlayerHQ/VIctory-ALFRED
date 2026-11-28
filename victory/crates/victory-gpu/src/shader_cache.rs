@@ -133,7 +133,12 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    // (`VICTORY_STRICT_HALVES=<hash>,...`: the strict forms for the programs it names, by the
+    // hash a run's log gives them)
+    let translate = |c: &[u8]| {
+        let hash = blake3::hash(c).to_hex();
+        victory_shader::emit::with_program_strict(&hash[..16], || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),

@@ -1,6 +1,10 @@
-//! A CPU model of one console wave of 64 lanes (GFX10 in wave64), the reference the
-//! translation of a console wave into two host waves of 32 is checked against
-//! (`wave_model_tests`).
+//! A CPU model of one console wave of 64 lanes (GFX10 in wave64) or 32 (wave32), the reference
+//! the translation of a console wave is checked against (`wave_model_tests`): into two host waves
+//! of 32, or into one host wave of its own size.
+//!
+//! In wave32 a lane mask is one dword: EXEC and VCC are `exec_lo` and `vcc_lo`, mask writes
+//! (compares, saveexec) write that dword alone, and the `_b32` mask instructions are the ones
+//! the compiler uses.
 //!
 //! It decodes its own words and depends on nothing else in the crate: it is the console as
 //! the RDNA ISA reference states it, not as the translator reads it. Every lane runs every
@@ -17,7 +21,7 @@
 //! The assembler below writes the same encodings, so a fixture's program and its reference
 //! come from one list of words.
 
-/// Lanes of a console wave.
+/// Lanes of a console wave in wave64 (the most a wave has: the model's VGPR width).
 pub(super) const LANES: usize = 64;
 
 /// Scalar operand codes.
@@ -32,9 +36,11 @@ const DPP8: u32 = 233;
 const DPP8_FI: u32 = 234;
 const DPP16: u32 = 250;
 
-/// One console wave: 128 scalar dwords (VCC at 106/107, EXEC at 126/127), SCC, 256 VGPRs of
-/// 64 lanes, and the raw UAV the program stores to, in dwords.
+/// One console wave: its lane count (32 or 64), 128 scalar dwords (VCC at 106/107, EXEC at
+/// 126/127), SCC, 256 VGPRs of 64 lanes (a wave32 uses the first 32), and the raw UAV the
+/// program stores to, in dwords.
 pub(super) struct Wave {
+    lanes: usize,
     s: [u32; 128],
     scc: bool,
     v: Vec<[u32; LANES]>,
@@ -49,22 +55,39 @@ struct Src {
 }
 
 impl Wave {
-    /// The wave at the program's start: the root constants in s0 up, v0 the thread index
-    /// (one wave of 64 threads, so the lane), every lane in EXEC, every other register 0.
-    pub(super) fn new(constants: &[u32], mem_dwords: usize) -> Self {
+    /// The wave of `lanes` lanes (32 or 64) at the program's start: the root constants in s0
+    /// up, v0 the thread index (one wave of that many threads, so the lane), every lane in
+    /// EXEC, every other register 0.
+    pub(super) fn with_lanes(constants: &[u32], mem_dwords: usize, lanes: usize) -> Self {
+        assert!(lanes == 32 || lanes == 64, "a wave of 32 or 64 lanes");
         let mut s = [0u32; 128];
         s[..constants.len()].copy_from_slice(constants);
         s[EXEC] = u32::MAX;
-        s[EXEC + 1] = u32::MAX;
+        s[EXEC + 1] = if lanes == 64 { u32::MAX } else { 0 };
         let mut v = vec![[0u32; LANES]; 256];
         for (l, x) in v[0].iter_mut().enumerate() {
             *x = l as u32;
         }
-        Self { s, scc: false, v, mem: vec![0; mem_dwords] }
+        Self { lanes, s, scc: false, v, mem: vec![0; mem_dwords] }
     }
 
     fn exec(&self) -> u64 {
-        u64::from(self.s[EXEC]) | u64::from(self.s[EXEC + 1]) << 32
+        self.mask(EXEC)
+    }
+
+    /// The lane mask at `code`: a register pair in wave64, its low dword in wave32.
+    fn mask(&self, code: usize) -> u64 {
+        let hi = if self.lanes == 64 { u64::from(self.s[code + 1]) << 32 } else { 0 };
+        u64::from(self.s[code]) | hi
+    }
+
+    /// Writes the lane mask `bits` to `code` (one dword in wave32).
+    fn set_mask(&mut self, code: usize, bits: u64) {
+        if self.lanes == 64 {
+            self.set64(code, bits);
+        } else {
+            self.set32(code, bits as u32);
+        }
     }
 
     fn set64(&mut self, code: usize, x: u64) {
@@ -120,7 +143,7 @@ impl Wave {
     /// row without `bound_ctrl` writes nothing).
     fn vwrite_but(&mut self, d: usize, f: impl Fn(&Self, usize) -> u32, keep: u64) {
         let exec = self.exec() & !keep;
-        let new: Vec<u32> = (0..LANES).map(|l| f(self, l)).collect();
+        let new: Vec<u32> = (0..self.lanes).map(|l| f(self, l)).collect();
         for (l, x) in new.into_iter().enumerate() {
             if exec >> l & 1 == 1 {
                 self.v[d][l] = x;
@@ -146,8 +169,8 @@ impl Wave {
                     2 => true,
                     4 => !self.scc,
                     5 => self.scc,
-                    6 => self.s[VCC] == 0 && self.s[VCC + 1] == 0,
-                    7 => self.s[VCC] != 0 || self.s[VCC + 1] != 0,
+                    6 => self.mask(VCC) == 0,
+                    7 => self.mask(VCC) != 0,
                     8 => self.exec() == 0,
                     9 => self.exec() != 0,
                     _ => panic!("the model has no SOPP opcode {op}"),
@@ -193,10 +216,20 @@ impl Wave {
                     }
                     0x24 | 0x25 => {
                         // s_and_saveexec_b64, s_or_saveexec_b64
+                        assert_eq!(self.lanes, 64, "a 64-bit saveexec in wave32");
                         let (old, x) = (self.exec(), self.sread64(a));
                         let new = if op == 0x24 { x & old } else { x | old };
                         self.set64(d, old);
                         self.set64(EXEC, new);
+                        self.scc = new != 0;
+                    }
+                    0x3C | 0x3D => {
+                        // s_and_saveexec_b32, s_or_saveexec_b32 (wave32)
+                        assert_eq!(self.lanes, 32, "a 32-bit saveexec in wave64");
+                        let (old, x) = (self.exec(), u64::from(self.sread(a)));
+                        let new = if op == 0x3C { x & old } else { x | old };
+                        self.set32(d, old as u32);
+                        self.set32(EXEC, new as u32);
                         self.scc = new != 0;
                     }
                     _ => panic!("the model has no SOP1 opcode {op:#x}"),
@@ -217,6 +250,13 @@ impl Wave {
                     }
                     0xA => self.set32(d, if self.scc { self.sread(a) } else { self.sread(b) }),
                     0xB => self.set64(d, if self.scc { self.sread64(a) } else { self.sread64(b) }),
+                    0xE | 0x10 => {
+                        // s_and_b32, s_or_b32
+                        let (x, y) = (self.sread(a), self.sread(b));
+                        let r = if op == 0xE { x & y } else { x | y };
+                        self.set32(d, r);
+                        self.scc = r != 0;
+                    }
                     0xF | 0x11 => {
                         let (x, y) = (self.sread64(a), self.sread64(b));
                         let r = if op == 0xF { x & y } else { x | y };
@@ -340,13 +380,13 @@ impl Wave {
             assert!(!dpp);
             let vsrc1 = (w >> 9 & 0xFF) as usize;
             let bits = self.compare(op & 0xEF, |me, l| (me.vread(src0, l), me.v[vsrc1][l]));
-            self.set64(if op & 0xF0 == 0xD0 { EXEC } else { VCC }, bits);
+            self.set_mask(if op & 0xF0 == 0xD0 { EXEC } else { VCC }, bits);
         } else {
             // VOP2
             let op = w >> 25 & 0x3F;
             let d = (w >> 17 & 0xFF) as usize;
             let vsrc1 = (w >> 9 & 0xFF) as usize;
-            let vcc = u64::from(self.s[VCC]) | u64::from(self.s[VCC + 1]) << 32;
+            let vcc = self.mask(VCC);
             let f = |a: u32, b: u32, l: usize| -> u32 {
                 match op {
                     1 => if vcc >> l & 1 == 1 { b } else { a }, // v_cndmask_b32
@@ -369,7 +409,7 @@ impl Wave {
     fn compare(&self, op: u32, ab: impl Fn(&Self, usize) -> (u32, u32)) -> u64 {
         let exec = self.exec();
         let mut bits = 0u64;
-        for l in (0..LANES).filter(|&l| exec >> l & 1 == 1) {
+        for l in (0..self.lanes).filter(|&l| exec >> l & 1 == 1) {
             let (a, b) = ab(self, l);
             let t = match op {
                 0xC1 => a < b,
@@ -400,16 +440,16 @@ impl Wave {
             0xC1..=0xC6 => {
                 // v_cmp_*_u32 to an SGPR pair
                 let bits = self.compare(op, |me, l| (me.vread(a, l), me.vread(b, l)));
-                self.set64(d, bits);
+                self.set_mask(d, bits);
             }
             0x101 => {
                 // v_cndmask_b32 with a mask from SGPRs
-                let m = self.sread64(c);
+                let m = if self.lanes == 64 { self.sread64(c) } else { u64::from(self.sread(c)) };
                 self.vwrite(d, |me, l| if m >> l & 1 == 1 { me.vread(b, l) } else { me.vread(a, l) });
             }
             0x360 => {
                 // v_readlane_b32: whatever EXEC is
-                let l = (self.sread(b) & 63) as usize;
+                let l = self.sread(b) as usize & (self.lanes - 1);
                 let x = self.vread(a, l);
                 self.set32(d, x);
             }
@@ -440,7 +480,12 @@ impl Wave {
 
 /// The UAV after one console wave ran `words` with root constants `constants`.
 pub(super) fn console(words: &[u32], constants: &[u32], mem_dwords: usize) -> Vec<u32> {
-    let mut wave = Wave::new(constants, mem_dwords);
+    console_of(words, constants, mem_dwords, LANES)
+}
+
+/// [`console`] for a console wave of `lanes` lanes (32: a wave32 program).
+pub(super) fn console_of(words: &[u32], constants: &[u32], mem_dwords: usize, lanes: usize) -> Vec<u32> {
+    let mut wave = Wave::with_lanes(constants, mem_dwords, lanes);
     wave.run(words);
     wave.mem
 }
@@ -520,14 +565,16 @@ pub(super) mod asm {
         }
 
         /// SOP1 `op` (3 mov_b32, 4 mov_b64, 0x10 bcnt1_i32_b64, 0x14 ff1_i32_b64,
-        /// 0x24 and_saveexec_b64, 0x25 or_saveexec_b64).
+        /// 0x24 and_saveexec_b64, 0x25 or_saveexec_b64, 0x3C and_saveexec_b32,
+        /// 0x3D or_saveexec_b32).
         pub fn sop1(&mut self, op: u32, d: u8, a: Op) -> &mut Self {
             let (c, lit) = a.code();
             assert!(c < 256, "a scalar source");
             self.push(0xBE80_0000 | u32::from(d) << 16 | op << 8 | c, lit)
         }
 
-        /// SOP2 `op` (0 add_u32, 0xA cselect_b32, 0xF and_b64, 0x11 or_b64, 0x1E lshl_b32).
+        /// SOP2 `op` (0 add_u32, 0xA cselect_b32, 0xE and_b32, 0xF and_b64, 0x10 or_b32,
+        /// 0x11 or_b64, 0x1E lshl_b32).
         pub fn sop2(&mut self, op: u32, d: u8, a: Op, b: Op) -> &mut Self {
             let ((ca, la), (cb, lb)) = (a.code(), b.code());
             assert!(ca < 256 && cb < 256 && (la.is_none() || lb.is_none()));

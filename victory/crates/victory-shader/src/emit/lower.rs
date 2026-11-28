@@ -25,6 +25,11 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// Lane masks the ballot cannot give, as their writing instruction makes them (a child module
+/// for the same reason).
+#[path = "mask_numbers.rs"]
+pub(super) mod mask_numbers;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -487,6 +492,12 @@ pub(super) const GROUP_UNEVEN: Why = "a first-lane read where not every thread o
 /// not wait (`VICTORY_GROUP_SYNC=0`): the other half's first lane may not be written yet.
 pub(super) const FIRST_LANE_NO_WAIT: Why = "a first-lane read across the halves whose barriers do not wait (group sync off)";
 
+thread_local! {
+    /// The program being translated on this thread is one `VICTORY_STRICT_HALVES` names by
+    /// its hash ([`super::with_program_strict`]): the strict forms and the wave-wide form for it.
+    pub(super) static PROGRAM_STRICT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's choice for [`strict_halves`], for its thread only.
@@ -505,6 +516,9 @@ thread_local! {
 /// fixtures were written; a test chooses for its own thread. Part of the translation: the
 /// shader cache keys on it.
 pub(super) fn strict_halves() -> bool {
+    if PROGRAM_STRICT.get() {
+        return true;
+    }
     #[cfg(test)]
     return TEST_STRICT_HALVES.get().unwrap_or(true);
     #[cfg(not(test))]
@@ -4105,6 +4119,14 @@ impl<'a> Lower<'a> {
         let made = self.def_block.get(&lo).copied();
         let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
+            // (in the retry of a program refused for it: from the writing instruction's operands)
+            if let Some(&xy) = self.ballots.get(&lo) {
+                return Ok(if high { xy.1 } else { xy.0 });
+            }
+            if let Some(xy) = self.mask_number(lo)? {
+                self.ballots.insert(lo, xy);
+                return Ok(if high { xy.1 } else { xy.0 });
+            }
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }

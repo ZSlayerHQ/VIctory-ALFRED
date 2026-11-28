@@ -23,6 +23,7 @@ export const LOCAL_ENV_NAMES = Object.freeze([
   'VICTORY_WORKTREES', // the lane worktrees run-queue.sh looks a bare lane name up in
   'PRESENTMON_EXE', // PresentMon's executable (presentmon.mjs)
   'RENDERDOC_DIR', // RenderDoc's folder (renderdoc.mjs)
+  'STREAMLINE_DIR', // the folder with NVIDIA's Streamline and DLSS files, for a menu file that asks for DLSS (run-world.sh)
   'VICTORY_SAVE_BACKUPS', // the save snapshots and before-run backups (save-snapshot.mjs)
   'VICTORY_PRECOMPILE_JSON', // the pre-compile overlay's state file (run-world.sh, precompile-progress.mjs)
 ]);

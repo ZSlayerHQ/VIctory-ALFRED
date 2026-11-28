@@ -1780,12 +1780,15 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     Some((at as u64, len as u64))
 }
 
+/// The bytes a [`fingerprint`] reads at most: all of memory up to them.
+pub(crate) const FINGERPRINTED: u64 = 48 << 10;
+
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
 /// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
 /// (a texture streams in whole mips; the small ones lie first). Read
 /// through the kernel, so pages not there count as zeros.
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
-    const WINDOW: usize = 16 << 10;
+    const WINDOW: usize = FINGERPRINTED as usize / 3;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
@@ -1838,33 +1841,39 @@ fn staged_from(resource: This) -> u32 {
 /// byte, and a texture uploaded again costs a staging buffer, a detiling and
 /// a copy more than this look.) `VICTORY_TEXTURE_SAME=0`: not asked.
 pub(crate) fn unchanged(resource: This, first: u32) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SAME").is_none_or(|v| v != "0")) {
+    if !same_asked() {
         return false;
     }
-    let Some(copy) = crate::resource::made_copy(resource) else {
-        return false;
-    };
-    let Some((from, held)) = *copy.holds.lock().unwrap_or_else(|e| e.into_inner()) else {
-        return false;
-    };
-    let Some((memory, desc)) = crate::resource::texture_memory(resource) else {
-        return false;
-    };
-    let Some(layout) = crate::resource::texture_layout(&desc) else {
-        return false;
-    };
+    held_digest(resource, first).is_some_and(|(memory, size, held)| holds_still(memory, size, held) == Some(true))
+}
+
+/// Whether memory is compared with what a host copy was filled from
+/// ([`unchanged`], and the pass's whole looks again);
+/// `VICTORY_TEXTURE_SAME=0`: never, as before.
+pub(crate) fn same_asked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SAME").is_none_or(|v| v != "0"))
+}
+
+/// What the host copy of a title texture was filled from, for the levels
+/// from `first` on: the texture's memory, the bytes of it read, and their
+/// digest then. None: no copy filled yet, or one filled from a later level.
+pub(crate) fn held_digest(resource: This, first: u32) -> Option<(*const u8, usize, Digest)> {
+    let copy = crate::resource::made_copy(resource)?;
+    let (from, held) = (*copy.holds.lock().unwrap_or_else(|e| e.into_inner()))?;
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let layout = crate::resource::texture_layout(&desc)?;
     let layout = &layout.planes[0].layout;
     if from > crate::resource::read_from(layout, first).max(copy.base) {
-        return false;
+        return None;
     }
-    let size = layout.bytes_from(from) as usize;
-    with_read(size, |read| {
-        if crate::host::read_there(memory, read) == 0 {
-            return false;
-        }
-        digest(read) == held
-    })
+    Some((memory, layout.bytes_from(from) as usize, held))
+}
+
+/// Whether the `size` bytes of title memory at `memory` are the ones of
+/// digest `held` ([`held_digest`]); None: none of them is mapped.
+pub(crate) fn holds_still(memory: *const u8, size: usize, held: Digest) -> Option<bool> {
+    with_read(size, |read| (crate::host::read_there(memory, read) != 0).then(|| digest(read) == held))
 }
 
 /// Where the levels from `first` on of a title texture are: address and

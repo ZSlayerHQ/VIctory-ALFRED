@@ -46,6 +46,8 @@ mod host;
 /// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
 /// (read by the input module).
 pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// F1 presses seen by the settings menu's key thread, latched as it sees them (the loading cover ends on one).
+pub static F1_PRESSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]

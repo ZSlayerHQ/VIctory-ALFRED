@@ -1891,6 +1891,13 @@ pub(crate) fn framegen_live() -> bool {
     FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire) || fsr::live_swap_chain()
 }
 
+/// Whether our swap chain is not the plain one: Streamline's proxy (frame
+/// generation's, or the present hook's) or FSR 3's. Read-only, live (the
+/// loading cover asks, `host/bootvideo/cover.rs`).
+pub(crate) fn swap_chain_wrapped() -> bool {
+    SWAP_CHAIN_PROXIED.load(Acquire) || PRESENT_HOOKED.load(Acquire) || fsr::live_swap_chain()
+}
+
 /// Which frame generation the presents have: DLSS's, AMD's FSR 3, or none.
 pub(crate) fn framegen_kind() -> Option<&'static str> {
     if FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire) {

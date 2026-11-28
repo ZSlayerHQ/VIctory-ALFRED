@@ -1,9 +1,8 @@
 //! The settings menu drawn on its panel: the scaled art copied, the bar
 //! under the row picked, and the lettering blended by its coverage (what
 //! `draw` in `scripts/overlay-art/menu_assets.py` does), all on the
-//! processor; then written out in the swap chain's format for today's copy.
+//! processor. The art's coverage is kept for the overlay draw.
 
-use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::art::{self, Lettering, Scaled};
 
@@ -211,12 +210,17 @@ pub(super) fn lines_under(scaled: &Scaled, page: &Page) -> (usize, f32) {
     (n, list_bottom(n))
 }
 
-struct Canvas<'a> {
+/// A picture being drawn: four bytes a pixel, red first, `size` wide and high.
+pub(super) struct Canvas<'a> {
     pixels: &'a mut Vec<u8>,
     size: (usize, usize),
 }
 
-impl Canvas<'_> {
+impl<'a> Canvas<'a> {
+    pub(super) fn new(pixels: &'a mut Vec<u8>, size: (usize, usize)) -> Canvas<'a> {
+        Canvas { pixels, size }
+    }
+
     fn fill(&mut self, x0: f32, x1: f32, y0: f32, y1: f32, colour: [u8; 3]) {
         let (w, h) = self.size;
         let clamp = |v: f32, most: usize| (v.round().max(0.0) as usize).min(most);
@@ -229,7 +233,7 @@ impl Canvas<'_> {
     }
 
     /// `text` with its pen starting at `x` (ending there if `right`), standing on `baseline`.
-    fn text(&mut self, font: &Lettering, text: &str, x: f32, baseline: f32, colour: [u8; 3], right: bool) {
+    pub(super) fn text(&mut self, font: &Lettering, text: &str, x: f32, baseline: f32, colour: [u8; 3], right: bool) {
         let (w, h) = (self.size.0 as i64, self.size.1 as i64);
         let ((cw, ch), origin_x, base) = font.metrics();
         let mut pen = if right { x - font.width(text) } else { x };
@@ -258,104 +262,5 @@ impl Canvas<'_> {
             }
             pen += font.advance(i);
         }
-    }
-}
-
-/// A half-precision float's bits, for values from 0 to 1.
-fn half(v: f32) -> u16 {
-    let bits = v.to_bits();
-    let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
-    let mantissa = bits & 0x7F_FFFF;
-    if v <= 0.0 || exp < -10 {
-        return 0;
-    }
-    if exp <= 0 {
-        let m = mantissa | 0x80_0000;
-        let shift = (14 - exp) as u32;
-        return ((m >> shift) + ((m >> (shift - 1)) & 1)) as u16;
-    }
-    ((exp as u32) << 10 | mantissa >> 13) as u16 + ((mantissa >> 12) & 1) as u16
-}
-
-/// The light of an sRGB byte (for the floating-point swap chain, whose values are linear).
-fn linear(v: u8) -> f32 {
-    let v = f32::from(v) / 255.0;
-    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-}
-
-/// Writes `canvas` (`size`, four bytes a pixel, red first) into `out`, rows
-/// `pitch` bytes apart, as pixels of `format`. False for a format it does not write.
-pub(super) fn write_out(canvas: &[u8], size: (u32, u32), format: DXGI_FORMAT, out: &mut [u8], pitch: usize) -> bool {
-    let (w, h) = (size.0 as usize, size.1 as usize);
-    let rows = canvas.chunks_exact(w * 4).take(h).zip(out.chunks_mut(pitch));
-    match format {
-        DXGI_FORMAT_R8G8B8A8_UNORM => rows.for_each(|(from, to)| to[..w * 4].copy_from_slice(from)),
-        DXGI_FORMAT_B8G8R8A8_UNORM => rows.for_each(|(from, to)| {
-            for (p, q) in from.chunks_exact(4).zip(to.chunks_exact_mut(4)) {
-                q.copy_from_slice(&[p[2], p[1], p[0], 0xFF]);
-            }
-        }),
-        DXGI_FORMAT_R10G10B10A2_UNORM => rows.for_each(|(from, to)| {
-            let ten = |v: u8| (u32::from(v) * 1023 + 127) / 255;
-            for (p, q) in from.chunks_exact(4).zip(to.chunks_exact_mut(4)) {
-                q.copy_from_slice(&(ten(p[0]) | ten(p[1]) << 10 | ten(p[2]) << 20 | 3 << 30).to_le_bytes());
-            }
-        }),
-        DXGI_FORMAT_R16G16B16A16_FLOAT => {
-            static HALVES: std::sync::OnceLock<[[u8; 2]; 256]> = std::sync::OnceLock::new();
-            let halves = HALVES.get_or_init(|| std::array::from_fn(|v| half(linear(v as u8)).to_le_bytes()));
-            let one = half(1.0).to_le_bytes();
-            rows.for_each(|(from, to)| {
-                for (p, q) in from.chunks_exact(4).zip(to.chunks_exact_mut(8)) {
-                    q[..2].copy_from_slice(&halves[usize::from(p[0])]);
-                    q[2..4].copy_from_slice(&halves[usize::from(p[1])]);
-                    q[4..6].copy_from_slice(&halves[usize::from(p[2])]);
-                    q[6..].copy_from_slice(&one);
-                }
-            });
-        }
-        _ => return false,
-    }
-    true
-}
-
-/// Bytes a pixel of `format` takes, among those [`write_out`] writes.
-pub(super) fn pixel_bytes(format: DXGI_FORMAT) -> Option<u32> {
-    match format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM => Some(4),
-        DXGI_FORMAT_R16G16B16A16_FLOAT => Some(8),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn halves_of_what_the_panel_writes_are_exact() {
-        assert_eq!(half(0.0), 0);
-        assert_eq!(half(1.0), 0x3C00);
-        assert_eq!(half(0.5), 0x3800);
-        assert_eq!(half(0.25), 0x3400);
-        // A small one, below the normal range: 2^-20.
-        assert_eq!(half(1.0 / 1_048_576.0), 0x0010);
-        assert_eq!(half(linear(255)), 0x3C00);
-    }
-
-    #[test]
-    fn every_format_is_written_as_its_pixels() {
-        let canvas = [10u8, 128, 255, 255, 0, 0, 0, 255];
-        let mut out = vec![0u8; 2 * 8 + 3];
-        assert!(write_out(&canvas, (2, 1), DXGI_FORMAT_R8G8B8A8_UNORM, &mut out, 19));
-        assert_eq!(&out[..8], &canvas);
-        assert!(write_out(&canvas, (2, 1), DXGI_FORMAT_B8G8R8A8_UNORM, &mut out, 19));
-        assert_eq!(&out[..4], &[255, 128, 10, 255]);
-        assert!(write_out(&canvas, (2, 1), DXGI_FORMAT_R10G10B10A2_UNORM, &mut out, 19));
-        assert_eq!(u32::from_le_bytes([out[0], out[1], out[2], out[3]]), 40 | 514 << 10 | 1023 << 20 | 3 << 30);
-        assert!(write_out(&canvas, (2, 1), DXGI_FORMAT_R16G16B16A16_FLOAT, &mut out, 19));
-        assert_eq!(&out[4..8], &[0x00, 0x3C, 0x00, 0x3C]);
-        assert_eq!(&out[8..16], &[0, 0, 0, 0, 0, 0, 0x00, 0x3C]);
-        assert!(!write_out(&canvas, (2, 1), DXGI_FORMAT_R32G32B32A32_FLOAT, &mut out, 19));
     }
 }

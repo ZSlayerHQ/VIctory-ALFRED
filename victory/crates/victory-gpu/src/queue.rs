@@ -913,6 +913,45 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// The loading cover's record of the title's presents
+/// (`host/bootvideo/cover.rs`), written only while it watches: per present,
+/// its number (0 while the entry is written), the performance counter and
+/// the draws recorded so far. No lock: the cover reads an entry and keeps it
+/// if its number is the same before and after. One writer at a time
+/// ([`COVER_WRITING`]): a present made while another thread writes is not
+/// recorded, a gap the cover reads as "not known" and shows the title for.
+#[cfg(windows)]
+pub(crate) static COVER_WATCHING: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+static COVER_RING: [[AtomicU64; 3]; 64] = [const { [const { AtomicU64::new(0) }; 3] }; 64];
+#[cfg(windows)]
+pub(crate) static COVER_WRITING: AtomicBool = AtomicBool::new(false);
+
+#[cfg(windows)]
+pub(crate) fn cover_note(frame: u64) {
+    if COVER_WRITING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let entry = &COVER_RING[(frame % 64) as usize];
+    entry[0].store(0, Ordering::Relaxed);
+    std::sync::atomic::fence(Ordering::Release);
+    entry[1].store(system_timestamp(), Ordering::Relaxed);
+    entry[2].store(crate::draw::drawn(), Ordering::Relaxed);
+    entry[0].store(frame, Ordering::Release);
+    COVER_WRITING.store(false, Ordering::Release);
+}
+
+/// The entries of the cover's ring that are whole: (number, counter, draws so far).
+#[cfg(windows)]
+pub(crate) fn cover_presents() -> impl Iterator<Item = (u64, u64, u64)> {
+    COVER_RING.iter().filter_map(|entry| {
+        let frame = entry[0].load(Ordering::Acquire);
+        let (at, drawn) = (entry[1].load(Ordering::Relaxed), entry[2].load(Ordering::Relaxed));
+        std::sync::atomic::fence(Ordering::Acquire);
+        (frame != 0 && entry[0].load(Ordering::Relaxed) == frame).then_some((frame, at, drawn))
+    })
+}
+
 /// Shows the first plane's first resource in our window.
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
@@ -951,6 +990,10 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    if COVER_WATCHING.load(Ordering::Relaxed) {
+        cover_note(frame);
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

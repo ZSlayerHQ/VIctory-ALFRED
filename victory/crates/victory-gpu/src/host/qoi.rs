@@ -1,5 +1,5 @@
 //! QOI images ("Quite OK Image", qoiformat.org): a decoder of our own, for
-//! the settings menu's art (`art.rs`). Three or four bytes a pixel.
+//! the settings menu's art (`menu/art.rs`) and the boot video's frames (`bootvideo.rs`). Three or four bytes a pixel.
 
 /// A decoded image: its size, and its pixels top row first, `channels` bytes each.
 pub(super) struct Image {
@@ -80,7 +80,7 @@ pub(super) mod tests {
     use super::*;
 
     /// A QOI encoder (the format's every operation), to make images for tests.
-    pub(in super::super) fn encode(width: u32, height: u32, channels: usize, pixels: &[u8]) -> Vec<u8> {
+    pub(in crate::host) fn encode(width: u32, height: u32, channels: usize, pixels: &[u8]) -> Vec<u8> {
         let mut out = b"qoif".to_vec();
         out.extend_from_slice(&width.to_be_bytes());
         out.extend_from_slice(&height.to_be_bytes());

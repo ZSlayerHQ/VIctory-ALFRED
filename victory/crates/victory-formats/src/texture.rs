@@ -1488,6 +1488,56 @@ mod tests {
         );
     }
 
+    /// Detiling throughput (no game data): 2048x2048 BC7 and BC1 textures
+    /// with all their mips, rows 256-byte aligned as the host copies them,
+    /// in MB of tiled memory a second and ms a texture:
+    /// `cargo test --release -p victory-formats detile_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn detile_throughput() {
+        for (name, swizzle) in [
+            ("64KB_D", Swizzle::SW_64KB_D),
+            ("64KB_S", Swizzle::SW_64KB_S),
+            ("4KB_S", Swizzle::SW_4KB_S),
+        ] {
+            for (format, bpe) in [("BC7", 16), ("BC1", 8)] {
+                let l = Layout::new(&Desc {
+                    block: 4,
+                    ..desc(2048, 2048, 12, bpe, swizzle)
+                })
+                .unwrap();
+                let tiled: Vec<u8> = (0..l.size).map(|i| (i * 31) as u8).collect();
+                let mut linear: Vec<(Vec<u8>, usize)> = l
+                    .mips
+                    .iter()
+                    .map(|m| {
+                        let pitch = (m.width * bpe).next_multiple_of(256) as usize;
+                        (vec![0u8; pitch * m.height as usize], pitch)
+                    })
+                    .collect();
+                let mut pass = || {
+                    for (mip, (out, pitch)) in linear.iter_mut().enumerate() {
+                        let plane = out.len();
+                        l.detile(&tiled, mip as u32, 0, out, *pitch, plane).unwrap();
+                    }
+                };
+                pass();
+                let runs = 20;
+                let started = std::time::Instant::now();
+                for _ in 0..runs {
+                    pass();
+                }
+                let secs = started.elapsed().as_secs_f64() / f64::from(runs);
+                println!(
+                    "{format} {name}: {:.2} MB tiled, {:.0} MB/s, {:.2} ms a texture",
+                    l.size as f64 / 1e6,
+                    l.size as f64 / secs / 1e6,
+                    secs * 1e3
+                );
+            }
+        }
+    }
+
     #[test]
     fn bad_descriptions_and_buffers_are_refused() {
         assert_eq!(

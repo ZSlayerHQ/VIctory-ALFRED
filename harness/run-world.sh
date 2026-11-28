@@ -434,13 +434,19 @@ fi
 # and turns it into switches at the next start; the harness starts `run`, which does neither, so without this the
 # menu cannot save and a saved choice is never applied. Each VICTORY_NAME=value line goes over the settings set (an
 # empty value leaves that switch out), and the launcher choices `run` understands become their switches as `play`
-# makes them: the picture size, the console and the frame rate limit. DLSS and frame generation are not applied:
-# their files are not installed here. The command line and the flags above win over the file.
+# makes them: the picture size, the console, the frame rate limit, and DLSS when STREAMLINE_DIR (harness/local.env or
+# the environment) names a folder that holds NVIDIA's files (the runtime checks their signatures itself), and frame
+# generation over that DLSS (after the settings set, below). The command line and the flags above win over the file.
 MENU_COUNT=0
 MENU_SKIPPED=0
 MENU_UNSET=" "
+MENU_PUT=" "
+MENU_FG=0
 MENU_FG_TYPE=auto
 MENU_NAME=""
+MENU_DLSS=""
+MENU_DLSS_WHY=""
+MENU_FG_WHY=""
 if [ -n "$MENU_FILE" ]; then
   case "$MENU_FILE" in /*|[A-Za-z]:[\\/]*) ;; *) MENU_FILE=$PWD/$MENU_FILE ;; esac
   MENU_NAME=${MENU_FILE##*[\\/]}
@@ -450,6 +456,7 @@ if [ -n "$MENU_FILE" ]; then
     [ -n "${!1+x}" ] && return 0
     case "$MENU_BY_FLAGS" in *" $1 "*) return 0 ;; esac
     if [ -n "$2" ]; then ENV_ARGS+=("$1=$2"); else MENU_UNSET+="$1 "; fi
+    MENU_PUT+="$1 "
     MENU_COUNT=$((MENU_COUNT + 1))
   }
   MENU_RES=""
@@ -467,6 +474,8 @@ if [ -n "$MENU_FILE" ]; then
         VICTORY_MENU_FPS) MENU_FPS=$VALUE ;;
         VICTORY_MENU_CONSOLE) MENU_CONSOLE=$VALUE ;;
         VICTORY_MENU_FG_TYPE) MENU_FG_TYPE=$VALUE ;;
+        VICTORY_MENU_FRAMEGEN) MENU_FG=$VALUE ;;
+        VICTORY_MENU_DLSS) MENU_DLSS=$VALUE ;;
         VICTORY_MENU_*) ;;
         VICTORY_*) menu_put "$NAME" "$VALUE" ;;
         *) MENU_SKIPPED=$((MENU_SKIPPED + 1)) ;;
@@ -492,6 +501,21 @@ if [ -n "$MENU_FILE" ]; then
       ;;
   esac
   case "$MENU_FG_TYPE" in auto|dlss|fsr) ;; *) MENU_FG_TYPE=auto ;; esac
+  # 0 is off and 2 to 6 a factor; anything else is ignored, as an unknown DLSS mode is.
+  case "$MENU_FG" in [2-6]) ;; *) MENU_FG=0 ;; esac
+  # DLSS as `play` sets it: a mode the build knows, and a folder with NVIDIA's files. Without the folder the choice
+  # stays saved in the menu's file and the run says why it is off.
+  case "$MENU_DLSS" in
+    dlaa|quality|balanced|performance)
+      if [ -n "${STREAMLINE_DIR:-}" ] && [ -f "$STREAMLINE_DIR/sl.interposer.dll" ]; then
+        menu_put VICTORY_DLSS 1
+        menu_put VICTORY_DLSS_MODE "$MENU_DLSS"
+        menu_put VICTORY_STREAMLINE_DIR "$STREAMLINE_DIR"
+      else
+        MENU_DLSS_WHY="the menu asks for DLSS ($MENU_DLSS), but STREAMLINE_DIR names no folder with NVIDIA's files: DLSS is off"
+      fi
+      ;;
+  esac
 fi
 
 # --settings: a named set of runtime switches, one NAME=value a line in harness/settings/<name>.env, added to every
@@ -541,8 +565,8 @@ case "$SETTINGS" in
 esac
 
 # With a menu file the menu is told what this run really has, so it shows the true choices and can save: the file,
-# the console, the picture size and the frame rate limit as the run's switches give them, DLSS and frame generation
-# off. No VICTORY_MENU_PLAY is given, so its "Save and restart" saves and asks for the restart by hand.
+# the console, the picture size, the frame rate limit, DLSS and frame generation as the run's switches give them.
+# No VICTORY_MENU_PLAY is given, so its "Save and restart" saves and asks for the restart by hand.
 if [ -n "$MENU_FILE" ]; then
   menu_final() { # NAME: its value in the run's environment (the command line, else what the harness passes)
     if [ -n "${!1+x}" ]; then printf '%s' "${!1}"; return 0; fi
@@ -553,8 +577,64 @@ if [ -n "$MENU_FILE" ]; then
   MENU_SHOWN_RES=4k
   [ "$(menu_final VICTORY_NATIVE_1440P)" = 1 ] && MENU_SHOWN_RES=1440
   [ "$(menu_final VICTORY_RENDER_1080P)" = 1 ] && MENU_SHOWN_RES=1080to1440
+  MENU_SHOWN_DLSS=off
+  if [ "$(menu_final VICTORY_DLSS)" = 1 ]; then
+    MENU_SHOWN_DLSS=$(menu_final VICTORY_DLSS_MODE)
+    case "$MENU_SHOWN_DLSS" in dlaa|quality|balanced|performance) ;; *) MENU_SHOWN_DLSS=quality ;; esac
+  fi
+  # Frame generation as `play` sets it, decided on the run's final switches (the settings set, the menu, the command
+  # line): it needs DLSS upscaling on and the line of submissions (VICTORY_THIN=1 or VICTORY_ASYNC_SUBMIT=1); the
+  # menu's type fsr (FSR 3) puts VICTORY_FSR_FRAMEGEN=1 in place of VICTORY_FRAMEGEN. Off, the run says why.
+  fg_put() { # NAME [VALUE]: over the settings set unless the command line, a flag or the menu file gave it; no VALUE leaves it out
+    [ -n "${!1+x}" ] && return 0
+    case "$MENU_BY_FLAGS$MENU_PUT" in *" $1 "*) return 0 ;; esac
+    local ENTRY KEPT=() SET_KEPT=()
+    for ENTRY in "${ENV_ARGS[@]}"; do [ "${ENTRY%%=*}" = "$1" ] || KEPT+=("$ENTRY"); done
+    ENV_ARGS=("${KEPT[@]}")
+    for ENTRY in ${SETTINGS_PAIRS[@]+"${SETTINGS_PAIRS[@]}"}; do [ "${ENTRY%%=*}" = "$1" ] || SET_KEPT+=("$ENTRY"); done
+    SETTINGS_PAIRS=(${SET_KEPT[@]+"${SET_KEPT[@]}"})
+    SETTINGS_COUNT=${#SETTINGS_PAIRS[@]}
+    if [ -n "${2:-}" ]; then ENV_ARGS+=("$1=$2"); MENU_COUNT=$((MENU_COUNT + 1)); fi
+  }
+  MENU_SHOWN_FG=0
+  MENU_FG_KEY=VICTORY_FRAMEGEN
+  [ "$MENU_FG_TYPE" = fsr ] && MENU_FG_KEY=VICTORY_FSR_FRAMEGEN
+  if [ "$MENU_FG" != 0 ]; then
+    MENU_FG_ASK="the menu asks for frame generation (${MENU_FG}x), but"
+    if [ -n "${VICTORY_FRAMEGEN+x}" ] && [ "$VICTORY_FRAMEGEN" != 1 ]; then
+      MENU_FG_WHY="$MENU_FG_ASK the command line's VICTORY_FRAMEGEN=$VICTORY_FRAMEGEN keeps it off"
+    elif [ -n "${!MENU_FG_KEY+x}" ] && [ "${!MENU_FG_KEY}" != 1 ]; then
+      MENU_FG_WHY="$MENU_FG_ASK the command line's $MENU_FG_KEY=${!MENU_FG_KEY} keeps it off"
+    elif [ "$MENU_SHOWN_DLSS" = off ]; then
+      MENU_FG_WHY="$MENU_FG_ASK it needs DLSS upscaling on with NVIDIA's files: frame generation is off"
+    elif [ "$(menu_final VICTORY_THIN)" != 1 ] && [ "$(menu_final VICTORY_ASYNC_SUBMIT)" != 1 ]; then
+      MENU_FG_WHY="$MENU_FG_ASK it needs VICTORY_THIN=1 or VICTORY_ASYNC_SUBMIT=1: frame generation is off"
+    else
+      if [ "$MENU_FG_TYPE" = fsr ]; then
+        fg_put VICTORY_FSR_FRAMEGEN 1
+        fg_put VICTORY_FRAMEGEN
+      else
+        fg_put VICTORY_FRAMEGEN 1
+      fi
+      fg_put VICTORY_FRAMEGEN_X "$MENU_FG"
+      fg_put VICTORY_TEXTURE_ROOM_PERCENT 80
+      # The factor the runtime reads: 0 is off, a number clamps to 2..6, anything else is 2.
+      MENU_SHOWN_FG=$(menu_final VICTORY_FRAMEGEN_X)
+      case "$MENU_SHOWN_FG" in
+        ''|*[!0-9]*) MENU_SHOWN_FG=2 ;;
+        *)
+          MENU_SHOWN_FG=$((10#$MENU_SHOWN_FG))
+          if [ "$MENU_SHOWN_FG" -gt 6 ]; then MENU_SHOWN_FG=6; elif [ "$MENU_SHOWN_FG" -eq 1 ]; then MENU_SHOWN_FG=2; fi
+          ;;
+      esac
+      if [ "$(menu_final "$MENU_FG_KEY")" != 1 ]; then
+        MENU_SHOWN_FG=0
+        MENU_FG_WHY="$MENU_FG_ASK a line of the menu file leaves $MENU_FG_KEY off"
+      fi
+    fi
+  fi
   ENV_ARGS+=("VICTORY_MENU_FILE=$MENU_FILE" "VICTORY_MENU_CONSOLE=$CONSOLE" "VICTORY_MENU_RES=$MENU_SHOWN_RES"
-    "VICTORY_MENU_DLSS=off" "VICTORY_MENU_FRAMEGEN=0" "VICTORY_MENU_FG_TYPE=$MENU_FG_TYPE")
+    "VICTORY_MENU_DLSS=$MENU_SHOWN_DLSS" "VICTORY_MENU_FRAMEGEN=$MENU_SHOWN_FG" "VICTORY_MENU_FG_TYPE=$MENU_FG_TYPE")
   MENU_INTERVAL=$(menu_final VICTORY_FRAME_INTERVAL_US)
   case "$MENU_INTERVAL" in
     ''|*[!0-9]*) ;;
@@ -582,7 +662,14 @@ fi
 say "profile: $PROFILE  console: $CONSOLE  timing: $TIMING  presentmon: $PRESENTMON"
 say "settings: $SETTINGS ($SETTINGS_COUNT switches)"
 if [ -n "$MENU_FILE" ]; then
-  say "menu file: $MENU_NAME ($MENU_COUNT values applied; DLSS and frame generation are not)"
+  MENU_FG_SAID=off
+  if [ "$MENU_SHOWN_FG" != 0 ]; then
+    MENU_FG_SAID="${MENU_SHOWN_FG}x (DLSS)"
+    [ "$MENU_FG_TYPE" = fsr ] && MENU_FG_SAID="${MENU_SHOWN_FG}x (FSR 3)"
+  fi
+  say "menu file: $MENU_NAME ($MENU_COUNT values applied; DLSS $MENU_SHOWN_DLSS; frame generation $MENU_FG_SAID)"
+  [ -n "$MENU_DLSS_WHY" ] && say "menu file: $MENU_DLSS_WHY"
+  [ -n "$MENU_FG_WHY" ] && say "menu file: $MENU_FG_WHY"
   [ "$MENU_SKIPPED" -gt 0 ] && say "menu file: $MENU_SKIPPED lines skipped (not VICTORY_NAME=value)"
 fi
 say ""

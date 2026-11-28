@@ -42,11 +42,13 @@ them as open questions, not as known.
 - **Suspected:** the per-tile light lists are not written for the last row or column of tiles, which keep stale
   lists.
 
-### At a distance a character's head is not drawn
+### A character's head is not drawn (some first starts of a build)
 
-- **Seen:** the head's skin is missing, the eyes remain, and the hair sits on a shoulder. Close up the head is right.
-- **Suspected:** programs that prepare distant characters use all 64 lanes of a console wave; on 32-lane cards they
-  run in an approximate form (see Shaders) that picks wrong values for half the lanes.
+- **Seen:** the head's skin is missing for the whole session; the eyes, teeth and hair remain. It happens on some
+  first starts of a build, while the card's pipelines are still being compiled, and not on later starts.
+- **Cause (found 2026-11-28):** the title paints each character's skin once when a session loads. A paint draw whose
+  pipeline was still being compiled was dropped, so the skin stayed empty for that session.
+- **Until the fix is in:** close the program and start it again. The second start has its pipelines ready.
 
 ### With the title's ray-traced light on
 

@@ -120,11 +120,138 @@ test('a menu file goes over the settings set: a value replaces, an empty value l
   assert.deepEqual(named(env, 'VICTORY_AMBIENT'), [], 'left out, as the menu saved it');
   assert.equal(env.has('harness env: menu-file=victory-settings.txt (3 values)'), true);
   assert.equal(env.has(`harness env: settings=noone (${set.length - 1} switches)`), true);
-  // The menu is handed its file, and is told what the run really has: DLSS and frame generation are not applied.
+  // The menu is handed its file, and is told what the run really has: no folder for DLSS, so neither it nor frame
+  // generation is applied.
   assert.deepEqual(named(env, 'VICTORY_MENU_FILE'), [`VICTORY_MENU_FILE=${file}`]);
   assert.equal(env.has('VICTORY_MENU_DLSS=off'), true);
   assert.equal(env.has('VICTORY_MENU_FRAMEGEN=0'), true);
   assert.deepEqual(named(env, 'VICTORY_DLSS'), []);
+});
+
+test('a menu file that asks for DLSS turns it on only with a folder that holds the interposer', (t) => {
+  const file = menuFile(t, ['VICTORY_MENU_DLSS=quality']);
+  const folder = tempDir(t).replace(/\\/g, '/');
+  // No folder named, then a folder without the files: off both times, and the run says why.
+  for (const extra of [{}, { STREAMLINE_DIR: folder }]) {
+    const result = printEnvResult(t, ['--menu-file', file], extra);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /VICTORY_MENU_DLSS=off/);
+    assert.doesNotMatch(result.stdout, /^VICTORY_DLSS=/m);
+  }
+  fs.writeFileSync(path.join(folder, 'sl.interposer.dll'), '');
+  const on = printEnv(t, ['--menu-file', file], { STREAMLINE_DIR: folder });
+  assert.equal(on.has('VICTORY_DLSS=1'), true);
+  assert.equal(on.has('VICTORY_DLSS_MODE=quality'), true);
+  assert.deepEqual(named(on, 'VICTORY_STREAMLINE_DIR'), [`VICTORY_STREAMLINE_DIR=${folder}`]);
+  assert.equal(on.has('VICTORY_MENU_DLSS=quality'), true, 'the menu is told what the run really has');
+  assert.equal(on.has('VICTORY_MENU_FRAMEGEN=0'), true, 'the menu asks for no frame generation');
+  // The command line wins: DLSS switched off there stays off, and the menu shows it.
+  const off = printEnv(t, ['--menu-file', file], { STREAMLINE_DIR: folder, VICTORY_DLSS: '0' });
+  assert.equal(off.has('VICTORY_MENU_DLSS=off'), true);
+  // A mode the build does not know is ignored.
+  const odd = printEnv(t, ['--menu-file', menuFile(t, ['VICTORY_MENU_DLSS=ultra'])], { STREAMLINE_DIR: folder });
+  assert.deepEqual(named(odd, 'VICTORY_DLSS'), []);
+});
+
+// Frame generation, as the build's own launcher sets it: over DLSS with NVIDIA's files, and the line of submissions.
+const fgSwitches = ['VICTORY_FRAMEGEN', 'VICTORY_FRAMEGEN_X', 'VICTORY_TEXTURE_ROOM_PERCENT', 'VICTORY_FSR_FRAMEGEN'];
+function streamlineFolder(t) {
+  const folder = tempDir(t).replace(/\\/g, '/');
+  fs.writeFileSync(path.join(folder, 'sl.interposer.dll'), '');
+  return folder;
+}
+function lines(result) {
+  assert.equal(result.status, 0, result.stderr);
+  return new Set(result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+}
+function assertFgOff(env, why) {
+  for (const name of fgSwitches) assert.deepEqual(named(env, name), [], name);
+  assert.equal(env.has('VICTORY_MENU_FRAMEGEN=0'), true, 'the menu is told frame generation is off');
+  if (why) assert.equal([...env].some((line) => line.startsWith('menu file: ') && why.test(line)), true, String(why));
+}
+
+test('a menu file that asks for frame generation turns it on at its factor over DLSS with the folder', (t) => {
+  const folder = streamlineFolder(t);
+  for (const type of [[], ['VICTORY_MENU_FG_TYPE=dlss'], ['VICTORY_MENU_FG_TYPE=auto']]) {
+    const file = menuFile(t, ['VICTORY_MENU_DLSS=quality', 'VICTORY_MENU_FRAMEGEN=3', ...type]);
+    const env = lines(printEnvResult(t, ['--menu-file', file], { STREAMLINE_DIR: folder }));
+    assert.equal(env.has('VICTORY_DLSS=1'), true);
+    assert.deepEqual(named(env, 'VICTORY_FRAMEGEN'), ['VICTORY_FRAMEGEN=1'], type.join());
+    assert.deepEqual(named(env, 'VICTORY_FRAMEGEN_X'), ['VICTORY_FRAMEGEN_X=3']);
+    assert.deepEqual(named(env, 'VICTORY_TEXTURE_ROOM_PERCENT'), ['VICTORY_TEXTURE_ROOM_PERCENT=80']);
+    assert.deepEqual(named(env, 'VICTORY_FSR_FRAMEGEN'), [], 'DLSS frame generation, not FSR 3');
+    assert.deepEqual(named(env, 'VICTORY_MENU_FRAMEGEN'), ['VICTORY_MENU_FRAMEGEN=3'], 'the menu is told the run has it');
+    assert.equal(env.has('harness env: menu-file=victory-settings.txt (6 values)'), true, 'three for DLSS, three for it');
+    assert.equal([...env].some((line) => /^menu file: .*frame generation 3x \(DLSS\)/.test(line)), true);
+  }
+});
+
+test('frame generation stays off without DLSS and its folder, and the run says why', (t) => {
+  const empty = tempDir(t).replace(/\\/g, '/');
+  const folder = streamlineFolder(t);
+  for (const [menu, extra] of [
+    [['VICTORY_MENU_DLSS=quality'], {}],
+    [['VICTORY_MENU_DLSS=quality'], { STREAMLINE_DIR: empty }],
+    [['VICTORY_MENU_DLSS=off'], { STREAMLINE_DIR: folder }],
+    [[], { STREAMLINE_DIR: folder }],
+  ]) {
+    const file = menuFile(t, [...menu, 'VICTORY_MENU_FRAMEGEN=2']);
+    assertFgOff(lines(printEnvResult(t, ['--menu-file', file], extra)), /needs DLSS upscaling on with NVIDIA's files/);
+  }
+});
+
+test('a VICTORY_FRAMEGEN=0 on the command line keeps frame generation off whatever the menu says', (t) => {
+  const folder = streamlineFolder(t);
+  for (const type of ['dlss', 'fsr']) {
+    const file = menuFile(t, ['VICTORY_MENU_DLSS=quality', 'VICTORY_MENU_FRAMEGEN=4', `VICTORY_MENU_FG_TYPE=${type}`]);
+    const env = lines(printEnvResult(t, ['--menu-file', file], { STREAMLINE_DIR: folder, VICTORY_FRAMEGEN: '0' }));
+    assert.equal(env.has('VICTORY_DLSS=1'), true, 'DLSS itself is still applied');
+    assertFgOff(env, /VICTORY_FRAMEGEN=0 keeps it off/);
+  }
+});
+
+test('a frame generation factor outside 2 to 6 is ignored', (t) => {
+  const folder = streamlineFolder(t);
+  for (const factor of ['7', '1', 'abc', '']) {
+    const file = menuFile(t, ['VICTORY_MENU_DLSS=quality', `VICTORY_MENU_FRAMEGEN=${factor}`]);
+    const env = lines(printEnvResult(t, ['--menu-file', file], { STREAMLINE_DIR: folder }));
+    assertFgOff(env);
+    assert.equal([...env].some((line) => /frame generation \(/.test(line)), false, `no reason line for '${factor}'`);
+  }
+});
+
+test("frame generation needs VICTORY_THIN=1 or VICTORY_ASYNC_SUBMIT=1 in the run's final switches", (t) => {
+  const folder = streamlineFolder(t);
+  const file = menuFile(t, ['VICTORY_MENU_DLSS=quality', 'VICTORY_MENU_FRAMEGEN=2']);
+  const why = /needs VICTORY_THIN=1 or VICTORY_ASYNC_SUBMIT=1/;
+  // The set has VICTORY_THIN=1; an empty value on the command line takes it out of the run, and so does the menu file.
+  const bare = { STREAMLINE_DIR: folder, VICTORY_THIN: '', VICTORY_JOIN_PARTS: '' };
+  const offCmd = lines(printEnvResult(t, ['--menu-file', file], bare));
+  assert.deepEqual(named(offCmd, 'VICTORY_THIN'), [], "the command line took the set's switch out");
+  assertFgOff(offCmd, why);
+  const unset = menuFile(t, ['VICTORY_THIN=', 'VICTORY_MENU_DLSS=quality', 'VICTORY_MENU_FRAMEGEN=2']);
+  assertFgOff(lines(printEnvResult(t, ['--menu-file', unset], { STREAMLINE_DIR: folder })), why);
+  assertFgOff(lines(printEnvResult(t, ['--menu-file', file, '--settings', 'none'], { STREAMLINE_DIR: folder })), why);
+  // VICTORY_ASYNC_SUBMIT=1 given instead: on.
+  const on = lines(printEnvResult(t, ['--menu-file', file], { ...bare, VICTORY_ASYNC_SUBMIT: '1' }));
+  assert.deepEqual(named(on, 'VICTORY_FRAMEGEN'), ['VICTORY_FRAMEGEN=1']);
+  assert.deepEqual(named(on, 'VICTORY_FRAMEGEN_X'), ['VICTORY_FRAMEGEN_X=2']);
+  assert.equal(on.has('VICTORY_MENU_FRAMEGEN=2'), true);
+});
+
+test("the menu's FSR 3 type puts VICTORY_FSR_FRAMEGEN=1 in place of VICTORY_FRAMEGEN", (t) => {
+  const folder = streamlineFolder(t);
+  const file = menuFile(t, ['VICTORY_MENU_DLSS=balanced', 'VICTORY_MENU_FRAMEGEN=2', 'VICTORY_MENU_FG_TYPE=fsr']);
+  const env = lines(printEnvResult(t, ['--menu-file', file], { STREAMLINE_DIR: folder }));
+  assert.deepEqual(named(env, 'VICTORY_FSR_FRAMEGEN'), ['VICTORY_FSR_FRAMEGEN=1']);
+  assert.deepEqual(named(env, 'VICTORY_FRAMEGEN'), [], 'FSR only, as the launcher sets it');
+  assert.deepEqual(named(env, 'VICTORY_FRAMEGEN_X'), ['VICTORY_FRAMEGEN_X=2']);
+  assert.deepEqual(named(env, 'VICTORY_TEXTURE_ROOM_PERCENT'), ['VICTORY_TEXTURE_ROOM_PERCENT=80']);
+  assert.equal(env.has('VICTORY_MENU_FRAMEGEN=2'), true);
+  assert.equal(env.has('VICTORY_MENU_FG_TYPE=fsr'), true);
+  assert.equal([...env].some((line) => /^menu file: .*frame generation 2x \(FSR 3\)/.test(line)), true);
+  // Without DLSS's folder FSR 3 frame generation stays off too.
+  assertFgOff(lines(printEnvResult(t, ['--menu-file', file], {})), /needs DLSS upscaling on/);
 });
 
 test("the menu's launcher choices become the switches the build's own launcher makes of them", (t) => {

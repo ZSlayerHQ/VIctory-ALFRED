@@ -209,7 +209,7 @@ case "$ACTION" in
     ART="$HERE/../scripts/overlay-art/assets"
     if [ -f "$ART/panel.qoi" ]; then
       mkdir -p "$DEST/menu-art" || die "cannot create $DEST/menu-art"
-      for art in panel.qoi font-row.qoi font-small.qoi layout.json; do
+      for art in panel.qoi font-row.qoi font-small.qoi chip.qoi layout.json; do
         if [ -f "$ART/$art" ]; then
           cp -f "$ART/$art" "$DEST/menu-art/$art" || die "cannot copy menu-art/$art"
         fi

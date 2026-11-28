@@ -841,6 +841,134 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// The mark, in a slot's count of looks again, that its texture was found
+/// changed after an upload of it (kept across its uploads again).
+const FOUND_CHANGED: u8 = 0x80;
+
+/// The look again after one that found a slot uploaded whole unchanged, by
+/// the count of such looks (and [`FOUND_CHANGED`]): the frames to it and
+/// the count to keep; None: no more looks.
+///
+/// One found changed, once those are over, is looked at every `tail`
+/// frames for as long as its view is in the queue (0: no more): the title
+/// writes such a texture (a glyph atlas) again whenever it has new letters
+/// to show, and the five looks are over in two seconds where it begins 300
+/// frames a second (the world's loading). Those slots are few: the others'
+/// stay out of the queue, whose lock every pass holds over all its slots.
+fn next_look(looks: u8, tail: u64) -> Option<(u64, u8)> {
+    match RECHECK_FRAMES.get(usize::from(looks & !FOUND_CHANGED) + 1) {
+        Some(&wait) => Some((wait, looks + 1)),
+        None => (tail > 0 && looks & FOUND_CHANGED != 0).then_some((tail, looks)),
+    }
+}
+
+/// Frames between the looks again at a texture found changed after an
+/// upload, once its looks of [`RECHECK_FRAMES`] are over: about a second
+/// (`most`, the frames of about four seconds, over four; 4 at least).
+/// `VICTORY_RECHECK_TAIL=0`: none, it is looked at no more, as before.
+fn recheck_tail(most: u64) -> u64 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_TAIL").is_none_or(|v| v != "0")) { (most / 4).max(4) } else { 0 }
+}
+
+/// Bytes a frame's looks again may read whole, past the fingerprint
+/// ([`look_again`]): `VICTORY_RECHECK_WHOLE_MB`, 8 MiB by default; 0: none,
+/// the fingerprint alone, as before; none either with
+/// `VICTORY_TEXTURE_SAME=0` (`crate::texture::same_asked`).
+fn whole_look_bytes() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    if !crate::texture::same_asked() {
+        return 0;
+    }
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_RECHECK_WHOLE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8)
+    }) << 20
+}
+
+/// A start budget: a whole look begins only while a frame's whole looks
+/// have taken less than this, so a frame spends up to this plus one look
+/// (about 0.11 ms a MB: 0.62 ms for the 5,406,720 bytes of the loading
+/// tip's atlas, an optimized build; at most 8 MiB, under 1 ms).
+const WHOLE_LOOK_NANOS: u64 = 1_000_000;
+
+/// The frame [`WHOLE_LOOK_SPENT`] counts, and the bytes read and the
+/// nanoseconds taken in it by whole looks.
+static WHOLE_LOOK_SPENT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Since the start: whole looks made, the bytes they read, their
+/// nanoseconds, the changes they found that the fingerprint had not, and
+/// looks that read no more than the fingerprint for the frame's budget.
+pub(crate) static HEAP_TEXTURES_WHOLE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Whether a whole look reading `size` bytes (what the host copy was
+/// filled from, which may be more than the view's span) fits in what frame
+/// `frame` has left of `most` bytes and [`WHOLE_LOOK_NANOS`], by `spent`:
+/// the frame [`WHOLE_LOOK_SPENT`] counts, its bytes and its nanoseconds.
+fn whole_look_fits(spent: [u64; 3], frame: u64, size: u64, most: u64) -> bool {
+    let [of, bytes, nanos] = spent;
+    most > 0 && size <= most && (of != frame || (bytes + size <= most && nanos < WHOLE_LOOK_NANOS))
+}
+
+/// [`whole_look_fits`] for this frame (`size` 0: asked before the bytes
+/// are known); a refusal counted while whole looks are on.
+fn whole_look_room(frame: u64, size: u64) -> bool {
+    let spent = WHOLE_LOOK_SPENT.each_ref().map(|n| n.load(Ordering::Relaxed));
+    let most = whole_look_bytes();
+    let room = whole_look_fits(spent, frame, size, most);
+    if !room && most > 0 {
+        HEAP_TEXTURES_WHOLE[4].fetch_add(1, Ordering::Relaxed);
+    }
+    room
+}
+
+/// A whole look in frame `frame` read `bytes` and took `took`.
+fn whole_look_spent(frame: u64, bytes: u64, took: std::time::Duration) {
+    let s = &WHOLE_LOOK_SPENT;
+    let nanos = took.as_nanos() as u64;
+    if s[0].swap(frame, Ordering::Relaxed) != frame {
+        s[1].store(0, Ordering::Relaxed);
+        s[2].store(0, Ordering::Relaxed);
+    }
+    s[1].fetch_add(bytes, Ordering::Relaxed);
+    s[2].fetch_add(nanos, Ordering::Relaxed);
+    for (count, n) in HEAP_TEXTURES_WHOLE.iter().zip([1, bytes, nanos]) {
+        count.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// What the host copy of the texture a slot's view shows was filled from
+/// ([`crate::texture::held_digest`]), as the pass finds that texture.
+fn held_of(view: &View) -> Option<(*const u8, usize, crate::texture::Digest)> {
+    match view {
+        View::Placed(false, resource, desc) if resource[0] != 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let texture = crate::resource::texture_at(address, resource)?;
+            crate::texture::held_digest(texture, crate::resource::first_mip(desc))
+        }
+        View::Shader(object, _) => crate::texture::held_digest(*object as This, 0),
+        _ => None,
+    }
+}
+
+/// What a look again at a slot uploaded whole finds: `Some(whole)` if its
+/// memory changed, by the fingerprint of `[at, at + len)` against `print`
+/// (false), or else in any of the bytes its host copy was filled from
+/// (true), when `whole` names them (memory, bytes, their digest then).
+/// The fingerprint reads 48 KiB at three places: a glyph the title writes
+/// into the rest of a 5 MB atlas changes none of them.
+fn look_again(
+    at: u64,
+    len: u64,
+    print: u64,
+    whole: impl FnOnce() -> Option<(*const u8, usize, crate::texture::Digest)>,
+) -> Option<bool> {
+    if crate::texture::fingerprint(at, len) != print {
+        return Some(false);
+    }
+    let (memory, size, held) = whole()?;
+    (crate::texture::holds_still(memory, size, held) == Some(false)).then_some(true)
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -3351,17 +3479,42 @@ impl State {
                 knew if queue_batch() && host.texture_slot_write(index) == Some(write) => knew,
                 _ => rest(0, || host.texture_slot_checked(index)),
             };
+            // Found changed after an upload, now or before: its uploads
+            // again keep the mark ([`next_look`]).
+            let mut changed_before = checked.map_or(0, |c| c.3 & FOUND_CHANGED);
             if let Some((at, len, print, looks, uploaded)) = checked {
-                let looked = timed(0, || crate::texture::fingerprint(at, len));
-                if looked == print {
+                // Past the fingerprint, all of what the host copy was filled
+                // from, within the frame's bytes and time ([`whole_look_room`],
+                // by the bytes it reads; not in the frame after an upload,
+                // whose digest is noted when its list is sent).
+                let mut read = 0;
+                let whole = || {
+                    if len <= crate::texture::FINGERPRINTED || frame <= uploaded + 1 || !whole_look_room(frame, 0) {
+                        return None;
+                    }
+                    let held = heap.handle(index).and_then(crate::descriptor::view).as_ref().and_then(held_of)?;
+                    if !whole_look_room(frame, held.1 as u64) {
+                        return None;
+                    }
+                    read = held.1 as u64;
+                    Some(held)
+                };
+                let started = std::time::Instant::now();
+                let found = timed(0, || look_again(at, len, print, whole));
+                if read > 0 {
+                    whole_look_spent(frame, read, started.elapsed());
+                }
+                let Some(by_whole) = found else {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     outcome(slot_outcome::UNCHANGED);
-                    tells.tell(index, write, match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => Told::Recheck(frame + wait, (at, len), print, looks + 1, uploaded),
+                    tells.tell(index, write, match next_look(looks, recheck_tail(most)) {
+                        Some((wait, looks)) => Told::Recheck(frame + wait, (at, len), print, looks, uploaded),
                         None => Told::Done(None),
                     });
                     continue;
-                }
+                };
+                HEAP_TEXTURES_WHOLE[3].fetch_add(u64::from(by_whole), Ordering::Relaxed);
+                changed_before = FOUND_CHANGED;
                 if recheck_soon() {
                     again_in = 1;
                 }
@@ -3381,7 +3534,9 @@ impl State {
                         address = format_args!("{at:#x}"),
                         bytes = len,
                         frames_after_upload = frame.saturating_sub(uploaded),
-                        looks,
+                        looks = looks & !FOUND_CHANGED,
+                        found_before = looks & FOUND_CHANGED != 0,
+                        whole_look = by_whole,
                         changed = n + 1,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
@@ -3586,7 +3741,7 @@ impl State {
                     memory.map(|(at, len)| (at, len, crate::texture::fingerprint(at, len)))
                 });
                 tells.tell(index, write, match memory {
-                    Some((at, len, print)) => Told::Recheck(frame + again_in, (at, len), print, 0, frame),
+                    Some((at, len, print)) => Told::Recheck(frame + again_in, (at, len), print, changed_before, frame),
                     None => Told::Done(again),
                 });
                 continue;
@@ -3719,7 +3874,7 @@ impl State {
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             tells.tell(index, write, match memory {
                 // Whole and uploaded: looked at again (see above).
-                Some((at, len, print)) => Told::Recheck(frame + again_in, (at, len), print, 0, frame),
+                Some((at, len, print)) => Told::Recheck(frame + again_in, (at, len), print, changed_before, frame),
                 None => Told::Done(again),
             });
         }
@@ -3846,6 +4001,12 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && crate::ambient::views::on()
+        {
+            self.list_views(p, role);
+        }
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
@@ -3858,7 +4019,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, MISS_DEPTH, MISS_LIGHT, MissNote, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, Alpha, DEPTH, LIGHT, MISS_DEPTH, MISS_LIGHT, MissNote, MissRoute, RADIANCE, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3877,15 +4038,15 @@ impl State {
                 .unwrap_or(u32::MAX),
             _ => 0,
         };
-        // The alpha layer only with VICTORY_AMBIENT_SPECULAR_ALPHA=1: its pixels
-        // are of transparent surfaces (glass, foam, wakes on water) and the
-        // depth read is the opaque one behind them; outdoors on water that is
-        // the bottom, the reflected direction is wrong and the estimate dark
-        // (play session 2026-11-27: dark patches on the water around a boat).
-        let alpha_too = std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "1");
-        if role == Role::Miss
-            && !(layer == crate::ambient::MISS_OPAQUE || (alpha_too && layer == crate::ambient::MISS_ALPHA))
-        {
+        // The alpha layer only with VICTORY_AMBIENT_SPECULAR_ALPHA set: its
+        // pixels are of transparent surfaces (glass, foam, wakes on water) and
+        // the depth read is the opaque one behind them; outdoors on water that
+        // is the bottom, the reflected direction is wrong and the estimate
+        // dark (seen in play as dark patches on the water around a boat). Its bound reads no depth (`crate::ambient::alpha`). What is
+        // left as the title has it does not depend on the depth, so it is
+        // decided before the tables are looked at (`crate::ambient::route`).
+        let alpha = if role == Role::Miss { crate::ambient::alpha_in_effect() } else { Alpha::Title };
+        if role == Role::Miss && crate::ambient::route(layer, false, false, alpha) == MissRoute::Left {
             crate::ambient::note_miss(MissNote::Water);
             return false;
         }
@@ -3946,6 +4107,25 @@ impl State {
                 }
                 _ => false,
             }
+        }
+        // The miss program's image is of half the picture's size, its depth
+        // (32-bit) of the whole: whether `seen` is a depth the estimate can be
+        // made from for the image `of`.
+        fn miss_depth_fits(of: &D3D12_RESOURCE_DESC, seen: &D3D12_RESOURCE_DESC) -> bool {
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT,
+                DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+            };
+            matches!(
+                seen.Format,
+                DXGI_FORMAT_R32_TYPELESS
+                    | DXGI_FORMAT_R32_FLOAT
+                    | DXGI_FORMAT_D32_FLOAT
+                    | DXGI_FORMAT_R32G8X24_TYPELESS
+                    | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+            ) && seen.Width >= of.Width
+                && seen.Height >= of.Height
+                && seen.Width <= of.Width * 4
         }
         let stencil_at = |(slot, offset): (u8, u32)| {
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
@@ -4032,6 +4212,22 @@ impl State {
             }),
             Role::Radiance | Role::Air => image,
         };
+        // On the layer and the depth as the check below takes it: a depth that
+        // check refuses is no depth, and the alpha layer's estimate without
+        // one is left (counted not ready), never another layer's path.
+        let route = match role {
+            Role::Miss => {
+                let valid = matches!((&image, &depth), (Some((of, _)), Some((seen, _))) if miss_depth_fits(of, seen));
+                crate::ambient::route(layer, depth.is_some(), valid, alpha)
+            }
+            _ => MissRoute::Estimate,
+        };
+        let bound = match route {
+            MissRoute::Bound(k) => Some(k),
+            _ => None,
+        };
+        // The bound reads the rays' image alone: there may be no depth to give.
+        let depth = if bound.is_some() { image } else { depth };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             if role == Role::Miss {
@@ -4072,24 +4268,10 @@ impl State {
         let format = if role == Role::Resolve { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         // The miss program's image is of half the picture's size, its depth
-        // (32-bit) of the whole.
+        // (32-bit) of the whole: the estimate's route had its depth checked
+        // (`miss_depth_fits`); the bound reads none.
         let sizes = match role {
-            Role::Miss => {
-                use windows::Win32::Graphics::Dxgi::Common::{
-                    DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT,
-                    DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
-                };
-                matches!(
-                    seen.Format,
-                    DXGI_FORMAT_R32_TYPELESS
-                        | DXGI_FORMAT_R32_FLOAT
-                        | DXGI_FORMAT_D32_FLOAT
-                        | DXGI_FORMAT_R32G8X24_TYPELESS
-                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
-                ) && seen.Width >= of.Width
-                    && seen.Height >= of.Height
-                    && seen.Width <= of.Width * 4
-            }
+            Role::Miss => matches!(route, MissRoute::Estimate | MissRoute::Bound(_)),
             _ => (seen.Width, seen.Height) == (of.Width, of.Height),
         };
         if of.Format.0 != format || !sizes || volume != (role == Role::Air) {
@@ -4105,11 +4287,36 @@ impl State {
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
             depth_size: [seen.Width as u32, seen.Height],
-        });
+        }, bound);
         if ran && role == Role::Miss {
-            crate::ambient::note_miss(MissNote::Ran(layer));
+            crate::ambient::note_miss(if bound.is_some() { MissNote::Bounded } else { MissNote::Ran(layer) });
         }
         ran
+    }
+
+    /// The shader views and unordered views in the root tables of `p`, a
+    /// program of `role`, once per distinct set (`crate::ambient::views`,
+    /// `VICTORY_AMBIENT_LIST_VIEWS=1`): read as [`Self::ambient`] reads its
+    /// places, making no host copy.
+    #[cfg(feature = "diagnostics")]
+    fn list_views(&self, p: &HostPipeline, role: crate::ambient::Role) {
+        use crate::ambient::views;
+        let Some(t) = p.stages.first().map(|s| s.translated()) else {
+            return;
+        };
+        let lines: Vec<String> = t
+            .used
+            .iter()
+            .filter(|u| u.root == RootType::Table && matches!(u.kind, ResourceType::Srv | ResourceType::Uav))
+            .map(|u| {
+                let view = match self.roots_ref(true).get(usize::from(u.slot)) {
+                    Some(Root::Table(table)) => crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4),
+                    _ => None,
+                };
+                views::line(u.slot, u.table_offset_dwords, u.kind == ResourceType::Uav, &views::found(view))
+            })
+            .collect();
+        views::note(role, &p.name, &lines);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -5439,6 +5646,14 @@ impl State {
         // that found nothing the sky (`crate::ambient`, `Role::Miss`): the
         // execution held back is recorded first. (Not after one joined to
         // the run before: the tables noted are another program's.)
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH
+            && !joined
+            && let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && crate::ambient::views::on()
+        {
+            self.list_views(p, role);
+        }
         if kind == DISPATCH
             && !joined
             && let Some(role @ crate::ambient::Role::Miss) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -6074,6 +6289,106 @@ mod tests {
         constants[0x7c / 4] = 3 + 256;
         assert_eq!(bake_record_range(&constants), Some((3, 259)));
         assert_eq!(bake_record_range(&constants[..0x78 / 4 + 1]), None);
+    }
+
+    /// The frames at which a slot uploaded at frame 0 is looked at again,
+    /// up to frame `until`: found changed at its first look (the title's
+    /// first glyphs in a shared atlas) and uploaded again there, then found
+    /// unchanged at every look (as the pass tells the queue).
+    fn looks_after_a_change(tail: u64, until: u64) -> Vec<u64> {
+        use super::{FOUND_CHANGED, RECHECK_FRAMES, next_look};
+        // Uploaded again at the first look, and looked at in the next frame.
+        let (mut at, mut looks) = (RECHECK_FRAMES[0] + 1, FOUND_CHANGED);
+        let mut seen = Vec::new();
+        while at <= until {
+            seen.push(at);
+            let Some((wait, next)) = next_look(looks, tail) else { break };
+            (at, looks) = (at + wait, next);
+        }
+        seen
+    }
+
+    /// A late write (the loading tip's letters): a texture found changed
+    /// after its upload is looked at again for as long as it is in the
+    /// queue, `tail` frames apart once its looks of `RECHECK_FRAMES` are
+    /// over; one never found changed has those five looks alone.
+    #[test]
+    fn a_texture_found_changed_is_looked_at_after_its_looks_are_over() {
+        use super::{FOUND_CHANGED, next_look};
+        // While the world loads the title begins some 300 frames a second
+        // (one slot's looks in a recorded load, 62 frames in 0.21 s): the
+        // five looks end two seconds after an upload.
+        let tail = 16;
+        let write = 2_000;
+        let seen = looks_after_a_change(tail, 4 * write);
+        assert!(
+            seen.iter().any(|&at| at > write && at <= write + tail),
+            "a write at frame {write} is looked at within {tail} frames; the looks: {seen:?}"
+        );
+        assert_eq!(next_look(4, tail), None, "never found changed: five looks, as before");
+        assert_eq!(next_look(FOUND_CHANGED | 4, 0), None, "no tail: five looks, as before");
+        assert_eq!(next_look(FOUND_CHANGED | 1, tail), Some((40, FOUND_CHANGED | 2)));
+    }
+
+    /// A whole look is admitted by the bytes it reads, the host copy's (a
+    /// view of a mip tail over a copy filled whole reads more than its
+    /// span): one past what the frame has left, or past the budget, is
+    /// refused; time spent past the start budget refuses all in that frame;
+    /// a new frame starts afresh; a budget of 0 admits none.
+    #[test]
+    fn a_whole_look_is_admitted_by_the_bytes_it_reads() {
+        use super::{WHOLE_LOOK_NANOS, whole_look_fits};
+        const MIB: u64 = 1 << 20;
+        let most = 8 * MIB;
+        let spent = [7, 6 * MIB, 0];
+        assert!(whole_look_fits(spent, 7, 2 * MIB, most));
+        assert!(!whole_look_fits(spent, 7, 3 * MIB, most), "a held size over the room is refused");
+        assert!(!whole_look_fits([0, 0, 0], 7, 9 * MIB, most), "over the budget, even in a fresh frame");
+        assert!(whole_look_fits(spent, 8, 8 * MIB, most), "another frame");
+        assert!(!whole_look_fits([7, 0, WHOLE_LOOK_NANOS], 7, MIB, most), "the start budget spent");
+        assert!(whole_look_fits([7, 0, WHOLE_LOOK_NANOS - 1], 7, MIB, most), "begun under the start budget");
+        assert!(!whole_look_fits([0, 0, 0], 7, 0, 0), "a budget of 0 admits none");
+    }
+
+    /// A write outside the fingerprint's 48 KiB (a glyph in the middle of
+    /// a 5,406,720-byte atlas, slot 332050's size): a look that may read
+    /// the bytes the host copy was filled from finds it; the fingerprint
+    /// alone does not. Prints what a whole look of that size costs.
+    #[test]
+    fn a_glyph_written_outside_the_fingerprint_is_found_by_a_whole_look() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const LEN: usize = 5_406_720;
+        // SAFETY: memory of our own, written and read by this thread alone.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            for i in 0..LEN {
+                base.add(i).write((i * 7 + i / 4093) as u8);
+            }
+            let at = base as u64;
+            // What the upload filled the host copy from, and the print.
+            let held = crate::texture::digest(std::slice::from_raw_parts(base, LEN));
+            let print = crate::texture::fingerprint(at, LEN as u64);
+            let whole = || Some((base.cast_const(), LEN, held));
+            assert_eq!(super::look_again(at, LEN as u64, print, whole), None, "nothing written");
+            // A glyph: a 4 KiB tile 1 MiB in, between the windows.
+            base.add(1 << 20).write_bytes(0xff, 4096);
+            assert_eq!(crate::texture::fingerprint(at, LEN as u64), print, "the fingerprint does not see it");
+            assert_eq!(super::look_again(at, LEN as u64, print, || None), None, "nor a look without the whole");
+            assert_eq!(super::look_again(at, LEN as u64, print, whole), Some(true), "a whole look finds the glyph");
+            let best = (0..5)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    std::hint::black_box(super::look_again(at, LEN as u64, print, whole));
+                    started.elapsed().as_secs_f64() * 1e3
+                })
+                .fold(f64::MAX, f64::min);
+            eprintln!("a whole look of {LEN} bytes: {best:.3} ms");
+            // Written in a window: the fingerprint finds it, as before.
+            base.add(16).write_bytes(0, 64);
+            assert_eq!(super::look_again(at, LEN as u64, print, whole), Some(false));
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
     }
 
     /// Slot numbers among a bake's words: each once in the order they come,

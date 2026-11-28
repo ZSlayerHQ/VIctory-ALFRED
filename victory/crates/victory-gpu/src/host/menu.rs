@@ -16,8 +16,8 @@
 //! (DLSS mode, frame generation, frame rate, console, picture size), which it
 //! turns into the layer's switches; the others are the switches themselves.
 //!
-//! In every build, as the stats panel is. Drawn on the processor and copied
-//! onto the swap chain's buffer, in the middle of the picture: on its panel
+//! In every build, as the stats panel is. Drawn on the processor and placed
+//! on the swap chain's buffer, in the middle of the picture: on its panel
 //! (our own art, `art.rs`: read from `VICTORY_MENU_ART`, else `menu-art`
 //! beside the program), or with `VICTORY_MENU_PANEL=0` or without the art as
 //! the stats panel is, white dot letters on a black box. The picture is made
@@ -37,16 +37,20 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::font::{colours, glyph};
-use super::{Host, HostList, transition};
+#[cfg(test)]
+use super::picture;
+use super::picture::{Blend, Buffers};
+use super::{Host, HostList};
 
 mod art;
+pub(super) mod chip;
 mod panel;
-mod qoi;
+pub(super) mod status;
 
 const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// As wide as the widest line the menu can show (a help line), no wider (tested).
-const COLUMNS: u32 = 107;
+const COLUMNS: u32 = 112;
 /// Lines of the box: a title, the keys, a blank, the rows shown (group
 /// headings, settings, a blank, the actions), a blank, the help line of the
 /// row picked (two more lines for the preload), a note and the repository line.
@@ -59,32 +63,32 @@ const KEYS: &str = "Up / Down: move \u{b7} Left / Right: change \u{b7} Enter: se
 /// The action that preloads shaders, and what is said of it while it is picked.
 const PRELOAD: usize = 2;
 const ABOUT_PRELOAD: [&str; 3] = [
-    "Prepares every shader in one go, then starts the game again.",
+    "Compiles every shader up front, then starts the game again.",
     "This can take a long time, depending on your PC.",
-    "After an update of this build you may need to do it again.",
+    "Needed again after an update of this build.",
 ];
 /// The help lines of the other actions, in their order (the preload's is [`ABOUT_PRELOAD`]).
 const ACTION_HELP: [&str; 5] = [
     "Saves your changes and restarts the game so they take effect.",
-    "Saves your changes. They take effect the next time you start the game.",
+    "Saves your changes. They take effect the next time the game starts.",
     "",
-    "Clears your saved changes. The recommended settings apply at the next start.",
+    "Clears your saved changes. The defaults apply at the next launch.",
     "Closes this menu.",
 ];
 /// The note after the first Enter on it: the second one does it.
-const CONFIRM_PRELOAD: &str = "Press Enter again to save, close the game and prepare the shaders.";
+const CONFIRM_PRELOAD: &str = "Press Enter again to save, close the game and precompile the shaders.";
 /// The notes after the actions.
 const NO_FILE: &str = "Nothing to save to: start the game with victory play.";
-const SAVED: &str = "Saved. Takes effect the next time you start the game.";
+const SAVED: &str = "Saved. Applies at the next launch.";
 const NOT_SAVED: &str = "Could not save the settings file.";
-const RESTART_YOURSELF: &str = "Saved. Close the game and start it again yourself.";
-const RESTART_FAILED: &str = "Saved, but the restart failed. Start the game again yourself.";
-const RESET: &str = "Reset. The recommended settings apply at the next start.";
+const RESTART_YOURSELF: &str = "Saved. Restart the game yourself to apply.";
+const RESTART_FAILED: &str = "Saved, but the restart failed. Restart the game yourself.";
+const RESET: &str = "Reset. Defaults apply at the next launch.";
 /// The note line while no other note is up: what the row picked does once
 /// changed, else what the `*` beside a row means.
-const CHANGED_NOW: &str = "Changed. Applies now.";
-const CHANGED_LATER: &str = "Changed. Takes effect after a restart.";
-const LEGEND: &str = "* = Changed. Takes effect after a restart.";
+const CHANGED_NOW: &str = "Changed: applied live.";
+const CHANGED_LATER: &str = "Changed: applies after a restart.";
+const LEGEND: &str = "* = Changed: applies after a restart.";
 /// The last line of the box: where this build comes from.
 const REPO: &str = "VIctory-ALFRED, built on VIctory-NVIDIA and foxhound";
 const RIM: u32 = 4;
@@ -99,7 +103,8 @@ struct Item {
     label: &'static str,
     values: &'static [(&'static str, &'static str)],
     live: bool,
-    help: &'static str,
+    /// One to three lines.
+    help: &'static [&'static str],
     group: &'static str,
     /// Variables set with this one: each with its value for each of this
     /// item's values, by index. One that is another row's variable moves that
@@ -109,7 +114,7 @@ struct Item {
 }
 
 impl Item {
-    const fn new(group: &'static str, var: &'static str, label: &'static str, values: &'static [(&'static str, &'static str)], help: &'static str) -> Item {
+    const fn new(group: &'static str, var: &'static str, label: &'static str, values: &'static [(&'static str, &'static str)], help: &'static [&'static str]) -> Item {
         Item { var, label, values, live: false, help, group, ties: &[] }
     }
 
@@ -127,12 +132,12 @@ const ON_UNSET: &[(&str, &str)] = &[("1", "On"), ("", "Off")];
 const UNSET_ON: &[(&str, &str)] = &[("", "Off"), ("1", "On")];
 const STAGES: &[(&str, &str)] = &[("2", "2"), ("1", "1"), ("0", "Off")];
 
-const PICTURE: &str = "Picture";
-const SMOOTHNESS: &str = "Smoothness";
-const LIGHT: &str = "Light and water";
-const ON_SCREEN: &str = "On screen";
-const MOUSE: &str = "Mouse and keyboard";
-const ADVANCED: &str = "Advanced speed settings (leave these alone unless asked)";
+const GRAPHICS: &str = "Graphics";
+const FRAME_RATE: &str = "Frame rate";
+const LIGHT: &str = "Lighting and water";
+const OVERLAY: &str = "Overlay";
+const INPUT: &str = "Input";
+const ADVANCED: &str = "Advanced";
 
 /// The row that turns the title's own ray-traced bounce light on: its two
 /// switches, with the estimates of light, haze and reflections cleared; off,
@@ -145,74 +150,86 @@ const BOUNCE: &str = "VICTORY_RT_RESOLVE";
 #[rustfmt::skip]
 const ITEMS: &[Item] = &[
     // The launcher's own choices, then the layer's switches, within each group.
-    Item::new(PICTURE, "VICTORY_MENU_DLSS", "Sharper picture (DLSS)", &[("quality", "Quality"), ("balanced", "Balanced"), ("performance", "Performance"), ("dlaa", "Native (DLAA)"), ("off", "Off")],
-        "NVIDIA's upscaler: draws fewer pixels and sharpens them. Quality looks best."),
-    Item::new(PICTURE, "VICTORY_DLSS_PRESET", "DLSS version", &[("", "Default"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")],
-        "Which DLSS model to use. Leave on Default unless you are comparing."),
-    Item::new(PICTURE, "VICTORY_MENU_RES", "Picture size", &[("1440", "2560 x 1440 (not in this build)"), ("1080to1440", "1080p stretched to 1440p (not in this build)"), ("4k", "3840 x 2160")],
-        "The size the game draws at. Bigger is sharper and slower."),
-    Item::new(PICTURE, "VICTORY_MENU_CONSOLE", "Console mode", &[("series-x", "Series X (full detail)"), ("series-s", "Series S (faster, softer)")],
-        "Which console the game thinks it runs on."),
-    Item::new(PICTURE, "VICTORY_FULLSCREEN", "Full screen", UNSET_ON,
-        "Fills the screen with no window border."),
-    Item::new(SMOOTHNESS, "VICTORY_MENU_FRAMEGEN", "Extra frames (smoother motion)", &[("0", "Off"), ("2", "2x"), ("3", "3x"), ("4", "4x"), ("5", "5x"), ("6", "6x")],
-        "Adds in-between frames so movement looks smoother. The game itself does not run faster."),
+    Item::new(GRAPHICS, "VICTORY_MENU_DLSS", "DLSS upscaling (not in this build)", &[("quality", "Quality"), ("balanced", "Balanced"), ("performance", "Performance"), ("dlaa", "DLAA (native)"), ("off", "Off")],
+        &["NVIDIA DLSS upscaling: renders below the output resolution and reconstructs it.",
+          "DLAA renders at native resolution with DLSS anti-aliasing. Needs an RTX card and NVIDIA's files."]),
+    Item::new(GRAPHICS, "VICTORY_DLSS_PRESET", "DLSS model preset (not in this build)", &[("", "Default"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")],
+        &["Which DLSS model preset is used. Default lets the installed DLSS version choose."]),
+    // Not "Render and output resolution": with DLSS on, the game renders below the output.
+    Item::new(GRAPHICS, "VICTORY_MENU_RES", "Resolution", &[("1440", "2560 x 1440 (not in this build)"), ("1080to1440", "1920 x 1080 upscaled to 1440p (not in this build)"), ("4k", "3840 x 2160")],
+        &["3840 x 2160 is the console's own; 2560 x 1440 is native 1440p;",
+          "1080p upscaled uses the game's own upscaler. Only 3840 x 2160 is in this build."]),
+    Item::new(GRAPHICS, "VICTORY_MENU_CONSOLE", "Console profile", &[("series-x", "Series X (full detail)"), ("series-s", "Series S (lower detail, faster)")],
+        &["Which console the game runs as. It sets the game's own detail and resolution targets."]),
+    Item::new(GRAPHICS, "VICTORY_FULLSCREEN", "Borderless fullscreen", UNSET_ON,
+        &["A borderless window that covers the display."]),
+    Item::new(FRAME_RATE, "VICTORY_MENU_FRAMEGEN", "Frame generation (not in this build)", &[("0", "Off"), ("2", "2x"), ("3", "3x"), ("4", "4x"), ("5", "5x"), ("6", "6x")],
+        &["Inserts generated frames between rendered ones: 2x doubles the displayed frame rate, up to 6x.",
+          "The game still simulates at the rendered rate, and input latency rises. Above 2x needs multi frame generation."]),
     // DLSS Frame Generation where it runs (RTX 40 and later), else AMD's FSR 3 (2X only).
-    Item::new(SMOOTHNESS, "VICTORY_MENU_FG_TYPE", "Extra frames: how", &[("auto", "Automatic"), ("dlss", "DLSS"), ("fsr", "FSR 3 (older cards)")],
-        "Which technology makes the extra frames. Automatic picks what your card supports."),
+    Item::new(FRAME_RATE, "VICTORY_MENU_FG_TYPE", "Frame gen type (not in this build)", &[("auto", "Auto"), ("dlss", "DLSS"), ("fsr", "FSR 3")],
+        &["DLSS Frame Generation (RTX 40 and 50) or AMD FSR 3 frame generation (other cards). Auto uses DLSS where it runs."]),
     // Someone else's mod (apps\victory\src\play.rs): loaded at the next start where its file was put.
-    Item::new(SMOOTHNESS, "VICTORY_MFG_UNLOCKER", "Extra frames on RTX 20 and 30 (unofficial)", UNSET_ON,
-        "Someone else's add-on, used at the next start only if its file was put in place. Won't start? Turn it off."),
-    Item::new(SMOOTHNESS, "VICTORY_MENU_FPS", "Frame rate limit", &[("1000", "None"), ("120", "120"), ("60", "60"), ("30", "30 (the game's own)")],
-        "The most frames a second the game may draw."),
+    Item::new(FRAME_RATE, "VICTORY_MFG_UNLOCKER", "MFG unlocker (not in this build)", UNSET_ON,
+        &["A third-party mod that enables DLSS frame generation on RTX 20 and 30. Used at the next start only if",
+          "its file was put in place; turn it off if the game then fails to launch."]),
+    Item::new(FRAME_RATE, "VICTORY_MENU_FPS", "FPS limit", &[("1000", "Unlimited"), ("120", "120"), ("60", "60"), ("30", "30 (console default)")],
+        &["Caps the rendered frame rate. 30 is the console's own cap."]),
+    // Name and help as before: whether it gives ray-traced light without the BVH builder is
+    // not what the code says (`pipeline::make`: without it the resolve shades no hits).
     Item::new(LIGHT, BOUNCE, "Real bounce light (best picture, slower)", UNSET_ON,
-        "The game's own bounced light: lit walls and floors in shade. Costs about a quarter of the frame rate today.")
+        &["The game's own bounced light: lit walls and floors in shade. Costs about a quarter of the frame rate today."])
         .tied(&[
             ("VICTORY_ACTIVATE_RAYS", &["", "1"]),
             ("VICTORY_AMBIENT", &["0.8", ""]),
             ("VICTORY_AMBIENT_AIR", &["1.5", ""]),
             ("VICTORY_AMBIENT_SPECULAR", &["1", ""]),
         ]),
-    Item::new(LIGHT, "VICTORY_AMBIENT", "Quick light in shade", &[("0.8", "On (0.8)"), ("1", "Brighter (1)"), ("0.5", "Dimmer (0.5)"), ("", "Off")],
-        "A fast stand-in for bounced light, used when the real one is off."),
-    Item::new(LIGHT, "VICTORY_AMBIENT_SPECULAR", "Quick reflections", ON_UNSET,
-        "A fast stand-in for reflections, used when the real light is off."),
-    Item::new(LIGHT, "VICTORY_AMBIENT_AIR", "Haze brightness limit", &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "None")],
-        "Stops distant haze from glowing too brightly with the quick light."),
-    Item::new(LIGHT, "VICTORY_BVH_BUILDER", "Full ray tracing (very slow, unfinished)", UNSET_ON,
-        "Builds the game's full ray-tracing scene. A few frames a second for now."),
-    Item::new(LIGHT, "VICTORY_WATER_LIGHT", "Light in water", &[("", "Off (clean)"), ("1", "On (dark blocks for now)")],
-        "The water's own light. On, it still draws dark squares."),
-    Item::new(LIGHT, "VICTORY_LEAVE_OUT", "Heat haze and decal tidy-up", &[("02384a60fda6f2d0,731a39171b568298", "Left out (faster)"), ("", "Run (slower)")],
-        "Two small effects that cost a lot for now."),
-    Item::new(ON_SCREEN, "VICTORY_FPS_LINE", "Show frame rate", &[("1", "On"), ("0", "Off")],
-        "The frames-a-second counter in the top-left corner.").live(),
-    Item::new(ON_SCREEN, "VICTORY_PANEL", "Show details panel (F3)", &[("0", "Off"), ("1", "On")],
-        "A panel of timings for troubleshooting.").live(),
-    Item::new(MOUSE, "VICTORY_MOUSE_CAPTURE", "Keep the mouse in the game", UNSET_ON,
-        "Stops the pointer leaving the game window."),
-    Item::new(MOUSE, "VICTORY_IME_ENGLISH", "Use an English keyboard", UNSET_ON,
-        "Types with the English layout whatever Windows is set to."),
-    Item::new(ADVANCED, "VICTORY_EARLY_DEPTH", "Skip hidden pixels early", ON_UNSET,
-        "Lets the card drop pixels that end up hidden. Faster."),
-    Item::new(ADVANCED, "VICTORY_WC_NO_BACK", "Skip large copy-backs", ON_UNSET,
-        "Leaves large blocks on the card instead of copying them back. Faster."),
-    Item::new(ADVANCED, "VICTORY_SOFT_VIEWS", "No freeze at scene cuts", &[("copies", "On"), ("", "Off")],
-        "Avoids a short freeze when a cutscene changes scene."),
-    Item::new(ADVANCED, "VICTORY_TEXTURE_NO_WAIT", "Do not wait for textures", ON_UNSET,
-        "The game carries on while a texture loads; it may appear a moment late."),
-    Item::new(ADVANCED, "VICTORY_RELAY", "Faster hand-off to the card", STAGES,
-        "How work is handed to the graphics card. 2 is fastest."),
-    Item::new(ADVANCED, "VICTORY_CARD_STEPS", "More work on the card", STAGES,
-        "Moves small copies from the processor to the card. 2 is fastest."),
-    Item::new(ADVANCED, "VICTORY_INDIRECT_BATCH", "Group small draw calls", STAGES,
-        "Sends small pieces of drawing together. 2 is fastest."),
+    // The fallbacks run whenever the BVH builder does not (`ambient::on`), not by the row above.
+    Item::new(LIGHT, "VICTORY_AMBIENT", "Ambient light fallback", &[("0.8", "On (0.8)"), ("1", "Brighter (1.0)"), ("0.5", "Dimmer (0.5)"), ("", "Off")],
+        &["An approximate ambient term. The number is its intensity."]),
+    Item::new(LIGHT, "VICTORY_AMBIENT_SPECULAR", "Reflection fallback", ON_UNSET,
+        &["Approximate specular reflections."]),
+    Item::new(LIGHT, "VICTORY_AMBIENT_AIR", "Fog brightness clamp", &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "None")],
+        &["Clamps how bright volumetric fog gets with the ambient fallback."]),
+    // The builder is the title's own compute programs, on the card.
+    Item::new(LIGHT, "VICTORY_BVH_BUILDER", "Ray tracing: full BVH (experimental)", UNSET_ON,
+        &["Builds the game's full ray-tracing acceleration structure (BVH). A few frames a second for now."]),
+    Item::new(LIGHT, "VICTORY_WATER_LIGHT", "Water lighting", &[("", "Off (clean)"), ("1", "On (artifacts for now)")],
+        &["The water's own tiled lighting passes. On, they still draw dark blocks."]),
+    Item::new(LIGHT, "VICTORY_LEAVE_OUT", "Heat haze and decal defrag", &[("02384a60fda6f2d0,731a39171b568298", "Skip (faster)"), ("", "Run (slower)")],
+        &["Two effects that are expensive for now."]),
+    Item::new(OVERLAY, "VICTORY_FPS_LINE", "FPS counter", &[("1", "On"), ("0", "Off")],
+        &["The FPS counter in the top-left corner."]).live(),
+    Item::new(OVERLAY, "VICTORY_PANEL", "Performance overlay (F3)", &[("0", "Off"), ("1", "On")],
+        &["Frame time, CPU and GPU timings and draw calls, for troubleshooting."]).live(),
+    Item::new(INPUT, "VICTORY_MOUSE_CAPTURE", "Lock cursor to window", UNSET_ON,
+        &["Confines the mouse cursor to the game window."]),
+    Item::new(INPUT, "VICTORY_IME_ENGLISH", "Force English keyboard layout", UNSET_ON,
+        &["Types with the English layout whatever the Windows input language is."]),
+    Item::new(ADVANCED, "VICTORY_EARLY_DEPTH", "Early depth test (early-Z)", ON_UNSET,
+        &["Lets the GPU reject hidden pixels before shading them. Faster."]),
+    Item::new(ADVANCED, "VICTORY_WC_NO_BACK", "Skip large GPU readbacks", ON_UNSET,
+        &["Keeps large buffers on the GPU instead of copying them back to system memory. Faster."]),
+    Item::new(ADVANCED, "VICTORY_SOFT_VIEWS", "Soft views (no hitch at cuts)", &[("copies", "On"), ("", "Off")],
+        &["Avoids a short hitch when a cutscene changes scene."]),
+    Item::new(ADVANCED, "VICTORY_TEXTURE_NO_WAIT", "Async texture uploads", ON_UNSET,
+        &["The game carries on while a texture uploads; it may pop in a moment late."]),
+    Item::new(ADVANCED, "VICTORY_RELAY", "Command relay", STAGES,
+        &["How draw commands are handed to the GPU. 2 is fastest."]),
+    Item::new(ADVANCED, "VICTORY_CARD_STEPS", "GPU-side copies", STAGES,
+        &["Moves small memory copies from the CPU to the GPU. 2 is fastest."]),
+    // Help as before: it batches the clamps of indirect executions, not small draws (`draw::batches`).
+    Item::new(ADVANCED, "VICTORY_INDIRECT_BATCH", "Draw call batching", STAGES,
+        &["Sends small pieces of drawing together. 2 is fastest."]),
+    // Name and help as before: the smallest title buffer whose copy is in the card's memory
+    // (`shadow::card_limits`), not a comparison instead of the CPU.
     Item::new(ADVANCED, "VICTORY_CARD_BUFFERS_MIN_KB", "Compare on the card from", &[("64", "64 KB"), ("1024", "1024 KB")],
-        "Blocks this size or larger are compared on the card."),
+        &["Blocks this size or larger are compared on the card."]),
 ];
 /// The lines after the settings.
 const ACTIONS: [&str; 5] =
-    ["Save and restart", "Save for next time", "Prepare all shaders now (slow once, smoother after)", "Back to recommended settings", "Close"];
+    ["Apply and restart", "Save (applies at next launch)", "Precompile shaders (restarts the game)", "Reset to defaults", "Close"];
 
 /// The width of the labels' column: the longest label.
 const LABEL: usize = {
@@ -398,6 +415,9 @@ fn keys() -> &'static Mutex<Vec<u16>> {
                     // SAFETY: a plain query.
                     let down = ours && unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
                     if down && !was[i] {
+                        if vk == VK_F1 {
+                            crate::F1_PRESSES.fetch_add(1, Ordering::Relaxed);
+                        }
                         keys().lock().unwrap_or_else(|e| e.into_inner()).push(vk);
                     }
                     was[i] = down;
@@ -424,7 +444,7 @@ const fn size_of((columns, lines): (u32, u32), scale: u32) -> (u32, u32) {
 }
 
 /// The frame-rate line's box, in characters.
-const CORNER: (u32, u32) = (32, 1);
+const CORNER: (u32, u32) = (32, 2);
 
 /// `lines`: each line's characters as their dots ([`dots`]), in a box `columns` wide.
 fn lit(lines: &[Vec<[u8; 7]>], columns: u32, x: u32, y: u32) -> bool {
@@ -463,113 +483,11 @@ fn painted(lines: &[String], chars: (u32, u32), scale: u32, colours: [&[u8]; 2],
     out
 }
 
-/// A picture's way to the swap chain's buffer: upload buffers written in
-/// turn, and the card's buffer each is copied into, which the back buffer is
-/// copied from at every present.
-struct Buffers {
-    format: DXGI_FORMAT,
-    size: (u32, u32),
-    pitch: u32,
-    uploads: Vec<(ID3D12Resource, *mut u8)>,
-    card: ID3D12Resource,
-    turn: usize,
-    fresh: bool,
-    /// The card's buffer was copied into before (it is in the copy-source state;
-    /// at first it is in the common state, promoted by the first copy).
-    used: bool,
-}
-
-// SAFETY: free-threaded resources, and memory only written under the presenter's lock.
-unsafe impl Send for Buffers {}
-
-impl Buffers {
-    fn new(host: &Host, format: DXGI_FORMAT, (width, height): (u32, u32)) -> Option<Buffers> {
-        let pitch = (width * panel::pixel_bytes(format)?).next_multiple_of(256);
-        let bytes = u64::from(pitch) * u64::from(height);
-        let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
-        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: bytes,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        };
-        let mut card: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a buffer.
-        unsafe {
-            host.device
-                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
-                .ok()?;
-        }
-        Some(Buffers { format, size: (width, height), pitch, uploads, card: card?, turn: 0, fresh: false, used: false })
-    }
-
-    /// The next upload buffer, to be written whole; copied to the card's at the next copy.
-    fn next(&mut self) -> &mut [u8] {
-        self.turn = (self.turn + 1) % UPLOADS;
-        self.fresh = true;
-        let len = self.pitch as usize * self.size.1 as usize;
-        // SAFETY: a mapped upload buffer of this length, which the card read frames ago.
-        unsafe { std::slice::from_raw_parts_mut(self.uploads[self.turn].1, len) }
-    }
-
-    /// `lines` in dot letters in a box of `chars`.
-    fn write_dots(&mut self, lines: &[String], chars: (u32, u32), scale: u32) {
-        let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, chars, scale, colours, self.pitch as usize);
-        self.next().copy_from_slice(&picture);
-    }
-
-    /// The bytes they hold (on the card or for it).
-    fn bytes(&self) -> u64 {
-        u64::from(self.pitch) * u64::from(self.size.1) * (UPLOADS as u64 + 1)
-    }
-
-    /// Records the copy of their top left `part` onto `back` at `at` (the back
-    /// buffer in the copy-destination state), and before it that of a fresh picture to the card.
-    fn copy_out(&mut self, list: &HostList, back: &ID3D12Resource, part: (u32, u32), at: (u32, u32)) {
-        // Our own copies are not part of a recorded frame (the recorder is in diagnostics builds).
-        #[cfg(feature = "diagnostics")]
-        let _ours = crate::replay::record::unrecorded();
-        let list = &list.list;
-        // SAFETY: an open list and live resources; the part lies within both.
-        unsafe {
-            if std::mem::take(&mut self.fresh) {
-                if std::mem::replace(&mut self.used, true) {
-                    list.ResourceBarrier(&[transition(&self.card, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
-                }
-                list.CopyResource(&self.card, &self.uploads[self.turn].0);
-                list.ResourceBarrier(&[transition(&self.card, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-            }
-            let from = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&self.card),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: self.format,
-                            Width: self.size.0,
-                            Height: self.size.1,
-                            Depth: 1,
-                            RowPitch: self.pitch,
-                        },
-                    },
-                },
-            };
-            let to = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(back),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-            };
-            let part = D3D12_BOX { left: 0, top: 0, front: 0, right: part.0, bottom: part.1, back: 1 };
-            list.CopyTextureRegion(&to, at.0, at.1, 0, &from, Some(&part));
-        }
-    }
+/// `lines` in dot letters in a box of `chars`, into the next of `buffers`.
+fn write_dots(buffers: &mut Buffers, lines: &[String], chars: (u32, u32), scale: u32) {
+    let Some(colours) = colours(buffers.format) else { return };
+    let picture = painted(lines, chars, scale, colours, buffers.pitch as usize);
+    buffers.next().copy_from_slice(&picture);
 }
 
 /// Presents a menu's buffers are kept after it closes or is resized (the
@@ -622,6 +540,10 @@ pub(super) struct Menu {
     shown: Option<Shown>,
     /// The frame-rate line's buffers while it is shown (the menu closed), and the line they hold.
     corner: Option<(Buffers, String)>,
+    /// The corner's chip, when its art is there.
+    chip: chip::ChipView,
+    /// The corner's lines, and when they were looked at.
+    corner_lines: Option<(std::time::Instant, Vec<chip::Line>)>,
     /// Buffers let go, with the presents they are still kept for.
     leaving: Vec<(u32, Buffers)>,
     /// Drawn on the panel when its art is there (`VICTORY_MENU_PANEL`, unless 0).
@@ -651,6 +573,8 @@ impl Menu {
             changed: true,
             shown: None,
             corner: None,
+            chip: chip::ChipView::new(panel),
+            corner_lines: None,
             leaving: Vec::new(),
             panel,
             failed: false,
@@ -668,9 +592,9 @@ impl Menu {
         let value = &self.values[i];
         let shown = shown_value(item, value, i == self.at);
         let mark = match (*value != self.started[i], live(item)) {
-            (true, true) => " *NOW",
+            (true, true) => " *LIVE",
             (true, false) => " *",
-            (false, true) => " NOW",
+            (false, true) => " LIVE",
             (false, false) => "",
         };
         format!("{cursor} {:<width$} < {shown} >{mark}", item.label, width = LABEL)
@@ -679,7 +603,7 @@ impl Menu {
     /// The help of the line picked: a setting's, or an action's.
     fn help(&self) -> Vec<&'static str> {
         match ITEMS.get(self.at) {
-            Some(item) => vec![item.help],
+            Some(item) => item.help.to_vec(),
             None if self.at == ITEMS.len() + PRELOAD => ABOUT_PRELOAD.to_vec(),
             None => vec![ACTION_HELP[self.at - ITEMS.len()]],
         }
@@ -713,9 +637,9 @@ impl Menu {
                     };
                     let value = &self.values[pick];
                     let mark = match (*value != self.started[pick], live(item)) {
-                        (true, true) => "  * Now",
+                        (true, true) => "  * Live",
                         (true, false) => "  *",
-                        (false, true) => "  Now",
+                        (false, true) => "  Live",
                         (false, false) => "",
                     };
                     panel::Entry::Line { label: item.label, mark, value: shown_value(item, value, picked), picked }
@@ -980,24 +904,26 @@ impl Menu {
         }
     }
 
-    /// Records the copy of the box onto `back` (in the copy-destination state):
+    /// Records the box onto `back` (in the copy-destination state):
     /// the menu while it is open, else the frame-rate line, else nothing.
-    pub(super) fn draw(&mut self, host: &Host, list: &HostList, back: &ID3D12Resource, (width, height): (u32, u32), format: DXGI_FORMAT) {
+    pub(super) fn draw(&mut self, blend: &mut Blend, host: &Host, list: &HostList, back: &ID3D12Resource, (width, height): (u32, u32), format: DXGI_FORMAT) {
         self.leave();
+        self.chip.tick();
         if self.failed {
             return;
         }
         if !Self::open() {
             self.close();
-            self.corner(host, list, back, (width, height), format);
+            self.corner(blend, host, list, back, (width, height), format);
             return;
         }
         self.let_go_of_corner();
+        self.chip.release();
         let key = (format, width, height);
         if self.shown.as_ref().is_none_or(|s| s.key != key) {
             self.close();
             let art = if self.panel { Self::art() } else { None };
-            self.shown = self.show(host, key, art);
+            self.shown = self.show(blend, host, key, art);
             self.failed = self.shown.is_none();
             self.changed = true;
         }
@@ -1007,7 +933,7 @@ impl Menu {
         let Some(shown) = &mut self.shown else { return };
         let (w, h) = shown.look.size();
         let (w, h) = (w.min(width), h.min(height));
-        shown.buffers.copy_out(list, back, (w, h), ((width - w) / 2, (height - h) / 2));
+        shown.buffers.draw(blend, host, list, back, (w, h), ((width - w) / 2, (height - h) / 2));
     }
 
     /// The art, read and decoded ([`art::Art::read`]); `None` (said once) without it.
@@ -1027,14 +953,16 @@ impl Menu {
 
     /// The open menu for a swap chain of `format` in a window `width` by
     /// `height`: on the panel if `art` is given, else in dot letters.
-    fn show(&self, host: &Host, key: (DXGI_FORMAT, u32, u32), art: Option<art::Art>) -> Option<Shown> {
+    fn show(&self, blend: &mut Blend, host: &Host, key: (DXGI_FORMAT, u32, u32), art: Option<art::Art>) -> Option<Shown> {
         let (format, width, height) = key;
         let began = std::time::Instant::now();
+        let art = art.filter(|art| !art.alpha() || blend.ready(host, format));
+        let alpha = art.as_ref().is_some_and(art::Art::alpha);
         let look = match art {
             Some(art) => Look::Panel { scaled: Box::new(art.at(art::panel_size((width, height)))), canvas: Vec::new() },
             None => Look::Dots { scale: scale_for(height) },
         };
-        let buffers = Buffers::new(host, format, look.size())?;
+        let buffers = Buffers::overlay(host, format, look.size(), UPLOADS, alpha)?;
         let (w, h) = look.size();
         tracing::info!(
             panel = matches!(look, Look::Panel { .. }),
@@ -1058,11 +986,10 @@ impl Menu {
         let Some(shown) = &mut self.shown else { return };
         let began = std::time::Instant::now();
         match (&mut shown.look, lines, page) {
-            (Look::Dots { scale }, Some(lines), _) => shown.buffers.write_dots(&lines, (COLUMNS, LINES), *scale),
+            (Look::Dots { scale }, Some(lines), _) => write_dots(&mut shown.buffers, &lines, (COLUMNS, LINES), *scale),
             (Look::Panel { scaled, canvas }, _, Some(page)) => {
                 panel::compose(scaled, &page, canvas);
-                let (pitch, format) = (shown.buffers.pitch as usize, shown.buffers.format);
-                panel::write_out(canvas, scaled.size, format, shown.buffers.next(), pitch);
+                shown.buffers.write_canvas(canvas, scaled.size);
             }
             _ => {}
         }
@@ -1097,41 +1024,82 @@ impl Menu {
     /// The bytes held for the menu: on the processor's side, and buffers on
     /// the card or for it (those still leaving included).
     fn held(&self) -> (u64, u64) {
-        let cpu = self.shown.as_ref().map_or(0, |s| s.look.bytes());
+        let (chip_cpu, chip_card) = self.chip.held();
+        let cpu = self.shown.as_ref().map_or(0, |s| s.look.bytes()) + chip_cpu;
         let card = self.shown.iter().map(|s| s.buffers.bytes()).sum::<u64>()
+            + chip_card
             + self.corner.iter().map(|(b, _)| b.bytes()).sum::<u64>()
             + self.leaving.iter().map(|(_, b)| b.bytes()).sum::<u64>();
         (cpu, card)
     }
 
-    /// The menu closed: the frame-rate line in the top left corner, if it is
-    /// wanted and there is a rate, in buffers of its own size; else nothing.
-    fn corner(&mut self, host: &Host, list: &HostList, back: &ID3D12Resource, (width, height): (u32, u32), format: DXGI_FORMAT) {
-        let Some(line) = fps_line() else {
+    /// The menu closed: the frame-rate line and the shaders' status in the top
+    /// left corner, on the chip when its art is there, else in dot letters in
+    /// buffers of their own size; nothing (and nothing held) when neither is wanted.
+    fn corner(&mut self, blend: &mut Blend, host: &Host, list: &HostList, back: &ID3D12Resource, (width, height): (u32, u32), format: DXGI_FORMAT) {
+        let lines = self.corner_lines();
+        if lines.is_empty() {
             self.let_go_of_corner();
+            self.chip.release();
             return;
-        };
+        }
+        if self.chip.ready(height) && self.chip.prepare(blend, host, (width, height), format, &lines) {
+            self.let_go_of_corner();
+            self.chip.draw(blend, host, list, back, (width, height));
+            return;
+        }
+        let texts: Vec<String> = lines.into_iter().map(|(l, _)| l).collect();
         let scale = scale_for(height);
         let size = size_of(CORNER, scale);
         if self.corner.as_ref().is_none_or(|(b, _)| (b.format, b.size) != (format, size)) {
             self.let_go_of_corner();
-            let Some(buffers) = Buffers::new(host, format, size) else {
+            let Some(buffers) = Buffers::new(host, format, size, UPLOADS) else {
                 self.failed = true;
                 return;
             };
             self.corner = Some((buffers, String::new()));
         }
         let Some((buffers, painted)) = &mut self.corner else { return };
-        if *painted != line {
-            buffers.write_dots(std::slice::from_ref(&line), CORNER, scale);
-            *painted = line;
+        let joined = texts.join("\n");
+        if *painted != joined {
+            write_dots(buffers, &texts, CORNER, scale);
+            *painted = joined;
         }
-        let w = (painted.chars().count().min(CORNER.0 as usize) as u32 * CELL.0 + 2 * RIM) * scale;
-        let (w, h) = (w.min(width).min(size.0), size.1.min(height));
+        let longest = texts.iter().map(|t| t.chars().count()).max().unwrap_or(0).min(CORNER.0 as usize) as u32;
+        let w = (longest * CELL.0 + 2 * RIM) * scale;
+        let h = (texts.len() as u32 * CELL.1 + 2 * RIM) * scale;
+        let (w, h) = (w.min(width).min(size.0), h.min(height).min(size.1));
         buffers.copy_out(list, back, (w, h), (0, 0));
+    }
+
+    /// The corner's lines now, looked at again at most every [`CORNER_EVERY`]
+    /// (the counter changes about once a second; the status's count may change
+    /// every frame, and the chip is made again only when its lines change).
+    fn corner_lines(&mut self) -> Vec<chip::Line> {
+        let now = std::time::Instant::now();
+        if let Some((at, lines)) = &self.corner_lines
+            && now.duration_since(*at) < CORNER_EVERY
+        {
+            return lines.clone();
+        }
+        let lines = corner_lines_from(fps_line(), status::now(), super::panel::shown().load(Ordering::Relaxed));
+        self.corner_lines = Some((now, lines.clone()));
+        lines
     }
 }
 
+/// How often the corner's lines are looked at.
+const CORNER_EVERY: Duration = Duration::from_millis(250);
+
+/// The corner's lines: the frame rate if it is shown, and the shaders'
+/// status unless the details panel (F3), which says it itself, is up.
+fn corner_lines_from(fps: Option<String>, status: status::Status, details_shown: bool) -> Vec<chip::Line> {
+    let mut lines: Vec<chip::Line> = fps.into_iter().map(|l| (l, art::LABEL)).collect();
+    if !details_shown && let Some(words) = status.words() {
+        lines.push((words, status.colour()));
+    }
+    lines
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1184,8 +1152,7 @@ mod tests {
     #[test]
     fn the_link_is_always_right_under_the_note() {
         // The words of the note, the help lines, the actions, the keys and the last line are the
-        // plain-English wording asked for on 2026-11-28, with the first lead's seven calls on it
-        // (jobs/2026-11-28-f1-menu-plain/menu-names.md).
+        // wording for PC gamers, each technical statement checked against the code.
         let mut menu = menu_with(ITEMS.iter().map(|_| String::new()).collect());
         for note in ["", "SAVED"] {
             menu.note = note.to_owned();
@@ -1202,22 +1169,51 @@ mod tests {
                 if at == ITEMS.len() + PRELOAD {
                     assert_eq!(about, ABOUT_PRELOAD);
                 } else if let Some(item) = ITEMS.get(at) {
-                    assert_eq!(about, [item.help, "", ""]);
+                    let mut help = item.help.to_vec();
+                    help.resize(3, "");
+                    assert_eq!(about, &help[..]);
                 } else {
                     assert_eq!(about, [ACTION_HELP[at - ITEMS.len()], "", ""]);
                 }
             }
         }
-        assert_eq!(ACTIONS[PRELOAD], "Prepare all shaders now (slow once, smoother after)");
+        assert_eq!(ACTIONS[PRELOAD], "Precompile shaders (restarts the game)");
         assert_eq!(REPO, "VIctory-ALFRED, built on VIctory-NVIDIA and foxhound");
         assert!(CONFIRM_PRELOAD.len() <= COLUMNS as usize);
-        assert_eq!(CONFIRM_PRELOAD, "Press Enter again to save, close the game and prepare the shaders.");
+        assert_eq!(CONFIRM_PRELOAD, "Press Enter again to save, close the game and precompile the shaders.");
         assert!(KEYS.ends_with("F1 or Esc: close"));
-        assert_eq!(ABOUT_PRELOAD[0], "Prepares every shader in one go, then starts the game again.");
-        assert_eq!(SAVED, "Saved. Takes effect the next time you start the game.");
-        assert!(ITEMS[item("VICTORY_MFG_UNLOCKER")].help.starts_with("Someone else's add-on, used at the next start only if its file was put in place."));
-        assert!(ITEMS.iter().all(|i| !i.help.ends_with("Now.")));
+        assert_eq!(ABOUT_PRELOAD[0], "Compiles every shader up front, then starts the game again.");
+        assert_eq!(SAVED, "Saved. Applies at the next launch.");
+        // This build has no DLSS or frame generation: their rows say so.
+        for var in ["VICTORY_MENU_DLSS", "VICTORY_DLSS_PRESET", "VICTORY_MENU_FRAMEGEN", "VICTORY_MENU_FG_TYPE", "VICTORY_MFG_UNLOCKER"] {
+            assert!(ITEMS[item(var)].label.ends_with("(not in this build)"), "{var}");
+        }
+        assert_eq!(ITEMS[item("VICTORY_MENU_RES")].label, "Resolution");
+        assert!(ITEMS[item("VICTORY_MFG_UNLOCKER")].help[0].starts_with("A third-party mod"));
+        // This build downloads nothing: the mod is used only where its file was put.
+        assert!(ITEMS[item("VICTORY_MFG_UNLOCKER")].help.iter().all(|l| !l.contains("ownload")));
+        assert!(ITEMS.iter().all(|i| (1..=3).contains(&i.help.len())));
         assert_eq!(ITEMS.iter().filter(|i| i.var == "VICTORY_MFG_UNLOCKER").count(), 1);
+    }
+
+    #[test]
+    fn the_corner_shows_the_counter_and_the_status_and_nothing_when_both_are_off() {
+        use status::Status;
+        let at = std::time::Instant::now();
+        // Off and nothing waiting: no lines, so nothing is made or held (`Menu::corner`).
+        assert!(corner_lines_from(None, Status::Hidden, false).is_empty());
+        let fps = || Some("FPS: 60.0".to_owned());
+        assert_eq!(corner_lines_from(fps(), Status::Hidden, false), [("FPS: 60.0".to_owned(), art::LABEL)]);
+        // The status under the counter, in its colour; alone when the counter is off.
+        let both = corner_lines_from(fps(), Status::Preparing(12), false);
+        assert_eq!(both[1], ("PREPARING SHADERS (12 left)".to_owned(), art::HEADING));
+        assert_eq!(corner_lines_from(None, Status::Ready(at), false), [("SHADERS READY".to_owned(), art::VALUE)]);
+        // With the details panel (F3) up, it says the status itself.
+        assert_eq!(corner_lines_from(fps(), Status::Preparing(12), true).len(), 1);
+        // Both fit the dot letters' corner box.
+        assert!(both.iter().all(|(l, _)| l.chars().count() <= CORNER.0 as usize));
+        let menu = play_defaults();
+        assert_eq!(menu.held(), (0, 0));
     }
 
     #[test]
@@ -1237,22 +1233,22 @@ mod tests {
         let mut menu = play_defaults();
         // Unchanged: the note says what `*` means; a row that applies while playing says so.
         menu.at = item("VICTORY_FPS_LINE");
-        assert!(menu.lines().iter().any(|l| l.starts_with("> Show frame rate") && l.ends_with(" NOW")));
+        assert!(menu.lines().iter().any(|l| l.starts_with("> FPS counter") && l.ends_with(" LIVE")));
         // Set here, not by `change`: that would change this process's environment at once.
         menu.values[menu.at] = "0".to_owned();
         let lines = menu.lines();
-        assert!(lines.iter().any(|l| l.starts_with("> Show frame rate") && l.ends_with(" *NOW")), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("> FPS counter") && l.ends_with(" *LIVE")), "{lines:#?}");
         assert_eq!(lines[lines.len() - 2], CHANGED_NOW);
         menu.at = item("VICTORY_MENU_DLSS");
         menu.change(menu.at, 1);
         let lines = menu.lines();
-        assert!(lines.iter().any(|l| l.starts_with("> Sharper picture (DLSS)") && l.ends_with("< Balanced > *")), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("> DLSS upscaling") && l.ends_with("< Balanced > *")), "{lines:#?}");
         assert_eq!(lines[lines.len() - 2], CHANGED_LATER);
         // The first value is what the launcher starts with: recommended, on the row picked only.
         menu.change(menu.at, -1);
         let lines = menu.lines();
-        assert!(lines.iter().any(|l| l.starts_with("> Sharper") && l.ends_with("< Quality (recommended) >")), "{lines:#?}");
-        assert!(lines.iter().any(|l| l.starts_with("  Picture size") && l.ends_with("< 2560 x 1440 (not in this build) >")), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("> DLSS upscaling") && l.ends_with("< Quality (recommended) >")), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("  Resolution") && l.ends_with("< 2560 x 1440 (not in this build) >")), "{lines:#?}");
         // Not set: the default.
         assert_eq!(shown_value(&ITEMS[item("VICTORY_MENU_FPS")], "", true), "Default");
     }
@@ -1281,8 +1277,11 @@ mod tests {
         let mut menu = menu_with(ITEMS.iter().map(|_| String::new()).collect());
         for (i, item) in ITEMS.iter().enumerate() {
             assert!(item.label.is_ascii() && item.label.len() <= LABEL, "{}", item.label);
-            assert!(!item.help.is_empty() && item.help.chars().count() <= COLUMNS as usize, "{}", item.help);
-            widest = widest.max(item.help.chars().count());
+            assert!((1..=3).contains(&item.help.len()), "{}", item.label);
+            for line in item.help {
+                assert!(!line.is_empty() && line.chars().count() <= COLUMNS as usize, "{line}");
+                widest = widest.max(line.chars().count());
+            }
             // Picked: the longest, with the recommended mark.
             menu.at = i;
             for (value, _) in item.values {
@@ -1309,7 +1308,7 @@ mod tests {
     fn rows_are_in_groups_and_the_cursor_never_rests_on_a_heading() {
         // Each group's rows together, under one heading.
         let headings: Vec<&str> = rows().iter().filter_map(|r| if let Row::Heading(g) = r { Some(*g) } else { None }).collect();
-        assert_eq!(headings, [PICTURE, SMOOTHNESS, LIGHT, ON_SCREEN, MOUSE, ADVANCED]);
+        assert_eq!(headings, [GRAPHICS, FRAME_RATE, LIGHT, OVERLAY, INPUT, ADVANCED]);
         let total = ITEMS.len() + ACTIONS.len();
         for step in [1, -1] {
             let mut menu = play_defaults();
@@ -1432,7 +1431,7 @@ mod tests {
             let arrow = scaled.row.width("\u{2039}");
             let w = scaled.size.0 as f32;
             for item in ITEMS {
-                let marks = if item.live { ["", "  * Now"] } else { ["", "  *"] };
+                let marks = if item.live { ["", "  * Live"] } else { ["", "  *"] };
                 for (value, _) in item.values {
                     for picked in [false, true] {
                         let shown = shown_value(item, value, picked);
@@ -1519,7 +1518,7 @@ mod tests {
         let mut menu = Menu { changed: false, ..Menu::with(ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), false) };
         assert!(!menu.panel);
         for (format, height) in [(DXGI_FORMAT_B8G8R8A8_UNORM, 720), (DXGI_FORMAT_R16G16B16A16_FLOAT, 2160)] {
-            menu.shown = menu.show(host, (format, height * 16 / 9, height), None);
+            menu.shown = menu.show(&mut Blend::default(), host, (format, height * 16 / 9, height), None);
             assert!(matches!(menu.shown.as_ref().map(|s| &s.look), Some(Look::Dots { .. })));
             menu.paint();
             let lines = menu.lines();
@@ -1542,7 +1541,7 @@ mod tests {
         };
         let mut menu = Menu { changed: false, ..Menu::with(ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), true) };
         assert_eq!(menu.held(), (0, 0));
-        menu.shown = menu.show(host, (DXGI_FORMAT_R10G10B10A2_UNORM, 3840, 2160), Some(art::tests::made()));
+        menu.shown = menu.show(&mut Blend::default(), host, (DXGI_FORMAT_R10G10B10A2_UNORM, 3840, 2160), Some(art::tests::made()));
         menu.paint();
         let (cpu, card) = menu.held();
         // The art at 1600 x 1200 and the picture drawn on it, and five buffers of the picture.
@@ -1593,7 +1592,7 @@ mod tests {
             let (w, h) = scaled.size;
             println!("{window:?}: panel {w} x {h}, scaled in {scale_ms:.1} ms, holding {} bytes with the picture", scaled.bytes() + canvas.len());
             for format in [DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT] {
-                let pitch = (w * panel::pixel_bytes(format).unwrap_or(4)).next_multiple_of(256) as usize;
+                let pitch = (w * picture::pixel_bytes(format).unwrap_or(4)).next_multiple_of(256) as usize;
                 let mut out = vec![0u8; pitch * h as usize];
                 let runs = 30;
                 let (mut compose_ms, mut write_ms) = (Vec::new(), Vec::new());
@@ -1604,7 +1603,7 @@ mod tests {
                     panel::compose(&scaled, &page, &mut canvas);
                     compose_ms.push(ms(t));
                     let t = Instant::now();
-                    panel::write_out(&canvas, scaled.size, format, &mut out, pitch);
+                    picture::write_out(&canvas, scaled.size, format, &mut out, pitch);
                     write_ms.push(ms(t));
                 }
                 let mid = |v: &mut Vec<f64>| {

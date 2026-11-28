@@ -11,7 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::qoi;
+use crate::host::picture::{boxed, rgba};
+use crate::host::qoi;
 
 /// One size of lettering: a grid of cells in a coverage image, each character
 /// at its origin (`origin_x` from the cell's left, standing on `baseline`
@@ -103,6 +104,10 @@ pub(super) struct Art {
 }
 
 impl Art {
+    pub(super) fn alpha(&self) -> bool {
+        self.panel.channels == 4
+    }
+
     /// The three images in `dir`, checked against the layout above.
     pub(super) fn read(dir: &Path) -> Result<Art, String> {
         let image = |name: &str| {
@@ -132,11 +137,11 @@ impl Art {
         let k = size.1 as f32 / PANEL.1 as f32;
         let (w, h) = (size.0 as usize, size.1 as usize);
         let step = (PANEL.0 as f32 / size.0 as f32, PANEL.1 as f32 / size.1 as f32);
-        let rgb = boxed(&self.panel.pixels, (PANEL.0 as usize, PANEL.1 as usize), self.panel.channels, (w, h), step);
-        let mut panel = Vec::with_capacity(w * h * 4);
-        for p in rgb.chunks_exact(self.panel.channels) {
-            panel.extend_from_slice(&[p[0], p[1], p[2], 0xFF]);
-        }
+        let panel = if size == PANEL && self.alpha() {
+            self.panel.pixels.clone()
+        } else {
+            rgba(boxed(&self.panel.pixels, (PANEL.0 as usize, PANEL.1 as usize), self.panel.channels, (w, h), step), self.panel.channels)
+        };
         Scaled { size, panel, row: Lettering::new(&self.row, &ROW_FONT, k), small: Lettering::new(&self.small, &SMALL_FONT, k) }
     }
 }
@@ -162,7 +167,7 @@ pub(super) struct Lettering {
 }
 
 impl Lettering {
-    fn new(image: &qoi::Image, spec: &FontSpec, k: f32) -> Lettering {
+    pub(super) fn new(image: &qoi::Image, spec: &FontSpec, k: f32) -> Lettering {
         let (cw, ch) = (spec.cell.0 as usize, spec.cell.1 as usize);
         let cell = (((cw as f32) * k).ceil() as usize, ((ch as f32) * k).ceil() as usize);
         let stride = image.width as usize * image.channels;
@@ -216,12 +221,12 @@ impl Lettering {
         &self.cover[i * n..(i + 1) * n]
     }
 
-    fn bytes(&self) -> usize {
+    pub(super) fn bytes(&self) -> usize {
         self.cover.len()
     }
 }
 
-/// The art at one size: the panel (four bytes a pixel, red first, the fourth 255) and the lettering.
+/// The art at one size: a straight-alpha RGBA panel and the lettering.
 pub(super) struct Scaled {
     pub(super) size: (u32, u32),
     pub(super) panel: Vec<u8>,
@@ -234,58 +239,6 @@ impl Scaled {
     pub(super) fn bytes(&self) -> usize {
         self.panel.len() + self.row.bytes() + self.small.bytes()
     }
-}
-
-/// A box filter: `src` (`sw` by `sh`, `n` bytes a pixel) to `dw` by `dh`,
-/// each pixel the mean of the area of the source it covers, `step` source
-/// pixels to one on each axis (the area past the source's edge counts as
-/// nothing, and is not counted).
-fn boxed(src: &[u8], (sw, sh): (usize, usize), n: usize, (dw, dh): (usize, usize), step: (f32, f32)) -> Vec<u8> {
-    // For each pixel on an axis: the first source pixel it covers, and how much of each.
-    let spans = |d: usize, s: usize, step: f32| -> Vec<(usize, Vec<f32>)> {
-        (0..d)
-            .map(|i| {
-                let (lo, hi) = (i as f32 * step, ((i + 1) as f32 * step).min(s as f32));
-                if hi <= lo {
-                    return (0, Vec::new());
-                }
-                let first = lo.floor() as usize;
-                let weights: Vec<f32> =
-                    (first..(hi.ceil() as usize).min(s)).map(|j| (hi.min(j as f32 + 1.0) - lo.max(j as f32)).max(0.0)).collect();
-                let total: f32 = weights.iter().sum();
-                (first, weights.into_iter().map(|w| w / total).collect())
-            })
-            .collect()
-    };
-    let (across, down) = (spans(dw, sw, step.0), spans(dh, sh, step.1));
-    let mut wide = vec![0f32; sh * dw * n];
-    for y in 0..sh {
-        let row = &src[y * sw * n..(y + 1) * sw * n];
-        let out = &mut wide[y * dw * n..(y + 1) * dw * n];
-        for (x, (first, weights)) in across.iter().enumerate() {
-            for (j, w) in weights.iter().enumerate() {
-                let at = (first + j) * n;
-                for c in 0..n {
-                    out[x * n + c] += f32::from(row[at + c]) * w;
-                }
-            }
-        }
-    }
-    let mut out = vec![0u8; dh * dw * n];
-    let mut sum = vec![0f32; dw * n];
-    for (y, (first, weights)) in down.iter().enumerate() {
-        sum.iter_mut().for_each(|s| *s = 0.0);
-        for (j, w) in weights.iter().enumerate() {
-            let row = &wide[(first + j) * dw * n..(first + j + 1) * dw * n];
-            for (s, v) in sum.iter_mut().zip(row) {
-                *s += v * w;
-            }
-        }
-        for (o, s) in out[y * dw * n..(y + 1) * dw * n].iter_mut().zip(&sum) {
-            *o = (s + 0.5).min(255.0) as u8;
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -316,15 +269,61 @@ pub(super) mod tests {
             .expect("art of the layout's sizes")
     }
 
+    /// The small lettering of [`made`], for the chip's tests.
+    pub(in super::super) fn made_small() -> qoi::Image {
+        made().small
+    }
+
+    pub(in super::super) fn rounded(image: qoi::Image) -> qoi::Image {
+        let (width, height) = (image.width, image.height);
+        let pixels = image.pixels.chunks_exact(3).enumerate().flat_map(|(i, p)| {
+            let (x, y) = (i as u32 % width, i as u32 / width);
+            let distance = x.min(width - 1 - x) + y.min(height - 1 - y);
+            let alpha = match distance { 0..=7 => 0, 8..=10 => 128, _ => 255 };
+            [p[0], p[1], p[2], alpha]
+        }).collect();
+        qoi::Image { width, height, channels: 4, pixels }
+    }
+
+    pub(in super::super) fn write_image(dir: &Path, name: &str, image: &qoi::Image) {
+        std::fs::write(dir.join(name), qoi::tests::encode(image.width, image.height, image.channels, &image.pixels)).unwrap();
+    }
+
+    pub(in super::super) fn assert_corners_and_centre(canvas: &[u8], (w, h): (u32, u32), corner: u8) {
+        let alpha = |x, y| canvas[((y * w + x) * 4 + 3) as usize];
+        for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+            assert_eq!(alpha(x, y), corner, "{x}, {y} in {w} x {h}");
+        }
+        assert_eq!(alpha(w / 2, h / 2), 255);
+    }
+
     #[test]
-    fn the_box_filter_keeps_a_flat_colour_and_averages_an_edge() {
-        let flat = vec![77u8; 10 * 6 * 3];
-        assert!(boxed(&flat, (10, 6), 3, (4, 3), (2.5, 2.0)).iter().all(|v| *v == 77));
-        // Black then white halves, halved: a grey column where they meet, at 1.5 pixels a pixel.
-        let edge = [0u8, 0, 0, 255, 255, 255];
-        assert_eq!(boxed(&edge, (6, 1), 1, (4, 1), (1.5, 1.0)), [0, 0, 255, 255]);
-        let mid: Vec<u8> = [0, 0, 0, 0, 255, 255, 255, 255].to_vec();
-        assert_eq!(boxed(&mid, (8, 1), 1, (3, 1), (8.0 / 3.0, 1.0)), [0, 128, 255]);
+    fn rgb_and_rgba_files_keep_the_panel_interior_and_compose_their_coverage() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dir = dir.path();
+        let art = made();
+        write_image(dir, ROW_FONT.image, &art.row);
+        write_image(dir, SMALL_FONT.image, &art.small);
+        write_image(dir, PANEL_IMAGE, &art.panel);
+        let rgb = Art::read(dir).unwrap();
+        assert!(!rgb.alpha());
+        write_image(dir, PANEL_IMAGE, &rounded(art.panel));
+        let rgba = Art::read(dir).unwrap();
+        assert!(rgba.alpha());
+
+        let values = super::super::ITEMS.iter().map(|item| item.values[0].0.to_owned()).collect();
+        let page = super::super::Menu::with(values, true).page();
+        for out in [(1280, 720), (3840, 2160)] {
+            let size = panel_size(out);
+            let mut old = Vec::new();
+            let mut rounded = Vec::new();
+            super::super::panel::compose(&rgb.at(size), &page, &mut old);
+            super::super::panel::compose(&rgba.at(size), &page, &mut rounded);
+            assert_corners_and_centre(&old, size, 255);
+            assert_corners_and_centre(&rounded, size, 0);
+            assert!(old.chunks_exact(4).zip(rounded.chunks_exact(4)).all(|(a, b)| b[3] != 255 || a == b));
+            assert!(rounded.chunks_exact(4).any(|p| (1..255).contains(&p[3])));
+        }
     }
 
     #[test]

@@ -496,6 +496,40 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     }
 }
 
+/// Runs `f` (the translation of the program whose run-log hash is `hash`, the first 16 hex
+/// digits of its container's BLAKE3) with the strict forms and the wave-wide form when
+/// `VICTORY_STRICT_HALVES` lists a prefix of that hash (`=<hash>[,<hash>...]`; `=1` is every
+/// program, through [`lower::strict_halves`]). A diagnostic, off by default: it lets one program
+/// take the exact forms while every other keeps today's lowering (made for the body programs).
+/// The shader cache keys on the switch's value.
+pub fn with_program_strict<R>(hash: &str, f: impl FnOnce() -> R) -> R {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| strict_list(&std::env::var("VICTORY_STRICT_HALVES").unwrap_or_default()));
+    if !list.iter().any(|p| hash.starts_with(p.as_str())) {
+        return f();
+    }
+    let was = lower::PROGRAM_STRICT.replace(true);
+    let r = f();
+    lower::PROGRAM_STRICT.set(was);
+    r
+}
+
+/// The hash prefixes a `VICTORY_STRICT_HALVES` value names (`1` and anything not hex: none).
+fn strict_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|h| h.trim().to_lowercase())
+        .filter(|h| h.len() >= 4 && h != "1" && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn the_strict_list_names_programs_by_hash_prefix() {
+    assert_eq!(strict_list("9f017d9011377efa, 87BF9E3F"), ["9f017d9011377efa", "87bf9e3f"]);
+    assert!(strict_list("1").is_empty() && strict_list("").is_empty() && strict_list("on,xyz1,12").is_empty());
+}
+
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
@@ -525,7 +559,38 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 /// Emits a program whose earlier stages already ran.
+///
+/// A program refused because a lane mask holding lanes elsewhere is read as data is emitted
+/// once more with such masks made from their writing instruction's operands where one host
+/// wave is the console wave (`lower::mask_numbers`), and only such a program: every program
+/// emitted without it stays as it was.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    let original = emit_forms(c, native, p, st, io, res);
+    if !matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE) {
+        return original;
+    }
+    let again = lower::mask_numbers::with_mask_numbers(|| emit_forms(c, native, p, st, io, res));
+    // (`VICTORY_WAVE_WHY`: one line per program the retry was for, so a translate of every
+    // program counts the ones it changed)
+    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        match &again {
+            Ok(_) => eprintln!("MASK-NUMBERS retry: emitted"),
+            Err(e) => eprintln!("MASK-NUMBERS retry: {e}"),
+        }
+    }
+    // a program the retry does not take stays refused for what it was
+    if again.is_ok() { again } else { original }
+}
+
+/// [`emit`] in every form the program may take.
+fn emit_forms(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -670,7 +735,7 @@ pub fn emit(
             )
             || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
                 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1") || lower::PROGRAM_STRICT.get();
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -845,6 +910,9 @@ pub fn emit(
 /// programs listed in [`emit`] (`wide_on`), keeps its own default. A test chooses for its
 /// own thread. Part of the translation: the shader cache keys on `VICTORY_WAVE_WIDE`.
 fn last_resort_wide() -> bool {
+    if lower::PROGRAM_STRICT.get() {
+        return true;
+    }
     #[cfg(test)]
     if let Some(on) = TEST_LAST_RESORT_WIDE.get() {
         return on;

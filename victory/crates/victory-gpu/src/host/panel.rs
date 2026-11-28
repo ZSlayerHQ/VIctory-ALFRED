@@ -30,7 +30,7 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
-const LINES: u32 = 10;
+const LINES: u32 = 11;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -313,8 +313,12 @@ pub(super) struct Panel {
     cost: Duration,
     before: Counters,
     lines: Vec<String>,
+    /// The shaders' status when the lines were made (its line is the last).
+    status: super::menu::status::Status,
     changed: bool,
     buffers: Option<Buffers>,
+    /// On the counter's chip when its art is there (`VICTORY_MENU_PANEL`, unless 0).
+    chip: super::menu::chip::ChipView,
     failed: bool,
 }
 
@@ -329,8 +333,10 @@ impl Panel {
             cost: Duration::ZERO,
             before: Counters::default(),
             lines: Vec::new(),
+            status: super::menu::status::Status::Hidden,
             changed: false,
             buffers: None,
+            chip: super::menu::chip::ChipView::new(std::env::var_os("VICTORY_MENU_PANEL").is_none_or(|v| v != "0")),
             failed: false,
         }
     }
@@ -365,6 +371,9 @@ impl Panel {
         self.before = counters;
         let cost = self.cost.as_secs_f64() * 1e6 / frames;
         self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
+        // The shaders' status, last (`menu::status`).
+        self.status = super::menu::status::now();
+        self.lines.extend(self.status.words());
         self.changed = true;
         (self.since, self.frames, self.worst) = (now, 0, 0.0);
         self.cost = now.elapsed();
@@ -374,16 +383,43 @@ impl Panel {
     /// that size and format in the state to be copied into.
     pub(super) fn draw(
         &mut self,
+        blend: &mut super::picture::Blend,
         host: &Host,
         list: &HostList,
         back: &ID3D12Resource,
         (width, height): (u32, u32),
         format: DXGI_FORMAT,
     ) {
+        self.chip.tick();
         if !shown().load(Ordering::Relaxed) || self.lines.is_empty() || self.failed {
+            // Not shown: nothing of the chip's is held.
+            self.chip.release();
             return;
         }
         let began = Instant::now();
+        // On the chip when its art is there: the first line near white, the status in its colour.
+        if self.chip.ready(height) {
+            let n = self.lines.len();
+            let has_status = self.status.words().is_some();
+            let lines: Vec<super::menu::chip::Line> = self
+                .lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let colour = match i {
+                        0 => super::menu::chip::TEXT,
+                        _ if has_status && i == n - 1 => self.status.colour(),
+                        _ => super::menu::chip::SOFT,
+                    };
+                    (l.clone(), colour)
+                })
+                .collect();
+            if self.chip.prepare(blend, host, (width, height), format, &lines) {
+                self.chip.draw(blend, host, list, back, (width, height));
+                self.cost += began.elapsed();
+                return;
+            }
+        }
         // Not the title's: the frame recorder leaves it out.
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();

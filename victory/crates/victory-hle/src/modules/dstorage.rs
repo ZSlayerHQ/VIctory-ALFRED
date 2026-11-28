@@ -1418,7 +1418,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         source
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
+        Some(tables) => unpack_bcpack(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
         None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
@@ -1477,6 +1477,107 @@ fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
             }
         }
     })
+}
+
+/// Whether BCPack data is unpacked as it was first (`VICTORY_BCPACK_SERIAL=1`;
+/// off by default): one lane step and one block after another on the
+/// worker, at the worker's priority. Kept to compare runs with
+/// [`unpack_bcpack`]'s way, which writes the same bytes.
+fn bcpack_serial() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| bcpack_serial_asked(std::env::var_os("VICTORY_BCPACK_SERIAL").as_deref()))
+}
+
+/// Whether `VICTORY_BCPACK_SERIAL`'s value asks for the serial path: `1` only.
+fn bcpack_serial_asked(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+/// Unpacks a request's BCPack data. BCPack is what textures arrive in, and
+/// unpacking ran at 15-20 MB/s of BC7 a worker, all of the console's work
+/// on the processor; a camera cut has many workers at it at once, beside
+/// the title's threads (all at normal priority). Now with
+/// [`bcpack::unpack`]: a round's lanes at once (AVX-512, about 8x), the
+/// blocks packed by [`bcpack_helpers`] too, and the worker below normal
+/// priority while it unpacks, so that the title's threads come first.
+fn unpack_bcpack(bc: u8, source: &[u8], out: &mut [u8], tables: &Tables) -> Result<(), bcpack::Error> {
+    unpack_bcpack_as(bcpack_serial(), bc, source, out, tables)
+}
+
+/// [`unpack_bcpack`]; `serial`: as before the fast path, `bcpack::decode` on
+/// the calling thread at its own priority, with no helpers started.
+fn unpack_bcpack_as(
+    serial: bool,
+    bc: u8,
+    source: &[u8],
+    out: &mut [u8],
+    tables: &Tables,
+) -> Result<(), bcpack::Error> {
+    if serial {
+        return bcpack::decode(bc, source, out, tables);
+    }
+    let result = {
+        let _below = BelowNormal::now();
+        #[cfg(test)]
+        tests::note_bcpack_priority(true);
+        bcpack::unpack(bc, source, out, tables, bcpack_helpers())
+    };
+    #[cfg(test)]
+    tests::note_bcpack_priority(false);
+    result
+}
+
+/// The threads that help pack BCPack blocks: a quarter of the processors,
+/// at most 4, below normal priority. `None` if none started.
+fn bcpack_helpers() -> Option<&'static bcpack::Pool> {
+    static POOL: OnceLock<bcpack::Pool> = OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        let n = std::thread::available_parallelism().map_or(1, |n| n.get() / 4).clamp(1, 4);
+        let pool = bcpack::Pool::new(n, "dstorage bcpack", below_normal);
+        tracing::info!(helpers = pool.threads(), "dstorage: BCPack helpers");
+        pool
+    });
+    (pool.threads() > 0).then_some(pool)
+}
+
+/// Puts the calling thread below normal priority.
+fn below_normal() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+    // SAFETY: a plain call on the calling thread's pseudo handle.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+}
+
+/// The calling thread below normal priority until this is dropped, then
+/// back at the priority it had; left as it is when that priority could not
+/// be read (there would be nothing to go back to).
+struct BelowNormal(Option<i32>);
+
+impl BelowNormal {
+    fn now() -> BelowNormal {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+        // SAFETY: a plain query of the calling thread.
+        BelowNormal::after(unsafe { GetThreadPriority(GetCurrentThread()) })
+    }
+
+    /// Lowers the calling thread, whose priority the query gave as `before`
+    /// (`THREAD_PRIORITY_ERROR_RETURN`, `i32::MAX`: it failed, not lowered).
+    fn after(before: i32) -> BelowNormal {
+        if before == i32::MAX {
+            return BelowNormal(None);
+        }
+        below_normal();
+        BelowNormal(Some(before))
+    }
+}
+
+impl Drop for BelowNormal {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+        if let Some(before) = self.0 {
+            // SAFETY: as in `below_normal`.
+            unsafe { SetThreadPriority(GetCurrentThread(), before) };
+        }
+    }
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
@@ -1890,6 +1991,32 @@ mod tests {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
     }
 
+    /// The threads that unpacked BCPack data: name, priority while
+    /// unpacking, priority after.
+    static BCPACK_PRIORITIES: Mutex<Vec<(String, i32, i32)>> = Mutex::new(Vec::new());
+
+    thread_local! {
+        static UNPACKING: std::cell::Cell<i32> = const { std::cell::Cell::new(i32::MIN) };
+    }
+
+    fn priority() -> i32 {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+        // SAFETY: a plain query of the calling thread.
+        unsafe { GetThreadPriority(GetCurrentThread()) }
+    }
+
+    /// `unpack_bcpack` on a worker: its priority while it unpacks (`during`)
+    /// and once it is done.
+    pub(super) fn note_bcpack_priority(during: bool) {
+        if during {
+            UNPACKING.with(|p| p.set(priority()));
+            return;
+        }
+        let name = std::thread::current().name().unwrap_or("").to_string();
+        let during = UNPACKING.with(|p| p.get());
+        BCPACK_PRIORITIES.lock().unwrap().push((name, during, priority()));
+    }
+
     #[test]
     fn request_layout_is_the_titles() {
         assert_eq!(size_of::<Request>(), 0x48);
@@ -2112,7 +2239,17 @@ mod tests {
             unsafe { VirtualProtect((at + 4096) as *const _, 4096, to, &mut old) }
         };
         assert_ne!(protect(PAGE_READONLY), 0);
+        // The read is tried again for about 0.25 s in all ([`READ_RETRIES`]);
+        // the guard is lifted after 20 ms. In a loaded run of every test, a
+        // thread of normal priority could wait longer than that for a core and
+        // fail the read (it did, once in the menu merge's gate), so the opener
+        // runs at time-critical priority and is not kept waiting.
         let opener = std::thread::spawn(move || {
+            use windows_sys::Win32::System::Threading::{
+                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+            };
+            // SAFETY: this thread's own pseudo-handle.
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
             std::thread::sleep(Duration::from_millis(20));
             protect(PAGE_READWRITE)
         });
@@ -2379,6 +2516,105 @@ mod tests {
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, bc4_blocks());
+    }
+
+    /// The worker's guard lowers a thread only when its priority could be
+    /// read, and gives that priority back: after a failed query
+    /// (`THREAD_PRIORITY_ERROR_RETURN`) there is nothing to go back to, and
+    /// the thread is left as it is (a review's finding).
+    #[test]
+    fn a_failed_priority_query_leaves_the_thread_alone() {
+        use windows_sys::Win32::System::Threading::{THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL};
+        std::thread::spawn(|| {
+            assert_eq!(priority(), THREAD_PRIORITY_NORMAL);
+            {
+                let _guard = BelowNormal::after(i32::MAX);
+                assert_eq!(priority(), THREAD_PRIORITY_NORMAL, "lowered with no priority to go back to");
+            }
+            assert_eq!(priority(), THREAD_PRIORITY_NORMAL);
+            {
+                let _below = BelowNormal::now();
+                assert_eq!(priority(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+            assert_eq!(priority(), THREAD_PRIORITY_NORMAL);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// A DirectStorage worker that unpacks a BCPack request runs below normal
+    /// priority while it does (the title's threads run at normal) and is back
+    /// at normal once it is done.
+    #[test]
+    fn a_worker_unpacks_below_normal_and_gets_its_priority_back() {
+        use windows_sys::Win32::System::Threading::{THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL};
+        with_test_tables();
+        let (_dir, file) = file_with(&BC4_STREAM);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut out = [0u8; 16];
+        enqueue(queue, &request(4 << 1, out.as_mut_ptr().cast(), 16, file, 0, 88));
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, bc4_blocks());
+        let seen = BCPACK_PRIORITIES.lock().unwrap().clone();
+        assert!(seen.iter().any(|(name, ..)| name.starts_with("dstorage ")), "a worker unpacked: {seen:?}");
+        for (name, during, after) in &seen {
+            assert!(name.starts_with("dstorage "), "unpacked on {name}");
+            assert_eq!((*during, *after), (THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL), "{name}");
+        }
+    }
+
+    /// `VICTORY_BCPACK_SERIAL=1` gives back the path from before the fast one:
+    /// `bcpack::decode`'s bytes, on the calling thread at its own priority
+    /// (nothing noted by the fast path's guard). Only `1` asks for it.
+    #[test]
+    fn bcpack_serial_is_the_path_from_before() {
+        use std::ffi::OsStr;
+        assert!(bcpack_serial_asked(Some(OsStr::new("1"))));
+        for other in [None, Some(OsStr::new("0")), Some(OsStr::new("")), Some(OsStr::new("yes"))] {
+            assert!(!bcpack_serial_asked(other), "{other:?}");
+        }
+        with_test_tables();
+        let tables = bcpack_tables().unwrap();
+        std::thread::Builder::new()
+            .name("bcpack serial test".into())
+            .spawn(move || {
+                let before = priority();
+                let mut want = [0u8; 16];
+                bcpack::decode(4, &BC4_STREAM, &mut want, tables).unwrap();
+                let mut got = [0u8; 16];
+                unpack_bcpack_as(true, 4, &BC4_STREAM, &mut got, tables).unwrap();
+                assert_eq!(got, want);
+                assert_eq!(got, bc4_blocks());
+                assert_eq!(priority(), before);
+                let seen = BCPACK_PRIORITIES.lock().unwrap();
+                assert!(!seen.iter().any(|(name, ..)| name == "bcpack serial test"), "{seen:?}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The helpers that pack BCPack blocks run below normal priority: work
+    /// handed to the runtime's pool is run by them (and by the thread that
+    /// hands it out), and every piece a helper ran saw below normal.
+    #[test]
+    fn the_bcpack_helpers_run_below_normal() {
+        use windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL;
+        let helpers = bcpack_helpers().expect("BCPack helpers");
+        assert!((1..=4).contains(&helpers.threads()));
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let pieces = seen.clone();
+        helpers.run(64, move |_| {
+            let name = std::thread::current().name().unwrap_or("").to_string();
+            pieces.lock().unwrap().push((name, priority()));
+            std::thread::sleep(Duration::from_millis(2));
+        });
+        let seen = seen.lock().unwrap();
+        let helped: Vec<_> = seen.iter().filter(|(name, _)| name.starts_with("dstorage bcpack")).collect();
+        assert!(!helped.is_empty(), "no helper ran a piece: {seen:?}");
+        assert!(helped.iter().all(|(_, p)| *p == THREAD_PRIORITY_BELOW_NORMAL), "{helped:?}");
     }
 
     #[test]
