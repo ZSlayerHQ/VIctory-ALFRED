@@ -19,6 +19,8 @@ export const LIVE_NAMES = Object.freeze([
   'VICTORY_FETCH_QUEUE',
   'VICTORY_LIVE_HUD',
   'VICTORY_TEXTURE_MADE',
+  'VICTORY_USER_COPY',
+  'VICTORY_USER_STORE',
 ]);
 
 const LIVE_NAME_SET = new Set(LIVE_NAMES);
@@ -46,6 +48,8 @@ export const LIVE_KINDS = Object.freeze({
   VICTORY_FETCH_QUEUE: 'onoff',
   VICTORY_LIVE_HUD: 'onoff',
   VICTORY_TEXTURE_MADE: 'onoff',
+  VICTORY_USER_COPY: 'onoff',
+  VICTORY_USER_STORE: 'onoff',
 });
 
 /// The switch the stats file and segment lines leave out while it is off (`live.rs`, `listed_in_lines`).

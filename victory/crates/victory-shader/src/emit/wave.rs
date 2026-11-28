@@ -95,177 +95,6 @@ fn buddies(a: u64, b: u64) -> bool {
     }
 }
 
-/// The order in which a sum of floats was added up, where every addition joined two sets of
-/// lanes that are each other's image under one lane bit (`l ^ (1 << d)`), both added in the
-/// same order: the bits `d` in the order they were joined (three bits each above a count in
-/// the low three), or [`Butterfly::UNKNOWN`]. Such a sum is the butterfly over those bits, which the
-/// paired form replays addition by addition ([`Section::butterflies`]). Two symbols that differ only
-/// in it are the same value to the rest of the simulation (equality ignores it), so following
-/// it changes nothing else the simulation finds.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Butterfly(pub(crate) u32);
-
-impl Butterfly {
-    /// One lane's term: nothing added yet.
-    pub(crate) const LEAF: Butterfly = Butterfly(0);
-    /// An order that is no butterfly, or not followed.
-    pub(crate) const UNKNOWN: Butterfly = Butterfly(u32::MAX);
-
-    /// The lane bits, in the order they were joined.
-    pub(crate) fn bits(self) -> Option<Vec<u32>> {
-        (self.0 != u32::MAX).then(|| (0..self.0 & 7).map(|j| self.0 >> (3 + 3 * j) & 7).collect())
-    }
-
-    /// `a` (lanes `la`) joined with `b` (lanes `lb`): the butterfly one bit further, or unknown.
-    fn join(a: Butterfly, la: u64, b: Butterfly, lb: u64) -> Butterfly {
-        let (Some(bits), true) = (a.bits(), a.0 == b.0) else {
-            return Butterfly::UNKNOWN;
-        };
-        let n = bits.len() as u32;
-        match (0..6u32).find(|&d| !bits.contains(&d) && image(la, d) == lb) {
-            Some(d) if n < 6 => Butterfly((a.0 & !7) | (n + 1) | d << (3 + 3 * n)),
-            _ => Butterfly::UNKNOWN,
-        }
-    }
-}
-
-impl PartialEq for Butterfly {
-    fn eq(&self, _: &Butterfly) -> bool {
-        true
-    }
-}
-
-impl Eq for Butterfly {}
-
-/// The lanes `l ^ (1 << d)` of the lanes in `set`.
-fn image(set: u64, d: u32) -> u64 {
-    const LOW: [u64; 6] = [
-        0x5555_5555_5555_5555,
-        0x3333_3333_3333_3333,
-        0x0F0F_0F0F_0F0F_0F0F,
-        0x00FF_00FF_00FF_00FF,
-        0x0000_FFFF_0000_FFFF,
-        0x0000_0000_FFFF_FFFF,
-    ];
-    let (low, k) = (LOW[d as usize], 1u32 << d);
-    ((set & low) << k) | ((set & !low) >> k)
-}
-
-/// One step of how a section adds up a sum ([`Order`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Step {
-    /// A lane's term (`mask ? src : ident`).
-    Lane(u8),
-    /// A constant (the 0 a DPP shift reads past the end of its row).
-    K(u32),
-    /// The sum of two earlier steps.
-    Add(u32, u32),
-}
-
-/// How a section adds up a sum of floats it leaves: which terms it adds to which, as the
-/// instructions do. Each addition rounds, so the same terms in another order give another
-/// sum (2^25, 1, -2^25 and 0 in four lanes: 0 added as neighbours, 1 with lanes two apart
-/// first). A lowering that adds the terms up itself follows this.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Order {
-    /// Each step after the steps it adds.
-    pub steps: Vec<Step>,
-    /// The step that is the value: one where every lane holds the same sum added up the
-    /// same way, else one per lane (a prefix; a sum each lane adds up in its own order).
-    pub results: Vec<u32>,
-}
-
-impl Order {
-    /// Whether this is one sum of all 64 lanes made as the compiler's expansion of a wave
-    /// sum makes it: lanes 2k and 2k+1, then those pairs side by side, and so on up to the
-    /// two halves ([`buddies`]), with nothing else added in.
-    pub(crate) fn neighbours_first(&self) -> bool {
-        let mut lanes: Vec<u64> = Vec::with_capacity(self.steps.len());
-        for step in &self.steps {
-            lanes.push(match *step {
-                Step::Lane(l) => 1 << l,
-                Step::Add(a, b) if buddies(lanes[a as usize], lanes[b as usize]) => {
-                    lanes[a as usize] | lanes[b as usize]
-                }
-                _ => return false,
-            });
-        }
-        self.results.len() == 1 && lanes[self.results[0] as usize] == u64::MAX
-    }
-}
-
-/// The step ([`Steps`]) a lane's sum is; `None`: not followed. Not part of what a lane's
-/// value is (two lanes hold the same sum whichever way each added it up), so every `Tree`
-/// is equal to every other.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Tree(Option<u32>);
-
-impl Tree {
-    pub(crate) const NONE: Tree = Tree(None);
-}
-
-impl PartialEq for Tree {
-    fn eq(&self, _: &Tree) -> bool {
-        true
-    }
-}
-
-impl Eq for Tree {}
-
-/// The steps of a section's sums, each kept once (an addition with its terms in either
-/// order: it is commutative).
-#[derive(Default)]
-struct Steps {
-    all: Vec<Step>,
-    index: HashMap<Step, u32>,
-}
-
-impl Steps {
-    fn of(&mut self, step: Step) -> Tree {
-        let n = *self.index.entry(step).or_insert_with(|| {
-            self.all.push(step);
-            self.all.len() as u32 - 1
-        });
-        Tree(Some(n))
-    }
-
-    fn add(&mut self, a: Tree, b: Tree) -> Tree {
-        match (a.0, b.0) {
-            (Some(a), Some(b)) => self.of(Step::Add(a.min(b), a.max(b))),
-            _ => Tree::NONE,
-        }
-    }
-
-    /// The steps `results` are made of, renumbered; `None` where one is not followed.
-    fn order(&self, results: &[Tree]) -> Option<Order> {
-        let results: Vec<u32> = results.iter().map(|t| t.0).collect::<Option<_>>()?;
-        let mut used = vec![false; self.all.len()];
-        let mut stack = results.clone();
-        while let Some(n) = stack.pop() {
-            if !std::mem::replace(&mut used[n as usize], true)
-                && let Step::Add(a, b) = self.all[n as usize]
-            {
-                stack.extend([a, b]);
-            }
-        }
-        // (a step is made after the steps it adds: their order is kept)
-        let mut place = vec![0u32; self.all.len()];
-        let mut steps = Vec::new();
-        for (n, step) in self.all.iter().enumerate().filter(|&(n, _)| used[n]) {
-            place[n] = steps.len() as u32;
-            steps.push(match *step {
-                Step::Add(a, b) => Step::Add(place[a as usize], place[b as usize]),
-                other => other,
-            });
-        }
-        let mut results: Vec<u32> = results.iter().map(|&n| place[n as usize]).collect();
-        if results.iter().all(|&r| r == results[0]) {
-            results.truncate(1);
-        }
-        Some(Order { steps, results })
-    }
-}
-
 /// A lane's value inside a section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sym {
@@ -275,28 +104,22 @@ pub(crate) enum Sym {
     Own(Value),
     /// A uniform value from before the section.
     Uni(Value),
-    /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane), a float sum added in
-    /// the order `tree` (and, where that order is a butterfly, over the bits `butterfly`).
+    /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane).
     Red {
         op: Option<Op>,
         src: Value,
         mask: Value,
         ident: u32,
         lanes: u64,
-        /// How the lane added it up.
-        tree: Tree,
-        /// The same order as lane bits, for the paired form.
-        butterfly: Butterfly,
     },
     /// Low (`!high`) or high (`high`) 32 bits of the 64-bit float sum over
-    /// `lanes` of `mask ? f64(lo, hi) : 0.0`, added in the order `butterfly`.
+    /// `lanes` of `mask ? f64(lo, hi) : 0.0`.
     Red64F {
         lo: Value,
         hi: Value,
         mask: Value,
         lanes: u64,
         high: bool,
-        butterfly: Butterfly,
     },
 }
 
@@ -320,12 +143,10 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
-    /// How each sum of floats among them (`Op::AddF`, over the wave or a prefix) is added up.
-    pub orders: HashMap<Value, Order>,
-    /// For a float sum over every lane (`Shape::Active` of [`Op::AddF`], `Shape::ActiveF64`)
-    /// added as a butterfly: its lane bits in the order the console joins them
-    /// ([`Butterfly`]). The paired form's record; the meeting form reads [`Section::orders`].
-    pub butterflies: HashMap<Value, Vec<u32>>,
+    /// What a `v_readlane_b32` of one lane takes, later in the block, from a
+    /// VGPR the section leaves (by the scalar it writes): the last lanes of
+    /// a reduction hold it before the first do.
+    pub reads: HashMap<Value, Shape>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -363,16 +184,25 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let (shapes, orders, butterflies) = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(
-            i,
-            Section {
-                end,
-                shapes,
-                orders,
-                butterflies,
-            },
-        );
+        let (vec, uni) = simulate(&insts[i + 1..end], wave, saved);
+        let mut reads = HashMap::new();
+        for later in insts[end + 1..].iter().filter(|i| i.name() == "v_readlane_b32") {
+            if let Fields::Valu(v) = &later.fields
+                && let (Some(Operand::Scalar { code, .. }), [Operand::Vector { reg, .. }, lane]) =
+                    (v.dst, &v.src[..])
+                && let Some(left) = later.read(Reg::V(*reg)).and_then(|x| vec.get(&x))
+                && let Some(w) = later.write(Reg::S(code))
+                && let Some(l) = lane_number(lane)
+                && let Some(&sym) = left.get(l as usize)
+                // (a lane's own value stays a lane read)
+                && !matches!(sym, Sym::Own(_))
+                && let Some(shape) = single(sym, wave)
+            {
+                reads.insert(w, shape);
+            }
+        }
+        let shapes = shapes(vec, uni, wave);
+        out.insert(i, Section { end, shapes, reads });
         i = end + 1;
     }
     out
@@ -422,42 +252,8 @@ fn dpp_lane(d: Dpp, l: u32) -> Option<(u32, bool, bool)> {
     }
 }
 
-fn combine(op: Op, a: Sym, b: Sym, steps: &mut Steps) -> Sym {
+fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     match (a, b) {
-        // Of floats, only -0.0 leaves every other operand as it is: +0.0 added to -0.0
-        // gives +0.0. So two constants of which one is a zero are added here (the other
-        // constant; of two zeros -0.0 only if both are, whichever comes first), ...
-        (Sym::K(x), Sym::K(y)) if op == Op::AddF && (op.identity(x) || op.identity(y)) => {
-            Sym::K(if op.identity(x) && op.identity(y) {
-                x & y
-            } else if op.identity(x) {
-                y
-            } else {
-                x
-            })
-        }
-        // ... a sum of floats, or one lane's term of one, keeps the +0.0 as a step of its
-        // own and is a sum of floats from then on (not the lane's term as it was; no
-        // butterfly over the lanes, which has no such step), ...
-        (Sym::K(0), Sym::Red { op: o, src, mask, ident, lanes, tree, .. })
-        | (Sym::Red { op: o, src, mask, ident, lanes, tree, .. }, Sym::K(0))
-            if op == Op::AddF && o.is_none_or(|o| o == Op::AddF) && op.identity(ident) =>
-        {
-            let zero = steps.of(Step::K(0));
-            Sym::Red {
-                op: Some(Op::AddF),
-                src,
-                mask,
-                ident,
-                lanes,
-                tree: steps.add(zero, tree),
-                butterfly: Butterfly::UNKNOWN,
-            }
-        }
-        // ... and anything else +0.0 is added to (a minimum or a sum of integers over the
-        // lanes, a value from before the section) is not followed: it is no longer what
-        // it was, where it was -0.0.
-        (Sym::K(0), _) | (_, Sym::K(0)) if op == Op::AddF => Sym::Unknown,
         (Sym::K(k), x) | (x, Sym::K(k)) if op.identity(k) => x,
         (
             Sym::Red {
@@ -466,8 +262,6 @@ fn combine(op: Op, a: Sym, b: Sym, steps: &mut Steps) -> Sym {
                 mask,
                 ident,
                 lanes: la,
-                tree: ta,
-                butterfly: ba,
             },
             Sym::Red {
                 op: ob,
@@ -475,8 +269,6 @@ fn combine(op: Op, a: Sym, b: Sym, steps: &mut Steps) -> Sym {
                 mask: mb,
                 ident: ib,
                 lanes: lb,
-                tree: tb,
-                butterfly: bb,
             },
         ) if (src, mask, ident) == (sb, mb, ib)
             && op.identity(ident)
@@ -491,22 +283,25 @@ fn combine(op: Op, a: Sym, b: Sym, steps: &mut Steps) -> Sym {
                 mask,
                 ident,
                 lanes: la | lb,
-                tree: steps.add(ta, tb),
-                butterfly: match op {
-                    Op::AddF => Butterfly::join(ba, la, bb, lb),
-                    _ => Butterfly::UNKNOWN,
-                },
             }
         }
         _ => Sym::Unknown,
     }
 }
 
-/// A section's values: their shapes, how each float sum is added up ([`Order`]) and, of
-/// those that are butterflies, the lane bits ([`Butterfly`]).
-type Simulated = (HashMap<Value, Shape>, HashMap<Value, Order>, HashMap<Value, Vec<u32>>);
+/// The lane a `v_readlane_b32` names.
+fn lane_number(op: &Operand) -> Option<u32> {
+    match *op {
+        Operand::Const(c) => crate::resource::inline(c),
+        Operand::Literal(x) => Some(x),
+        _ => None,
+    }
+}
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
+/// The lanes' values of the VGPRs the section writes, and its scalars.
+type Left = (HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>);
+
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -515,7 +310,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
     let mut exec = all;
     let mut vec: HashMap<Value, Vec<Sym>> = HashMap::new();
     let mut uni: HashMap<Value, Sym> = HashMap::new();
-    let mut steps = Steps::default();
     // Masks the section derives from the saved EXEC (`s_and` with it).
     let mut masked = vec![saved];
     for inst in insts {
@@ -528,7 +322,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return shapes(vec, uni, wave, &mut steps);
+                return (vec, uni);
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -543,7 +337,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return shapes(vec, uni, wave, &mut steps);
+                return (vec, uni);
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -610,11 +404,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
             else {
                 continue;
             };
-            let l = match *lane {
-                Operand::Const(c) => crate::resource::inline(c),
-                Operand::Literal(x) => Some(x),
-                _ => None,
-            };
+            let l = lane_number(lane);
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
                 let s = l
@@ -674,7 +464,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                 &vec,
                 &uni,
             );
-            let f64_term = |lo_s: Sym, hi_s: Sym| -> Option<(Value, Value, Value, u64, Butterfly)> {
+            let f64_term = |lo_s: Sym, hi_s: Sym| -> Option<(Value, Value, Value, u64)> {
                 match (lo_s, hi_s) {
                     (
                         Sym::Red {
@@ -683,7 +473,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                             mask: ml,
                             ident: 0,
                             lanes: ll,
-                            ..
                         },
                         Sym::Red {
                             op: None,
@@ -691,9 +480,8 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                             mask: mh,
                             ident: 0,
                             lanes: lh,
-                            ..
                         },
-                    ) if ml == mh && ll == lh => Some((lo, hi, ml, ll, Butterfly::LEAF)),
+                    ) if ml == mh && ll == lh => Some((lo, hi, ml, ll)),
                     (
                         Sym::Red64F {
                             lo: lo1,
@@ -701,7 +489,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                             mask: m1,
                             lanes: l1,
                             high: false,
-                            butterfly: t1,
                         },
                         Sym::Red64F {
                             lo: lo2,
@@ -709,12 +496,8 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                             mask: m2,
                             lanes: l2,
                             high: true,
-                            butterfly: t2,
                         },
-                    ) if (lo1, hi1, m1, l1) == (lo2, hi2, m2, l2) => {
-                        // (halves added in two orders: the same sum, but no one butterfly)
-                        Some((lo1, hi1, m1, l1, if t1.0 == t2.0 { t1 } else { Butterfly::UNKNOWN }))
-                    }
+                    ) if (lo1, hi1, m1, l1) == (lo2, hi2, m2, l2) => Some((lo1, hi1, m1, l1)),
                     _ => None,
                 }
             };
@@ -725,10 +508,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
             {
                 for l in 0..wave as usize {
                     let (rl, rh) = match (f64_term(alo[l], ahi[l]), f64_term(blo[l], bhi[l])) {
-                        (Some((lo1, hi1, m1, la, ta)), Some((lo2, hi2, m2, lb, tb)))
+                        (Some((lo1, hi1, m1, la)), Some((lo2, hi2, m2, lb)))
                             if (lo1, hi1, m1) == (lo2, hi2, m2) && la & lb == 0 =>
                         {
-                            let butterfly = Butterfly::join(ta, la, tb, lb);
                             (
                                 Sym::Red64F {
                                     lo: lo1,
@@ -736,7 +518,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                                     mask: m1,
                                     lanes: la | lb,
                                     high: false,
-                                    butterfly,
                                 },
                                 Sym::Red64F {
                                     lo: lo1,
@@ -744,7 +525,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                                     mask: m1,
                                     lanes: la | lb,
                                     high: true,
-                                    butterfly,
                                 },
                             )
                         }
@@ -828,8 +608,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                                 mask: m,
                                 ident,
                                 lanes: 1 << l,
-                                tree: steps.of(Step::Lane(l as u8)),
-                                butterfly: Butterfly::LEAF,
                             }
                         }
                         _ => Sym::Unknown,
@@ -870,7 +648,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                                 mask,
                                 ident: 0,
                                 lanes,
-                                ..
                             },
                             Some(Sym::Red {
                                 op: None | Some(Op::AddU),
@@ -878,7 +655,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                                 mask: m2,
                                 ident: 0,
                                 lanes: l2,
-                                ..
                             }),
                         ) if (src, mask) == (s2, m2) && lanes & l2 == l2 => {
                             let rest = lanes & !l2;
@@ -891,8 +667,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
                                     mask,
                                     ident: 0,
                                     lanes: rest,
-                                    tree: Tree::NONE,
-                                    butterfly: Butterfly::UNKNOWN,
                                 }
                             }
                         }
@@ -902,7 +676,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
             }
             (n, Some(a)) => match (Op::of(n), src(1)) {
                 (Some(op), Some(b)) => (0..wave as usize)
-                    .map(|l| combine(op, a[l], b[l], &mut steps))
+                    .map(|l| combine(op, a[l], b[l]))
                     .collect(),
                 _ => vec![Sym::Unknown; wave as usize],
             },
@@ -919,7 +693,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
             .collect();
         vec.insert(dst, merged);
     }
-    shapes(vec, uni, wave, &mut steps)
+    (vec, uni)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -943,25 +717,10 @@ fn constant(inst: &Inst) -> Option<u64> {
     }
 }
 
-/// The shape of each value, where every lane agrees on one; how each sum of floats among
-/// them is added up; and of those that are butterflies over every lane, the lane bits.
-fn shapes(vec: HashMap<Value, Vec<Sym>>, uni: HashMap<Value, Sym>, wave: u32, steps: &mut Steps) -> Simulated {
-    let all = if wave == 64 {
-        u64::MAX
-    } else {
-        u64::from(u32::MAX)
-    };
-    let mut out = HashMap::new();
-    let mut orders = HashMap::new();
-    let mut butterflies = HashMap::new();
-    // what a lane of a sum of floats holds, as a step
-    let mut tree = |s: Sym| match s {
-        Sym::Red { tree, .. } => tree,
-        Sym::K(k) => steps.of(Step::K(k)),
-        _ => Tree::NONE,
-    };
-    let float_sum = |sh: Shape| matches!(sh, Shape::Active(Op::AddF, ..) | Shape::Prefix(Op::AddF, ..));
-    let single = |s: Sym| match s {
+/// The shape of a scalar.
+fn single(s: Sym, wave: u32) -> Option<Shape> {
+    let all = u64::MAX >> (64 - wave);
+    match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
@@ -970,7 +729,6 @@ fn shapes(vec: HashMap<Value, Vec<Sym>>, uni: HashMap<Value, Sym>, wave: u32, st
             mask,
             ident,
             lanes,
-            ..
         } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
         Sym::Red64F {
             lo,
@@ -978,52 +736,30 @@ fn shapes(vec: HashMap<Value, Vec<Sym>>, uni: HashMap<Value, Sym>, wave: u32, st
             mask,
             lanes,
             high,
-            ..
         } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
         _ => None,
-    };
-    // a float sum's butterfly over every lane bit ([`Butterfly`])
-    let butterfly = |s: Sym| match s {
-        Sym::Red {
-            op: Some(Op::AddF),
-            butterfly,
-            ..
-        }
-        | Sym::Red64F { butterfly, .. } => butterfly.bits().filter(|b| b.len() as u32 == wave.trailing_zeros()),
-        _ => None,
-    };
+    }
+}
+
+/// The shape of each value, where every lane agrees on one.
+fn shapes(
+    vec: HashMap<Value, Vec<Sym>>,
+    uni: HashMap<Value, Sym>,
+    wave: u32,
+) -> HashMap<Value, Shape> {
+    let all = u64::MAX >> (64 - wave);
+    let mut out = HashMap::new();
     for (v, s) in uni {
-        if let Some(sh) = single(s) {
+        if let Some(sh) = single(s, wave) {
             out.insert(v, sh);
-            if float_sum(sh) {
-                orders.insert(v, vec![tree(s)]);
-            }
-            if let Some(b) = butterfly(s) {
-                butterflies.insert(v, b);
-            }
         }
     }
     for (v, lanes) in vec {
         if let Some(sh) = per_lane(&lanes, all) {
             out.insert(v, sh);
-            if float_sum(sh) {
-                orders.insert(v, lanes.iter().map(|&s| tree(s)).collect());
-            }
-            // (every lane the same sum: added in the same order in every lane)
-            let bits = |s: &Sym| match *s {
-                Sym::Red { butterfly, .. } | Sym::Red64F { butterfly, .. } => Some(butterfly.0),
-                _ => None,
-            };
-            if matches!(sh, Shape::Active(..) | Shape::ActiveF64(..))
-                && lanes.iter().all(|s| bits(s) == bits(&lanes[0]))
-                && let Some(b) = butterfly(lanes[0])
-            {
-                butterflies.insert(v, b);
-            }
         }
     }
-    let orders = orders.into_iter().filter_map(|(v, results)| Some((v, steps.order(&results)?))).collect();
-    (out, orders, butterflies)
+    out
 }
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
@@ -1035,7 +771,6 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
             mask,
             ident,
             lanes,
-            ..
         } if lanes == 1 << l => Some((src, mask, ident)),
         _ => None,
     };
@@ -1054,7 +789,6 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 mask,
                 ident,
                 lanes,
-                ..
             } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
             Sym::Red64F {
                 lo,
@@ -1062,7 +796,6 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 mask,
                 lanes,
                 high,
-                ..
             } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
             _ => None,
         };
@@ -1079,7 +812,6 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 mask,
                 ident,
                 lanes,
-                ..
             } => (op, src, mask, ident, lanes),
             // Lane 0 of an exclusive prefix holds the identity.
             Sym::K(_) if l == 0 => continue,
@@ -1122,104 +854,31 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     Some(Shape::Prefix(op, src, mask, ident, inclusive))
 }
 
-/// Test programs: a reduction over a whole console wave of 64 lanes in the steps the console
-/// compiler expands one to, put together here field by field from the instruction set's
-/// formats. The steps are the case the tests stand for (neighbours, pairs, fours, the two
-/// halves of a row of 16, the two rows of a half, the two halves of the wave); the registers
-/// are the fixture's own choice.
+/// `WaveActiveBitOr(v7)` into s7 as the console compiler expands it: every lane takes part,
+/// those outside the saved EXEC (s[4:5]) with 0.
 #[cfg(test)]
-pub(super) mod reduction {
-    /// The VGPR the reduction is made in, the VGPR for the other row's lanes, and the first
-    /// SGPR of the pair EXEC is saved in.
-    pub(crate) const WORK: u8 = 14;
-    pub(crate) const TMP: u8 = 15;
-    pub(crate) const SAVED: u8 = 26;
-    /// VOP2 opcodes of the operations reduced.
-    pub(crate) const V_ADD_F32: u8 = 3;
-    pub(crate) const V_OR_B32: u8 = 28;
-    pub(crate) const V_ADD_F16: u8 = 50;
-    /// Each lane with its neighbour, with the lane two away (twice: as the compiler has it,
-    /// and with every lane named), and with the lane four away.
-    pub(crate) const NEIGHBOURS: [u32; 8] = [1, 0, 3, 2, 5, 4, 7, 6];
-    pub(crate) const PAIRS: [u32; 8] = [2, 2, 0, 0, 6, 6, 4, 4];
-    pub(crate) const TWO_APART: [u32; 8] = [2, 3, 0, 1, 6, 7, 4, 5];
-    const FOURS: [u32; 8] = [4, 4, 4, 4, 0, 0, 0, 0];
-    const EXEC: u32 = 126;
-    const MINUS_ONE: u32 = 193;
-    const ZERO: u32 = 128;
-    const DPP8: u32 = 0xE9;
-    const DPP16: u32 = 0xFA;
-
-    const fn sop1(op: u32, sdst: u32, ssrc0: u32) -> u32 {
-        0xBE80_0000 | sdst << 16 | op << 8 | ssrc0
-    }
-
-    const fn vop2(op: u8, vdst: u8, src0: u32, vsrc1: u8) -> u32 {
-        (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | src0
-    }
-
-    const fn vop3(op: u32, dst: u8, src: [u32; 3]) -> [u32; 2] {
-        [0xD400_0000 | op << 16 | dst as u32, src[0] | src[1] << 9 | src[2] << 18]
-    }
-
-    /// The second word of a `dpp8` operation: `v<vsrc>` of the lanes `lanes` name, in eights.
-    pub(crate) const fn dpp8(lanes: [u32; 8], vsrc: u8) -> u32 {
-        let mut w = vsrc as u32;
-        let mut i = 0;
-        while i < 8 {
-            w |= lanes[i] << (8 + 3 * i);
-            i += 1;
-        }
-        w
-    }
-
-    /// `s_or_saveexec_b64 s[SAVED:SAVED+1], -1` and `s_mov_b64 exec, s[SAVED:SAVED+1]`.
-    pub(crate) const SAVE_EXEC: u32 = sop1(0x25, SAVED as u32, MINUS_ONE);
-    pub(crate) const RESTORE_EXEC: u32 = sop1(0x04, EXEC, SAVED as u32);
-
-    /// `v_cndmask_b32 v<dst>, <outside>, v<src>, s[SAVED:SAVED+1]`: the terms, `outside`
-    /// (an operand code) in the lanes outside the saved EXEC.
-    pub(crate) const fn terms(dst: u8, outside: u32, src: u8) -> [u32; 2] {
-        vop3(0x101, dst, [outside, 256 + src as u32, SAVED as u32])
-    }
-
-    /// The reduction by VOP2 `op` of `v<src>` over the wave into `s<out>`: every lane takes
-    /// part, those outside EXEC with 0.
-    pub(crate) const fn words(op: u8, src: u8, out: u8) -> [u32; 20] {
-        let own = vop2(op, WORK, DPP8, WORK);
-        let t = terms(WORK, ZERO, src);
-        let other_row = vop3(0x378, TMP, [256 + WORK as u32, ZERO, ZERO]);
-        let half = vop3(0x360, out, [256 + WORK as u32, ZERO + 32, 0]);
-        let first = vop3(0x360, out, [256 + WORK as u32, ZERO, 0]);
-        [
-            SAVE_EXEC, // s_or_saveexec_b64 saved, -1
-            t[0],
-            t[1], // v_cndmask_b32 work, 0, src, saved
-            own,
-            dpp8(NEIGHBOURS, WORK), // op work, work, work dpp8:[1,0,3,2,5,4,7,6]
-            own,
-            dpp8(PAIRS, WORK), // op work, work, work dpp8:[2,2,0,0,6,6,4,4]
-            own,
-            dpp8(FOURS, WORK), // op work, work, work dpp8:[4,4,4,4,0,0,0,0]
-            vop2(op, WORK, DPP16, WORK),
-            0xFF << 24 | 1 << 19 | 0x140 << 8 | WORK as u32, // op work, work, work row_mirror bound_ctrl:1
-            other_row[0],
-            other_row[1],                         // v_permlanex16_b32 tmp, work, 0, 0
-            vop2(op, WORK, 256 + TMP as u32, WORK), // op work, tmp, work
-            half[0],
-            half[1],                          // v_readlane_b32 out, work, 32
-            vop2(op, WORK, out as u32, WORK), // op work, out, work
-            first[0],
-            first[1],     // v_readlane_b32 out, work, 0
-            RESTORE_EXEC, // s_mov_b64 exec, saved
-        ]
-    }
-}
-
-/// `WaveActiveBitOr(v7)` into s7 ([`reduction::words`]): every lane takes part, those
-/// outside the saved EXEC with 0.
-#[cfg(test)]
-pub(super) const WAVE_OR_V7_TO_S7: [u32; 20] = reduction::words(reduction::V_OR_B32, 7, 7);
+pub(super) const WAVE_OR_V7_TO_S7: [u32; 20] = [
+    0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+    0xD501_0001,
+    0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+    0x3802_02E9,
+    0xDE54_C101, // v_or_b32 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+    0x3802_02E9,
+    0x9360_1201, // v_or_b32 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+    0x3802_02E9,
+    0x0009_2401, // v_or_b32 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+    0x3802_02FA,
+    0xFF09_4001, // v_or_b32 v1, v1, v1 row_mirror bound_ctrl:1
+    0xD778_0002,
+    0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+    0x3802_0302, // v_or_b32 v1, v2, v1
+    0xD760_0007,
+    0x0001_4101, // v_readlane_b32 s7, v1, 32
+    0x3802_0207, // v_or_b32 v1, s7, v1
+    0xD760_0007,
+    0x0001_0101, // v_readlane_b32 s7, v1, 0
+    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+];
 
 #[cfg(test)]
 mod tests {
@@ -1293,49 +952,6 @@ mod tests {
         assert_eq!(dpp_lane(swap, 8), Some((9, false, true)));
     }
 
-    /// What `combine` makes of +0.0 in a sum of floats (the third review of the meeting
-    /// form, Question 2 item 3): it is not an operand that leaves the other as it is.
-    #[test]
-    fn a_positive_zero_is_added_in_a_float_sum() {
-        const NEG: u32 = 0x8000_0000;
-        let mut steps = Steps::default();
-        let mut add = |a: Sym, b: Sym| combine(Op::AddF, a, b, &mut steps);
-        // constants: +0.0 + -0.0 is +0.0 either way round, -0.0 + -0.0 is -0.0
-        assert_eq!(add(Sym::K(0), Sym::K(NEG)), Sym::K(0));
-        assert_eq!(add(Sym::K(NEG), Sym::K(0)), Sym::K(0));
-        assert_eq!(add(Sym::K(NEG), Sym::K(NEG)), Sym::K(NEG));
-        assert_eq!(add(Sym::K(0), Sym::K(0)), Sym::K(0));
-        let one = 1.0f32.to_bits();
-        assert_eq!((add(Sym::K(0), Sym::K(one)), add(Sym::K(one), Sym::K(NEG))), (Sym::K(one), Sym::K(one)));
-        // a value from before the section: -0.0 leaves it, +0.0 does not
-        let own = Sym::Own(Value(1));
-        assert_eq!((add(Sym::K(NEG), own), add(own, Sym::K(0)), add(Sym::K(0), own)), (own, Sym::Unknown, Sym::Unknown));
-        // a minimum or an integer sum over the lanes is not left in place under + 0.0
-        let red = |op: Option<Op>, ident: u32, tree: Tree| Sym::Red {
-            op,
-            src: Value(1),
-            mask: Value(2),
-            ident,
-            lanes: 0xF,
-            tree,
-            butterfly: Butterfly::UNKNOWN,
-        };
-        for (op, ident) in [(Op::MinF, 0x7F80_0000), (Op::AddU, 0), (Op::MaxU, 0)] {
-            assert_eq!(add(Sym::K(0), red(Some(op), ident, Tree::NONE)), Sym::Unknown, "{op:?}");
-            assert_eq!(add(red(Some(op), ident, Tree::NONE), Sym::K(0)), Sym::Unknown, "{op:?}");
-        }
-        // one lane's term whose other lanes hold +inf is no term of a float sum
-        assert_eq!(add(Sym::K(0), red(None, 0x7F80_0000, Tree::NONE)), Sym::Unknown);
-        // a float sum, or a lane's term of one, keeps the +0.0 as a step and is a sum
-        let leaf = steps.of(Step::Lane(3));
-        let zero = steps.of(Step::K(0));
-        let want = steps.add(zero, leaf);
-        for term in [red(None, 0, leaf), red(Some(Op::AddF), 0, leaf)] {
-            let Sym::Red { op, tree, .. } = combine(Op::AddF, Sym::K(0), term, &mut steps) else { panic!("not followed") };
-            assert_eq!((op, tree.0), (Some(Op::AddF), want.0));
-        }
-    }
-
     #[test]
     fn prefixes_are_recognised() {
         let (x, m) = (Value(1), Value(2));
@@ -1345,8 +961,6 @@ mod tests {
             mask: m,
             ident: 0,
             lanes,
-            tree: Tree::NONE,
-            butterfly: Butterfly::UNKNOWN,
         };
         let inclusive: Vec<Sym> = (0..64).map(|l| red(u64::MAX >> (63 - l))).collect();
         assert_eq!(
@@ -1490,130 +1104,86 @@ mod tests {
         }
     }
 
-    /// `WaveActiveSum` of 16-bit floats (v11 into s22) in the steps of [`reduction::words`]:
-    /// the tree the lowering reproduces. A tree in another order is not followed.
+    /// A wave OR whose last step stays in the section's VGPR: the lower
+    /// lanes add the first half's to themselves, so only the upper ones
+    /// hold the whole, and the last lane is read after the section (an
+    /// upscaler's programs).
+    #[test]
+    fn one_lane_of_what_a_section_leaves_is_read_after_it() {
+        let words = |lane: u32| {
+            let mut w = WAVE_OR_V7_TO_S7[..14].to_vec(); // .. v_or_b32 v1, v2, v1
+            w.extend([
+                0xD760_0007,
+                0x0001_0101, // v_readlane_b32 s7, v1, 0
+                0x3802_0207, // v_or_b32 v1, s7, v1
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                0xD760_0006,
+                0x0001_0101 | lane << 9, // v_readlane_b32 s6, v1, lane
+                S_ENDPGM,
+            ]);
+            w
+        };
+        let read = |lane: u32| {
+            let p = build(&words(lane), true);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[0].write(Reg::S(4)).unwrap();
+            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+            let got = insts[insts.len() - 2].write(Reg::S(6)).unwrap();
+            let sec = &sections(&p, 0)[&0];
+            (sec.reads.get(&got).copied(), Shape::Active(Op::Or, v7, saved, 0))
+        };
+        let (found, whole) = read(63);
+        assert_eq!(found, Some(whole));
+        // Lane 0 has the first half's alone: still a lane read.
+        assert_eq!(read(0).0, None);
+    }
+
+    /// `WaveActiveSum` of 16-bit floats, as compiled in
+    /// `compute_graph_ops:CS_TransposeVecMatMulAlignedOperation`: the tree the
+    /// lowering reproduces. A tree in another order is not followed.
     #[test]
     fn a_sum_of_halves_over_the_wave_is_followed_in_the_order_of_its_tree() {
-        let tree = reduction::words(reduction::V_ADD_F16, 11, 22);
+        let words = |first: [u32; 2], second: [u32; 2]| {
+            [
+                0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+                0xD501_0001,
+                0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+                first[0],
+                first[1],
+                second[0],
+                second[1],
+                0x6402_02E9,
+                0x0009_2401, // v_add_f16 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+                0x6402_02FA,
+                0xFF09_4001, // v_add_f16 v1, v1, v1 row_mirror bound_ctrl:1
+                0xD778_0002,
+                0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+                0x6402_0302, // v_add_f16 v1, v2, v1
+                0xD760_0007,
+                0x0001_4101, // v_readlane_b32 s7, v1, 32
+                0x6402_0207, // v_add_f16 v1, s7, v1
+                0xD760_0007,
+                0x0001_0101, // v_readlane_b32 s7, v1, 0
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+            ]
+        };
+        let pairs = [0x6402_02E9, 0xDE54_C101]; // v_add_f16 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+        let quads = [0x6402_02E9, 0x9360_1201]; // v_add_f16 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
         let shape = |w: &[u32]| {
             let p = build(w, true);
             let insts = &p.blocks[0].insts;
-            let saved = insts[0].write(Reg::S(reduction::SAVED)).unwrap();
-            let v11 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(11)).then_some(v)).unwrap();
-            // ..., v_readlane_b32 s22, work, 0; s_mov_b64 exec, saved; s_endpgm
-            let total = insts[insts.len() - 3].write(Reg::S(22)).unwrap();
-            (sections(&p, 0)[&0].shapes.get(&total).copied(), Shape::Active(Op::AddH, v11, saved, 0))
+            let saved = insts[0].write(Reg::S(4)).unwrap();
+            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+            // ..., v_readlane_b32 s7, v1, 0; s_mov_b64 exec, s[4:5]; s_endpgm
+            let total = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
+            (sections(&p, 0)[&0].shapes.get(&total).copied(), Shape::Active(Op::AddH, v7, saved, 0))
         };
-        let (found, want) = shape(&tree);
+        let (found, want) = shape(&words(pairs, quads));
         assert_eq!(found, Some(want));
         // lanes two apart first, neighbours second: every lane counted once, but
         // (x0 + x2) + (x1 + x3) rounds differently from (x0 + x1) + (x2 + x3)
-        let mut other = tree;
-        other[4] = reduction::dpp8(reduction::TWO_APART, reduction::WORK);
-        other[6] = reduction::dpp8(reduction::NEIGHBOURS, reduction::WORK);
-        let (found, _) = shape(&other);
+        let (found, _) = shape(&words(quads, pairs));
         assert_eq!(found, None);
-        // the first two steps as they are, the other way round: lanes 1 and 2 would be
-        // counted twice, which is no sum either
-        let mut twice = tree;
-        twice.swap(4, 6);
-        let (found, _) = shape(&twice);
-        assert_eq!(found, None);
-    }
-
-    /// A 64-bit float sum whose low dword comes from one partial sum and whose high dword
-    /// from the same lanes added in another order is still the sum over those lanes, as
-    /// `world` takes it: its shape does not depend on the paired form's record
-    /// ([`Butterfly`]), which knows no order for it and so leaves it out of
-    /// `Section::butterflies` (the merge's review, 1: the paired record's check had made it
-    /// unknown with the paired form off).
-    #[test]
-    fn an_f64_sum_of_halves_added_in_two_orders_keeps_its_shape() {
-        const XOR1: u32 = 14_570_689; // dpp8:[1,0,3,2,5,4,7,6]
-        const XOR2: u32 = 11_788_826; // dpp8:[2,3,0,1,6,7,4,5]
-        const XOR4: u32 = 0o32107654; // dpp8:[4,5,6,7,0,1,2,3]
-        let v = |n: u8| 256 + u16::from(n);
-        let dpp8 = |w: &mut Vec<u32>, dst: u8, src: u8, sel: u32| w.extend([vop1(dst, 1, 0xE9), u32::from(src) | sel << 8]);
-        // v[lo:lo+1] += the lanes `sel` picks of it (v[4:5] the copy)
-        let step = |w: &mut Vec<u32>, lo: u8, sel: u32| {
-            dpp8(w, 4, lo, sel);
-            dpp8(w, 5, lo + 1, sel);
-            w.extend(vop3(lo, 0x164, v(4), v(lo), 0)); // v_add_f64
-        };
-        let words = |other_order: bool| {
-            let mut w = vec![sop1(12, 0x3D, 0xC1)]; // s_or_saveexec_b32 s12, -1
-            w.extend(vop3(2, 0x101, 0x80, v(6), 12)); // v_cndmask_b32 v2, 0, v6, s12
-            w.extend(vop3(3, 0x101, 0x80, v(7), 12)); // v_cndmask_b32 v3, 0, v7, s12
-            w.extend([vop1(10, 1, v(2)), vop1(11, 1, v(3))]); // v[10:11] = v[2:3]
-            step(&mut w, 2, XOR1);
-            step(&mut w, 2, XOR2);
-            let (first, second) = if other_order { (XOR2, XOR1) } else { (XOR1, XOR2) };
-            step(&mut w, 10, first);
-            step(&mut w, 10, second);
-            // v[8:9]: the low dword of the one, the high of the other
-            w.extend([vop1(8, 1, v(2)), vop1(9, 1, v(11))]);
-            step(&mut w, 8, XOR4);
-            w.extend([vop1(4, 1, 0xFA), dpp16(8, 0x140, 0xF, 0xF, true)]); // row_mirror
-            w.extend([vop1(5, 1, 0xFA), dpp16(9, 0x140, 0xF, 0xF, true)]);
-            w.extend(vop3(8, 0x164, v(4), v(8), 0));
-            w.extend(vop3(4, 0x378, v(8), 0x80, 0x80)); // v_permlanex16_b32 v4, v8, 0, 0
-            w.extend(vop3(5, 0x378, v(9), 0x80, 0x80));
-            w.extend(vop3(8, 0x164, v(4), v(8), 0));
-            w.extend(vop3(14, 0x360, v(8), 0x80, 0)); // v_readlane_b32 s14, v8, 0
-            w.extend(vop3(15, 0x360, v(9), 0x80, 0)); // v_readlane_b32 s15, v9, 0
-            w.push(sop1(126, 0x03, 12)); // s_mov_b32 exec_lo, s12
-            w
-        };
-        for other_order in [false, true] {
-            let p = build(&words(other_order), false);
-            let insts = &p.blocks[0].insts;
-            let saved = insts[0].write(Reg::S(12)).unwrap();
-            let input = |r: u8| p.inputs.iter().find_map(|&(g, x)| (g == Reg::V(r)).then_some(x)).unwrap();
-            let low = insts[insts.len() - 4].write(Reg::S(14)).unwrap();
-            let sec = &sections(&p, 0)[&0];
-            assert_eq!(
-                sec.shapes.get(&low),
-                Some(&Shape::ActiveF64(input(6), input(7), saved, false)),
-                "the sum over the wave (two orders: {other_order})"
-            );
-            assert_eq!(sec.butterflies.contains_key(&low), !other_order, "a butterfly only where both halves are one");
-        }
-    }
-
-    /// A sum of floats over the wave keeps the additions it was made by: the same lanes
-    /// summed with neighbours first or with lanes two apart first are one shape and two
-    /// orders. A wave OR, where the order changes nothing, keeps none.
-    #[test]
-    fn a_float_sum_keeps_the_order_of_its_additions() {
-        let left = |words: Vec<u32>| {
-            let p = build(&words, true);
-            let insts = &p.blocks[0].insts;
-            let saved = insts[0].write(Reg::S(reduction::SAVED)).unwrap();
-            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
-            let total = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
-            let sec = &sections(&p, 0)[&0];
-            (sec.shapes.get(&total).copied(), sec.orders.get(&total).cloned(), v7, saved)
-        };
-        let float = |w: u32| if w >> 25 == 28 { w & 0x01FF_FFFF | 3 << 25 } else { w }; // v_add_f32
-        let (shape, order, ..) = left(WAVE_OR_V7_TO_S7.to_vec());
-        assert!(matches!(shape, Some(Shape::Active(Op::Or, ..))));
-        assert_eq!(order, None);
-        let neighbours: Vec<u32> = WAVE_OR_V7_TO_S7.iter().map(|&w| float(w)).collect();
-        let mut two_apart = neighbours.clone();
-        // dpp8:[2,3,0,1,6,7,4,5], then [1,0,3,2,5,4,7,6]
-        two_apart[4] = reduction::dpp8(reduction::TWO_APART, reduction::WORK);
-        two_apart[6] = reduction::dpp8(reduction::NEIGHBOURS, reduction::WORK);
-        for (words, first) in [(neighbours, Step::Add(0, 1)), (two_apart, Step::Add(0, 2))] {
-            let (shape, order, v7, saved) = left(words);
-            assert_eq!(shape, Some(Shape::Active(Op::AddF, v7, saved, 0)));
-            let order = order.expect("the additions of a float sum");
-            // 64 terms and the 63 additions that make one sum of them, the same in every lane
-            assert_eq!((order.steps.len(), order.results.len()), (127, 1));
-            assert!((0..64).all(|l| order.steps[l] == Step::Lane(l as u8)));
-            assert_eq!(order.steps[64], first, "lane 0's first addition");
-            assert_eq!(order.neighbours_first(), first == Step::Add(0, 1));
-            assert_eq!(order.results[0], 126);
-        }
     }
 
     #[test]
@@ -1660,8 +1230,6 @@ mod tests {
             mask,
             ident,
             lanes,
-            tree: Tree::NONE,
-            butterfly: Butterfly::UNKNOWN,
         };
 
         for (wave, all) in [(32usize, u64::from(u32::MAX)), (64usize, u64::MAX)] {

@@ -52,13 +52,7 @@ pub struct BindReport {
 /// Writes the prepared copy into `dir` and maps it with the Windows loader.
 ///
 /// `dir` receives derived game data, so it must be outside the repository.
-/// `title_patches` names the folder of load-time patch files; `None` leaves
-/// the image untouched.
-pub fn load(
-    prepared: &PreparedImage,
-    dir: &Path,
-    title_patches: Option<&Path>,
-) -> Result<LoadedImage> {
+pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     victory_core::ensure_outside_repo(dir)?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(prepared.file_name());
@@ -89,17 +83,6 @@ pub fn load(
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
-    }
-    if title_patches.is_some() {
-        // SAFETY: the image is mapped and relocated and no title code runs;
-        // `size_of_image` covers every mapped section.
-        let mut image = unsafe {
-            crate::title_patches::MappedImage::new(
-                loaded.base(),
-                loaded.info.size_of_image as usize,
-            )
-        };
-        crate::title_patches::apply(title_patches, &prepared.original_hash, &mut image)?;
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
@@ -170,8 +153,7 @@ fn map_dll(
     }
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
-    let image =
-        load(&prepared, dirs.1, None).with_context(|| format!("loading {}", path.display()))?;
+    let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
     loaded.push((name, image));
     Ok(())
@@ -201,13 +183,8 @@ impl ImportResolver for WithTitleDlls<'_> {
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
-    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
-        return Ok(());
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
-    Ok(())
+    crate::publish::write_if_changed(path, bytes)
+        .with_context(|| format!("publishing {}", path.display()))
 }
 
 impl LoadedImage {

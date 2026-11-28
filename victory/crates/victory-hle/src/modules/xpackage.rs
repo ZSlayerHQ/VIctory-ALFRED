@@ -20,10 +20,9 @@ pub const PROVIDER: Guid = Guid::new(
     [0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e],
 );
 
-/// A later id of the package interface (2026), as implemented here: the
-/// slots up to 0xd0 take the arguments the public API lists in the same
-/// order; 0x110 uninstalls a package, 0x128/0x130 mount one with UI, 0x138
-/// enumerates packages.
+/// As the title (2026) asks for it. Its slots up to 0xd0 take the
+/// arguments the public API lists in the same order; 0x110 uninstalls a
+/// package, 0x128/0x130 mount one with UI, 0x138 enumerates packages.
 pub const IID_2026: Guid = Guid::new(
     0x0b9d_556e,
     0xab70,
@@ -72,12 +71,10 @@ fn package_bytes() -> u64 {
 type This = *const Object;
 
 extern "system" fn current_identifier(_: This, size: usize, buffer: *mut u8) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     put_string(&identifier(), size, buffer, std::ptr::null_mut())
 }
 
 extern "system" fn is_packaged(_: This) -> bool {
-    let _entry = victory_gpu::hle_call();
     true
 }
 
@@ -97,15 +94,12 @@ extern "system" fn create_monitor(
     _queue: *const c_void,
     out: *mut *const c_void,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     if !is_ours(id) {
         return NO_PACKAGE;
     }
     put(out, monitor())
 }
-extern "system" fn close_monitor(_: This, _: *const c_void) {
-    let _entry = victory_gpu::hle_call();
-}
+extern "system" fn close_monitor(_: This, _: *const c_void) {}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +112,6 @@ pub struct Progress {
 }
 
 extern "system" fn progress(_: This, _: *const c_void, out: *mut Progress) {
-    let _entry = victory_gpu::hle_call();
     let bytes = package_bytes();
     put(
         out,
@@ -140,15 +133,24 @@ extern "system" fn register_progress(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     put(out, token())
+}
+
+/// The completed installation has no pending progress callbacks to wait for.
+extern "system" fn unregister_progress(
+    _: This,
+    _monitor: *const c_void,
+    _token: u64,
+    _wait: bool,
+) -> bool {
+    true
 }
 
 /// 0: ready.
 // shortcut: every selector counts as installed, including ones the
 // package's layout does not have (the console answers those with an
-// invalid-selector error); a caller may ask about any selector, and the
-// runtime answers as a full install would.
+// invalid-selector error); the title asks only about its own
+// chunks, which a full install has.
 extern "system" fn find_availability(
     _: This,
     id: *const c_char,
@@ -156,7 +158,6 @@ extern "system" fn find_availability(
     _selectors: *const c_void,
     out: *mut u32,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     if !is_ours(id) {
         return NO_PACKAGE;
     }
@@ -169,7 +170,6 @@ extern "system" fn change_order(
     _count: u32,
     _selectors: *const c_void,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     if is_ours(id) { S_OK } else { NO_PACKAGE }
 }
 
@@ -185,7 +185,6 @@ extern "system" fn install_chunks_async(
     _suppress_confirmation: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let result = if is_ours(id) {
         Ok(xasync::bytes(monitor()))
     } else {
@@ -198,7 +197,6 @@ extern "system" fn install_chunks_result(
     block: *mut AsyncBlock,
     out: *mut *const c_void,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     xasync::result(block, (&raw const INSTALL).cast(), out)
 }
 
@@ -211,7 +209,6 @@ extern "system" fn estimate_download(
     bytes: *mut u64,
     confirm: *mut bool,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     if !is_ours(id) {
         return NO_PACKAGE;
     }
@@ -223,31 +220,26 @@ extern "system" fn estimate_download(
 }
 
 // shortcut: accepted but nothing is removed (the package folder is the
-// user's), so the chunks stay ready; a caller
-// would then see them still installed.
+// user's), so the chunks stay ready; the title's one call site
+// (its chunk manager) would then see them still installed.
 extern "system" fn uninstall_chunks(
     _: This,
     id: *const c_char,
     _count: u32,
     _selectors: *const c_void,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     if is_ours(id) { S_OK } else { NO_PACKAGE }
 }
 
 /// Mount handles only come from mounting another package, and there is
 /// none.
 extern "system" fn mount_path(_: This, _: *const c_void, _: usize, _: *mut u8) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     xasync::E_INVALIDARG
 }
-extern "system" fn close_mount(_: This, _: *const c_void) {
-    let _entry = victory_gpu::hle_call();
-}
+extern "system" fn close_mount(_: This, _: *const c_void) {}
 
 /// Only other packages are uninstalled this way, and none is installed.
 extern "system" fn uninstall_package(_: This, id: *const c_char) -> bool {
-    let _entry = victory_gpu::hle_call();
     tracing::info!(
         id = text(id).unwrap_or_default(),
         "package uninstall refused"
@@ -258,7 +250,6 @@ extern "system" fn uninstall_package(_: This, id: *const c_char) -> bool {
 static MOUNT: u8 = 0;
 
 extern "system" fn mount_async(_: This, id: *const c_char, block: *mut AsyncBlock) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     tracing::info!(
         id = text(id).unwrap_or_default(),
         "package mount: not installed"
@@ -270,13 +261,12 @@ extern "system" fn mount_result(
     block: *mut AsyncBlock,
     out: *mut *const c_void,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     xasync::result(block, (&raw const MOUNT).cast(), out)
 }
 
-/// Enumerates the packages of a kind: content packages (kind 1) are the
-/// kind supported, and there are none.
-// shortcut: the game kind (0) also lists nothing, not this installation.
+/// Titles enumerate content packages (kind 1); there are none.
+// shortcut: the game kind (0) also lists nothing, not this installation;
+// The title enumerates only content (kind 1).
 extern "system" fn enumerate(
     _: This,
     kind: u32,
@@ -284,7 +274,6 @@ extern "system" fn enumerate(
     _context: *mut c_void,
     _callback: *const c_void,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     tracing::debug!(kind, "packages enumerated: none");
     S_OK
 }
@@ -300,7 +289,7 @@ static VTABLE: Methods<40> = Methods([
     progress as *const (),              // 0x38
     missing::<8> as *const (),          // 0x40 update a monitor
     register_progress as *const (),     // 0x48
-    missing::<10> as *const (),         // 0x50 unregister it
+    unregister_progress as *const (),   // 0x50
     missing::<11> as *const (),         // 0x58 user locale
     find_availability as *const (),     // 0x60
     missing::<13> as *const (),         // 0x68 enumerate chunk availability
@@ -336,6 +325,34 @@ static VTABLE: Methods<40> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn completed_installation_unregisters_progress_immediately() {
+        type Register =
+            extern "system" fn(This, *const c_void, *mut c_void, *const c_void, *mut u64) -> HRESULT;
+        type Unregister = extern "system" fn(This, *const c_void, u64, bool) -> bool;
+        extern "system" fn callback(_: *mut c_void, _: *const c_void) {}
+
+        let this: This = &OBJECT;
+        let register = method::<Register>(&OBJECT, 0x48);
+        assert_eq!(VTABLE.0[0x50 / 8], unregister_progress as *const ());
+        let unregister = method::<Unregister>(&OBJECT, 0x50);
+        for wait in [false, true] {
+            let mut token = 0;
+            assert_eq!(
+                register(
+                    this,
+                    monitor(),
+                    std::ptr::null_mut(),
+                    callback as *const c_void,
+                    &mut token
+                ),
+                S_OK
+            );
+            assert_ne!(token, 0);
+            assert!(unregister(this, monitor(), token, wait));
+        }
+    }
 
     #[test]
     fn the_installation_is_complete_and_alone() {

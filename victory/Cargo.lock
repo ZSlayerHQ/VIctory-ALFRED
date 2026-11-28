@@ -636,8 +636,8 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
- "tracing",
  "victory-core",
+ "victory-formats",
  "victory-game",
  "victory-hle",
  "victory-loader",
@@ -676,12 +676,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
- "serde",
  "tempfile",
- "toml",
  "tracing",
  "victory-formats",
- "victory-loader",
  "victory-pipeline",
  "victory-shader",
  "windows",
@@ -693,7 +690,6 @@ dependencies = [
 name = "victory-hle"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "opus-pure",
  "tempfile",
  "tracing",
@@ -713,10 +709,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
- "serde",
  "tempfile",
  "thiserror",
- "toml",
  "tracing",
  "victory-core",
  "victory-pe",
@@ -746,7 +740,6 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "thiserror",
  "windows",
  "windows-sys",

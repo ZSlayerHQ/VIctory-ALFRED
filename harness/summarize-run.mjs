@@ -4,9 +4,10 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import nodePath from 'node:path';
-import { parseExtras, parseLogLines, readLogLines, runStarts } from './parse-run.mjs';
+import { FRAME_RE, median, parseExtras, parseLogLines, percentile, readLogLines, runStarts } from './parse-run.mjs';
 import { aggregate, collect } from './run-lines.mjs';
-import { presentMonCsvForLog, readPresentMon, capturesRoot } from './presentmon.mjs';
+import { presentMonCsvForLog, readPresentMon, readPresentMonFrames, capturesRoot } from './presentmon.mjs';
+import { COVER_SLACK_MS, recordedPids } from './presentmon-compare.mjs';
 import { annotate, defaultNamesFile, loadNames } from './name-hashes.mjs';
 import { loadLocalEnv } from './local-env.mjs';
 import { pictureLines } from './summary-picture.mjs';
@@ -112,6 +113,125 @@ const settledAt = lines.findIndex((line) => /harness: settled at/.test(line));
 const speed = aggregate(collect(lines, settledAt >= 0 ? settledAt + 1 : 0));
 out.speedLines = speed;
 
+// Their protocol (--protocol team-270): two windows after the settle, standing +80..+150 s and walking
+// +150..+270 s, from PresentMon's frames of the game's process. A window the run does not span is refused with its
+// reason rather than measured from a fragment. Draws come from the runtime's frame lines, anchored at the last
+// frame line before the settle marker (the settle time is that line; the marker itself carries no timestamp).
+function windowStats(frames, fromMs, toMs) {
+  const picked = frames.filter((frame) => frame.atMs >= fromMs && frame.atMs < toMs);
+  if (!picked.length) return null;
+  const ms = picked.map((frame) => frame.ms);
+  const gpu = picked.filter((frame) => frame.gpuMs !== null);
+  const mean = ms.reduce((a, b) => a + b, 0) / ms.length;
+  const slowest = [...ms].sort((a, b) => b - a).slice(0, Math.max(1, Math.round(ms.length * 0.01)));
+  return {
+    frames: ms.length,
+    fps: 1000 / mean,
+    medianMs: median(ms),
+    p90Ms: percentile(ms, 0.9),
+    p99Ms: percentile(ms, 0.99),
+    low1Fps: 1000 / (slowest.reduce((a, b) => a + b, 0) / slowest.length),
+    worstMs: Math.max(...ms),
+    gpuPct: gpu.length
+      ? (100 * gpu.reduce((a, b) => a + b.gpuMs, 0)) / gpu.reduce((a, b) => a + b.ms, 0)
+      : null,
+  };
+}
+
+// Does the run's own frames reach both edges of [fromMs, toMs)? A short run is refused, not measured from its first
+// seconds: the 1 s slack presentmon-compare.mjs allows.
+function coversWindow(frames, fromMs, toMs) {
+  const within = frames.filter((frame) => frame.atMs < toMs && frame.atMs + frame.ms > fromMs);
+  if (!within.length) return { ok: false, why: 'no frames in it' };
+  const first = Math.min(...within.map((frame) => frame.atMs));
+  const last = Math.max(...within.map((frame) => frame.atMs + frame.ms));
+  if (first > fromMs + COVER_SLACK_MS) return { ok: false, why: `its frames start ${Math.round((first - fromMs) / 1000)} s into it` };
+  if (last < toMs - COVER_SLACK_MS) return { ok: false, why: `the run ended ${Math.round((toMs - last) / 1000)} s short of it` };
+  return { ok: true };
+}
+
+function windowFor(frames, fromMs, toMs) {
+  const cover = coversWindow(frames, fromMs, toMs);
+  return cover.ok ? windowStats(frames, fromMs, toMs) : { missing: cover.why };
+}
+
+function drawsInWindow(lines, fromIndex, fromS, toS) {
+  let anchorMs = null;
+  for (let i = fromIndex - 1; i >= 0; i -= 1) {
+    if (!FRAME_RE.test(lines[i])) continue;
+    const stamp = lines[i].match(/^(\S+Z)\s/);
+    const at = stamp ? Date.parse(stamp[1]) : Number.NaN;
+    if (!Number.isNaN(at)) {
+      anchorMs = at;
+      break;
+    }
+  }
+  if (anchorMs === null) return null;
+  const values = [];
+  for (const line of lines.slice(fromIndex + 1)) {
+    const stamp = line.match(/^(\S+Z)\s/);
+    const at = stamp ? Date.parse(stamp[1]) : Number.NaN;
+    if (Number.isNaN(at)) continue;
+    const rel = (at - anchorMs) / 1000;
+    if (rel < fromS || rel >= toS) continue;
+    const frame = line.match(FRAME_RE);
+    if (frame) values.push(Number(frame.groups.draws));
+  }
+  return values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
+}
+
+// Peak RAM and VRAM from the log's own memory lines: the process's private bytes, and the card's in-use figure in
+// either build's wording. A build that prints neither gives null.
+function peakMemory(lines) {
+  let ramMb = null;
+  let vramMb = null;
+  for (const line of lines) {
+    const ram = line.match(/memory: (\d+) MB private\b/);
+    if (ram) ramMb = Math.max(ramMb ?? 0, Number(ram[1]));
+    const card = line.match(/\bthe card: (\d+) MB in use\b/);
+    if (card) vramMb = Math.max(vramMb ?? 0, Number(card[1]));
+    // Only the periodic wording ("with the memory line") is a sample of the run; the start-up lines ("right before/
+    // after the swap chain is made") are printed by release builds too and say nothing of the run's peak.
+    const shared = line.match(/video memory as the system counts it, with the memory line.*?\bin use (\d+) MB/);
+    if (shared) vramMb = Math.max(vramMb ?? 0, Number(shared[1]));
+  }
+  return { ramMb, vramMb };
+}
+
+const protocolMatch = lines.map((line) => line.match(/^harness env: protocol=(\S+)\s*$/)).find(Boolean);
+const protocol = protocolMatch ? protocolMatch[1] : null;
+const peaks = peakMemory(lines);
+let protocolReport = null;
+if (protocol === 'team-270') {
+  protocolReport = { name: protocol, settledSeconds: null, standing: null, walking: null, missing: {}, peaks };
+  const pids = recordedPids(lines);
+  if (pids.size > 1) {
+    protocolReport.missing.all = `the log records more than one process id (${[...pids.keys()].join(', ')})`;
+  } else if (!extras.settled || settledAt < 0) {
+    protocolReport.missing.all = 'the log has no settle marker';
+  } else if (pids.size === 0) {
+    protocolReport.missing.all = "the log records no game process id (the volume, priority or recording line)";
+  } else {
+    const settledS = Number(extras.settled.seconds);
+    protocolReport.settledSeconds = settledS;
+    const perFrame = readPresentMonFrames(presentMonCsvForLog(lines, path), [...pids.keys()][0]);
+    if (!perFrame) {
+      protocolReport.missing.all = 'no PresentMon CSV with frame times and a ProcessID column';
+    } else {
+      const settleMs = settledS * 1000;
+      const st = windowFor(perFrame.frames, settleMs + 80_000, settleMs + 150_000);
+      const wa = windowFor(perFrame.frames, settleMs + 150_000, settleMs + 270_000);
+      if (st.missing) protocolReport.missing.standing = st.missing;
+      else protocolReport.standing = st;
+      if (wa.missing) protocolReport.missing.walking = wa.missing;
+      else protocolReport.walking = wa;
+      if (protocolReport.standing) protocolReport.standing.draws = drawsInWindow(lines, settledAt, 80, 150);
+      if (protocolReport.walking) protocolReport.walking.draws = drawsInWindow(lines, settledAt, 150, 270);
+    }
+  }
+  out.protocol = protocolReport;
+}
+
 // The recording's own numbers. The picture block rides in the JSON as well as the readable page.
 const record = screenRecord(lines);
 const picture = await pictureForRun(record);
@@ -171,6 +291,23 @@ if (!presentmon) {
     `PresentMon: ${presentmon.frames} frames — median ${f(presentmon.medianMs)} ms, p95 ${f(presentmon.p95Ms)} ms, GPU busy median ${f(presentmon.gpuMedianMs)} ms`,
   );
 }
+if (protocol === 'team-270') {
+  console.log('\n## Protocol team-270 (their 270 s test: stand to +150, walk and turn to +270, both after the settle)');
+  if (protocolReport.missing.all) {
+    console.log(`- n/a: ${protocolReport.missing.all}`);
+  } else {
+    const line = (label, w, why) =>
+      w
+        ? `- ${label}: ${w.frames} frames, ${f(w.fps)} fps, median ${f(w.medianMs)} ms, p90 ${f(w.p90Ms)} ms, p99 ${f(w.p99Ms)} ms, ` +
+          `1% low ${f(w.low1Fps)} fps, worst ${f(w.worstMs)} ms, ${w.draws === null ? NA : f(w.draws)} draws/frame, ` +
+          `GPU busy ${w.gpuPct === null ? NA : `${f(w.gpuPct)}%`}`
+        : `- ${label}: n/a (${why ?? 'not measured'})`;
+    console.log(line('standing (+80..+150)', protocolReport.standing, protocolReport.missing.standing));
+    console.log(line('walking (+150..+270)', protocolReport.walking, protocolReport.missing.walking));
+    console.log("- 1% low: 1000 over the mean of the slowest 1% of frames; the windows' clock is within about 1 to 2 s of the settle (PresentMon's start delay plus rounding)");
+    console.log("- frame times and GPU busy: PresentMon, the game's process only; draws: the runtime frame lines after the settle");
+  }
+}
 if (starts.length) {
   console.log(
     `warning: this log holds ${starts.length + 1} runs (${starts.at(-1).reason} at line ${starts.at(-1).index + 1}); this summary covers the last one only`,
@@ -185,6 +322,9 @@ console.log(
   `Range: ${duration === null ? NA : duration + ' s'}; last presented frame: ${out.lastFrame && out.lastFrame.frame !== null ? out.lastFrame.frame : NA}`,
 );
 console.log(`Ending: ${out.ending.text}`);
+// The named set of switches the run started with (run-world.sh --settings); a log from before the flag has no line.
+const settingsLine = lines.map((line) => line.match(/^harness env: settings=(\S+) \((\d+) switches\)\s*$/)).find(Boolean);
+console.log(`Settings: ${settingsLine ? `${settingsLine[1]} (${settingsLine[2]} switches from the file)` : 'not recorded (a run from before --settings)'}`);
 if (out.watchdog) {
   console.log(`watchdog: ${out.watchdog.stalls} stalls, longest ${out.watchdog.longestSeconds} s`);
 }
@@ -258,6 +398,8 @@ if (extras.settled) {
   );
 } else if (extras.settledTimeout) {
   console.log('Scene never settled: the run hit --settled-timeout.');
+} else if (extras.worldTimeout) {
+  console.log('Never reached the world: the run hit --world-timeout.');
 }
 // The picture first (G-017): what the recording shows, stretch by stretch, with the log's figures for the same
 // wall-clock time. A heavy scene that is black can no longer pass as "world reached".
@@ -334,6 +476,11 @@ for (const w of worst) {
 }
 console.log('\n## Pipeline health');
 console.log(`- refused: ${refusedCount}${refusedCount ? ' — ' + refused.slice(0, 8).join('; ') : ''}`);
+// Shaders the translator would not translate: their draws are dropped, so each one is a piece of the picture missing.
+const notTranslated = out.notTranslated ?? { count: 0, byReason: [] };
+console.log(
+  `- shaders that do not translate (their draws are dropped): ${notTranslated.count}${notTranslated.count ? ' — ' + notTranslated.byReason.map(([reason, n]) => `${n} ${reason}`).join('; ') : ''}`,
+);
 console.log(
   `- translated this run: ${translated.total}${Object.keys(translated.byStage).length ? ' (' + Object.entries(translated.byStage).map(([k, v]) => `${k} ${v}`).join(', ') + ')' : ''}`,
 );
@@ -450,3 +597,50 @@ if (failures.length) {
   for (const x of failures) console.log(`- ${x}${x.length >= 300 ? '…' : ''}`);
 }
 if (withheldLines) console.log(`\n- ${withheldText(withheldLines)}`);
+
+// Their results template (their AGENTS.md, "Performance results template"), filled from this log; a field with no
+// source prints n/a. The two windows are the protocol's, from the same source as the section above.
+if (protocol === 'team-270') {
+  const build = lines.map((line) => line.match(/^harness build: (.+)$/)).find(Boolean)?.[1] ?? NA;
+  const consoleName = build.match(/console=(\S+)/)?.[1] ?? NA;
+  const switches =
+    lines
+      .filter((line) => /^harness env: VICTORY_/.test(line))
+      .map((line) => line.replace(/^harness env: /, ''))
+      .join(', ') || 'none';
+  const st = protocolReport?.standing ?? null;
+  const wa = protocolReport?.walking ?? null;
+  const row = (name, pick) =>
+    `${name.padEnd(20)}${(st ? pick(st) : NA).padEnd(24)}${wa ? pick(wa) : NA}`;
+  console.log('\n## Their results template');
+  console.log(`Test PC:            n/a (the harness does not know this machine's handle)`);
+  console.log(`Build:              ${build}`);
+  console.log(`Launch command:     n/a`);
+  console.log(`VIctory arguments:  n/a`);
+  console.log(`Switches:           ${switches}`);
+  console.log(`Settings:           ${consoleName} (render: n/a)`);
+  const routeLine = lines.map((line) => line.match(/^harness env: route=(\S+)\s*$/)).find(Boolean);
+  console.log(`Scene:              ${routeLine ? `route ${routeLine[1]}` : NA}`);
+  console.log(`Run length:         ${duration === null ? NA : duration} s`);
+  console.log(`${''.padEnd(20)}${'Standing (80-150 s)'.padEnd(24)}Walking (150-270 s)`);
+  console.log(row('FPS (average):', (w) => f(w.fps)));
+  console.log(row('Frame time median:', (w) => f(w.medianMs)));
+  console.log(row('Frame time p90:', (w) => f(w.p90Ms)));
+  console.log(row('Frame time p99:', (w) => f(w.p99Ms)));
+  console.log(row('1% low FPS:', (w) => f(w.low1Fps)));
+  console.log(row('Worst frame:', (w) => f(w.worstMs)));
+  console.log(row('Draws per frame:', (w) => (w.draws === null ? NA : f(w.draws))));
+  console.log(row('Draws per second:', (w) => (w.draws === null ? NA : f(w.draws * w.fps, 0))));
+  console.log(row('GPU busy:', (w) => (w.gpuPct === null ? NA : `${f(w.gpuPct)}%`)));
+  console.log(`CPU (busiest thread): ${NA}`);
+  const ramText = peaks.ramMb === null ? NA : `${peaks.ramMb} MB`;
+  const vramText = peaks.vramMb === null ? NA : `${peaks.vramMb} MB`;
+  console.log(`Peak RAM (private): ${ramText}  Peak VRAM: ${vramText}  (this process, sampled about every 5 s, diagnostics builds only)`);
+  console.log(`Shader/pipeline stutters:  ${NA}`);
+  console.log(`Textures:           ${NA} (see the picture block above)`);
+  console.log(`Trees / far objects: ${NA}`);
+  console.log(`Shadows / light:    ${NA}`);
+  console.log(`Crashes / hangs:    ${out.ending.text}`);
+  console.log(`Compared with:      ${NA}`);
+  console.log(`Notes:              windows are PresentMon frames, +80..+150 and +150..+270 s after the settle`);
+}

@@ -18,7 +18,7 @@ function tempDir(t) {
 
 // A harness run needs an executable and a folder outside every work tree; the shell itself stands in for the game
 // binary, and --print-env stops the script before anything is started.
-function printEnv(t, args, extraEnv = {}) {
+function printEnvResult(t, args, extraEnv = {}) {
   const dir = tempDir(t);
   const bash = spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' }).stdout.trim();
   fs.writeFileSync(path.join(dir, 'victory.toml'), '');
@@ -33,6 +33,11 @@ function printEnv(t, args, extraEnv = {}) {
       ...extraEnv,
     }),
   });
+  return result;
+}
+
+function printEnv(t, args, extraEnv = {}) {
+  const result = printEnvResult(t, args, extraEnv);
   assert.equal(result.status, 0, result.stderr);
   return new Set(result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
 }
@@ -52,6 +57,148 @@ test('--dump-targets sets the unsafe flag beside the targets and keeps the frame
 test('without --dump-targets neither dump variable is passed', (t) => {
   const env = printEnv(t, ['--frames', '2400,2600']);
   for (const line of env) assert.doesNotMatch(line, /^VICTORY_DUMP_/);
+});
+
+// --settings: every run starts with a named set of switches, so none is measured at bare defaults by accident.
+const settingsSwitches = (name) =>
+  fs
+    .readFileSync(path.join(here, 'settings', `${name}.env`), 'utf8')
+    .split(/\r?\n/)
+    .filter((line) => /^VICTORY_[A-Z0-9_]+=/.test(line));
+
+test("a run starts with the base build's settings by default, every switch of the file in its env", (t) => {
+  const env = printEnv(t, []);
+  const switches = settingsSwitches('noone');
+  assert.equal(switches.length > 0, true);
+  assert.equal(env.has(`harness env: settings=noone (${switches.length} switches)`), true);
+  for (const line of switches) assert.equal(env.has(line), true, line);
+});
+
+test('--settings none applies no switch from a file', (t) => {
+  const env = printEnv(t, ['--settings', 'none']);
+  assert.equal(env.has('harness env: settings=none (0 switches)'), true);
+  for (const line of settingsSwitches('noone')) assert.equal(env.has(line), false, line);
+});
+
+test('a switch given on the command line wins over the settings file', (t) => {
+  const env = printEnv(t, [], { VICTORY_CARD_STEPS: '0' });
+  const switches = settingsSwitches('noone');
+  assert.equal(env.has('VICTORY_CARD_STEPS=2'), false, 'the file must not override the command line');
+  assert.equal(env.has(`harness env: settings=noone (${switches.length - 1} switches)`), true);
+});
+
+test('--settings refuses a set with no file, and a name that is not a plain word', (t) => {
+  for (const name of ['nosuch', '../noone', 'noone.env']) {
+    const result = printEnvResult(t, ['--settings', name]);
+    assert.equal(result.status, 2, name);
+    assert.match(result.stderr + result.stdout, /--settings:/);
+  }
+});
+
+// --menu-file: the F1 menu's saved choices, applied the way the build's own launcher applies them. The harness
+// starts `run`, which hands the menu no file and applies none, so without the option the menu could not save.
+function menuFile(t, lines) {
+  const file = path.join(tempDir(t), 'victory-settings.txt').replace(/\\/g, '/');
+  fs.writeFileSync(file, ['# Saved by the F1 menu', ...lines, ''].join('\r\n'));
+  return file;
+}
+const named = (env, name) => [...env].filter((line) => line.startsWith(`${name}=`));
+
+test('a menu file goes over the settings set: a value replaces, an empty value leaves the switch out', (t) => {
+  const set = settingsSwitches('noone');
+  assert.equal(set.some((line) => line.startsWith('VICTORY_AMBIENT=')), true, 'the set has the switch this unsets');
+  const file = menuFile(t, [
+    'VICTORY_RT_RESOLVE=1',
+    'VICTORY_ACTIVATE_RAYS=1',
+    'VICTORY_AMBIENT=',
+    'VICTORY_MENU_DLSS=quality',
+    'VICTORY_MENU_FRAMEGEN=2',
+  ]);
+  const env = printEnv(t, ['--menu-file', file]);
+  assert.equal(env.has('VICTORY_RT_RESOLVE=1'), true);
+  assert.equal(env.has('VICTORY_ACTIVATE_RAYS=1'), true);
+  assert.deepEqual(named(env, 'VICTORY_AMBIENT'), [], 'left out, as the menu saved it');
+  assert.equal(env.has('harness env: menu-file=victory-settings.txt (3 values)'), true);
+  assert.equal(env.has(`harness env: settings=noone (${set.length - 1} switches)`), true);
+  // The menu is handed its file, and is told what the run really has: DLSS and frame generation are not applied.
+  assert.deepEqual(named(env, 'VICTORY_MENU_FILE'), [`VICTORY_MENU_FILE=${file}`]);
+  assert.equal(env.has('VICTORY_MENU_DLSS=off'), true);
+  assert.equal(env.has('VICTORY_MENU_FRAMEGEN=0'), true);
+  assert.deepEqual(named(env, 'VICTORY_DLSS'), []);
+});
+
+test("the menu's launcher choices become the switches the build's own launcher makes of them", (t) => {
+  const env = printEnv(t, ['--menu-file', menuFile(t, ['VICTORY_MENU_RES=1440', 'VICTORY_MENU_FPS=60'])]);
+  assert.equal(env.has('VICTORY_NATIVE_1440P=1'), true);
+  assert.deepEqual(named(env, 'VICTORY_FRAME_INTERVAL_US'), ['VICTORY_FRAME_INTERVAL_US=16667'], "over the set's");
+  assert.equal(env.has('VICTORY_MENU_RES=1440'), true);
+  assert.equal(env.has('VICTORY_MENU_FPS=60'), true);
+
+  const stretched = printEnv(t, ['--menu-file', menuFile(t, ['VICTORY_MENU_RES=1080to1440'])]);
+  assert.equal(stretched.has('VICTORY_RENDER_1080P=1'), true);
+  assert.equal(stretched.has('VICTORY_MENU_RES=1080to1440'), true);
+});
+
+test('a menu file that does not exist yet still lets the menu save, and shows the stock picture', (t) => {
+  const file = path.join(tempDir(t), 'not-yet.txt').replace(/\\/g, '/');
+  const env = printEnv(t, ['--menu-file', file]);
+  assert.deepEqual(named(env, 'VICTORY_MENU_FILE'), [`VICTORY_MENU_FILE=${file}`]);
+  assert.equal(env.has('VICTORY_MENU_RES=4k'), true);
+  assert.equal(env.has('VICTORY_MENU_FPS=1000'), true);
+  assert.equal(env.has('VICTORY_MENU_CONSOLE=series-x'), true);
+  assert.equal(env.has('harness env: menu-file=not-yet.txt (0 values)'), true);
+});
+
+test('the command line and --console win over the menu file', (t) => {
+  const file = menuFile(t, ['VICTORY_RT_RESOLVE=1', 'VICTORY_MENU_CONSOLE=series-s', 'VICTORY_MENU_RES=1440']);
+  const menu = printEnv(t, ['--menu-file', file]);
+  assert.equal(menu.has('VICTORY_MENU_CONSOLE=series-s'), true, "the menu's console when none is given");
+  assert.deepEqual(named(menu, 'VICTORY_NATIVE_1440P'), [], 'no 1440p switch on the smaller console, as in the launcher');
+  const given = printEnv(t, ['--menu-file', file, '--console', 'series-x'], { VICTORY_RT_RESOLVE: '0' });
+  assert.equal(given.has('VICTORY_MENU_CONSOLE=series-x'), true);
+  assert.deepEqual(named(given, 'VICTORY_RT_RESOLVE'), [], 'the menu must not override the command line');
+  assert.equal(given.has('VICTORY_NATIVE_1440P=1'), true);
+});
+
+test('without --menu-file nothing about the menu is passed', (t) => {
+  for (const line of printEnv(t, [])) assert.doesNotMatch(line, /^VICTORY_MENU_|menu-file/);
+});
+
+// --boot-video: the loading cover, a video over the screen from the start until the world is on it.
+test('--boot-video names its file in the env header, and --boot-volume the level the game is heard at meanwhile', (t) => {
+  const video = path.join(tempDir(t), 'boot.mp4').replace(/\\/g, '/');
+  fs.writeFileSync(video, '');
+  const env = printEnv(t, ['--boot-video', video]);
+  assert.equal(env.has('harness env: boot-video=boot.mp4'), true);
+  const heard = printEnv(t, ['--boot-video', video, '--boot-volume', '30']);
+  assert.equal(heard.has('harness env: boot-video=boot.mp4 (the game at 30 while it shows)'), true);
+  for (const line of printEnv(t, [])) assert.doesNotMatch(line, /boot-video/);
+});
+
+test('--boot-video refuses a file that is not there; --boot-volume refuses to stand alone or to be a word', (t) => {
+  const video = path.join(tempDir(t), 'boot.mp4').replace(/\\/g, '/');
+  fs.writeFileSync(video, '');
+  for (const args of [
+    ['--boot-video', `${video}.missing`],
+    ['--boot-volume', '30'],
+    ['--boot-video', video, '--boot-volume', 'loud'],
+  ]) {
+    const result = printEnvResult(t, args);
+    assert.equal(result.status, 2, args.join(' '));
+    assert.match(result.stderr + result.stdout, /--boot-(video|volume)/);
+  }
+});
+
+test('the loading cover starts before the game, is watched from the log, and ends with the run', () => {
+  const text = fs.readFileSync(script, 'utf8');
+  const player = text.indexOf('ffplay -loglevel quiet -an -loop 0 -fs -alwaysontop');
+  const watcher = text.indexOf('node "$TOOLS/boot-cover.mjs" watch "$LOG" "$COVER_PID"');
+  const game = text.indexOf('"$BIN" run "$GAME_EXE" --execute --console "$CONSOLE") \\');
+  assert.ok(player > 0 && watcher > player, 'the player, then its watcher');
+  assert.ok(game > watcher, 'both before the game starts, so its window opens under the cover');
+  assert.match(text, / -an /, "the video's own sound is never played");
+  assert.match(text, /trap 'cover_end; pipeline_library_leave' EXIT/, 'the player never outlives the run');
+  assert.ok(text.indexOf('\ncover_end\n', game) > game, 'and it is ended when the game ends');
 });
 
 test('a timed run defaults the watchdog to ending, an open session to warn', (t) => {
@@ -163,6 +310,18 @@ test('game output goes to the log only; the terminal goes through the public fil
   assert.match(text, /capture: \$\(harness_public_path "\$CAPTURE"\)/);
 });
 
+test("the warm-up gets the settings set's switches and uses the build's own translate command", () => {
+  const text = fs.readFileSync(script, 'utf8');
+  const warm = text.indexOf('if [ "$WARM" = 1 ]; then');
+  const settingsToWarm = text.indexOf('WARM_ENV+=(${SETTINGS_PAIRS[@]+"${SETTINGS_PAIRS[@]}"})');
+  const run = text.indexOf('"$BIN" "$WARM_CMD"');
+  assert.ok(text.includes('SETTINGS_PAIRS+=("$PAIR")'), 'each switch taken from the file is kept for the warm-up');
+  assert.ok(settingsToWarm > warm, 'the warm-up environment carries them');
+  assert.ok(run > settingsToWarm, 'and the command runs with that environment');
+  assert.match(text, /"\$BIN" shaders --help >\/dev\/null 2>&1 && WARM_CMD=shaders/, 'shaders where the build has it');
+  assert.doesNotMatch(text, /"\$BIN" warm \$\{WARM_ARGS/, 'never the fixed warm command');
+});
+
 test('the warm-up exit code and seconds are written to the run log, not only the terminal', () => {
   const text = fs.readFileSync(script, 'utf8');
   assert.match(text, /WARM_LINE="warm-up: exit=\$WARM_RC after /);
@@ -199,7 +358,11 @@ test('--quiet-wait sets the wait ceiling, 600 seconds by default', () => {
   assert.match(text, /--quiet-wait needs a whole number/);
   assert.match(text, /\[--quiet-wait N\]/);
   assert.match(text, /load-line\.mjs" wait --quiet-wait "\$QUIET_WAIT"/);
-  assert.match(text, /grep '\^harness: waiting for quiet:' \| public_line/);
+  // Each waiting line is said as it comes, through the public filter: a wait that prints only when it returns
+  // looks like a hang (a run waited 20 minutes in silence on 2026-11-28).
+  assert.match(text, /wait --quiet-wait "\$QUIET_WAIT" 2>>"\$LOG" \| while IFS= read -r line; do/);
+  assert.match(text, /'harness: waiting for quiet:'\*\)\s+printf '%s\\n' "\$line" \| public_line >&3/);
+  assert.match(text, /exit "\$\{PIPESTATUS\[0\]\}"/, "the wait's own exit code is kept");
 });
 
 test('--require-quiet samples before the warm-up and again on the start load', () => {
@@ -394,4 +557,46 @@ test('PresentMon runs by default when configured; --no-presentmon turns it off a
   assert.match(header(off), /presentmon: 0$/, '--no-presentmon turns it off');
   assert.equal([...off].some((line) => line.startsWith('PresentMon: not configured')), false);
   assert.match(header(printEnv(t, [], { PRESENTMON_EXE: '' })), /presentmon: 0$/, 'unconfigured is off');
+});
+
+test('--world-timeout is passed through and printed as an environment line', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'run-world-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bash = spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' }).stdout.trim();
+  fs.writeFileSync(path.join(dir, 'victory.toml'), '');
+  const result = spawnSync('bash', [script, '--world-timeout', '300', '--print-env'], {
+    encoding: 'utf8',
+    env: isolatedEnv({
+      VICTORY_BIN: bash,
+      VICTORY_DIR: dir,
+      VICTORY_CONFIG: path.join(dir, 'victory.toml'),
+      GAME_EXE: path.join(dir, 'game.exe'),
+      VICTORY_CAPTURES: path.join(dir, 'captures'),
+    }),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /harness env: world-timeout=300/);
+});
+
+// The key routes follow places in the title, so the public tree does not carry them: there these two tests skip, and
+// say so. The routes' own handling is tested above with a route the test writes (HARNESS_ROUTES_DIR).
+const NO_ROUTES = fs.existsSync(path.join(here, 'routes')) ? false : 'the key routes are not part of this tree';
+
+test('--protocol team-270 sets the route and the settled window, and prints them', { skip: NO_ROUTES }, (t) => {
+  const env = printEnv(t, ['--protocol', 'team-270']);
+  assert.ok(env.has('harness env: protocol=team-270'), [...env].join('\n'));
+  assert.ok(env.has('harness env: route=team-270'));
+  assert.ok(env.has('harness env: settled-seconds=275'));
+  // The route's entries reach the run through VICTORY_KEYS: the walk phase's first held key is in the list.
+  const keys = [...env].find((line) => line.startsWith('VICTORY_KEYS='));
+  assert.ok(keys, [...env].join('\n'));
+  assert.ok(keys.includes('+150:W:3'), keys);
+});
+
+test('--print-env without --protocol is unchanged by it: no protocol, route or settled lines', { skip: NO_ROUTES }, (t) => {
+  const env = printEnv(t, ['--route', 'manual-1']);
+  assert.ok([...env].some((line) => line.startsWith('VICTORY_KEYS=')), 'the route still reaches the run');
+  assert.ok(![...env].some((line) => line.startsWith('harness env: protocol=')), [...env].join('\n'));
+  assert.ok(![...env].some((line) => line.startsWith('harness env: route=')));
+  assert.ok(![...env].some((line) => line.startsWith('harness env: settled-seconds=')));
 });

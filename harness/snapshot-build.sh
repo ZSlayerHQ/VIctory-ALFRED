@@ -203,6 +203,20 @@ case "$ACTION" in
       COPIED+=(victory.pdb)
     fi
 
+    # The settings menu's art (our own, kept in this outer repository: the runtime's asset policy takes no binary
+    # art) goes beside the exe as menu-art/, where the menu looks for it. A build that does not read it loses
+    # nothing, and without the folder the menu draws its plain letters.
+    ART="$HERE/../scripts/overlay-art/assets"
+    if [ -f "$ART/panel.qoi" ]; then
+      mkdir -p "$DEST/menu-art" || die "cannot create $DEST/menu-art"
+      for art in panel.qoi font-row.qoi font-small.qoi layout.json; do
+        if [ -f "$ART/$art" ]; then
+          cp -f "$ART/$art" "$DEST/menu-art/$art" || die "cannot copy menu-art/$art"
+        fi
+      done
+      COPIED+=(menu-art/)
+    fi
+
     {
       printf 'commit: %s\n' "$FULL"
       printf 'branch: %s\n' "$BRANCH"

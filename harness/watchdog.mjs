@@ -53,6 +53,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { endSelected } from './end-run.mjs';
+
 import {
   FRAME_RE,
   HARNESS_DISK_RE,
@@ -594,18 +596,16 @@ export function watch(logPath, options = {}) {
       append(noCounterMarker(status));
     };
 
+    // A fresh selection at the moment of the kill, never the cached ids (end-run.mjs says why).
     const killThisRun = () => {
-      let alive = (pids || []).filter(isAlive);
-      if (!alive.length) {
-        refreshPids();
-        alive = (pids || []).filter(isAlive);
-      }
-      if (!alive.length) {
-        if (pids !== null) stop(0); // Already gone: it ended by itself.
+      lastSelection = Date.now();
+      const result = endSelected(() => selectionPids(psFile), endPid);
+      if (result.fresh) pids = result.fresh;
+      if (result.outcome === 'gone') {
+        stop(0); // Already gone: it ended by itself.
         return false;
       }
-      const ended = alive.filter(endPid);
-      return ended.length > 0;
+      return result.outcome === 'ended';
     };
 
     const writeTail = () => {
@@ -663,6 +663,15 @@ export function watch(logPath, options = {}) {
       }
       if (status.status === 'ok') warnedKind = null;
       if (status.status === 'stalled') {
+        // A counter that stopped because the game is gone is no frozen run: when a fresh selection finds no game, the
+        // run ended by itself, and the watchdog stops without a stall line (which the summary would read as its ending).
+        if (!warn && !announced) {
+          const fresh = selectionPids(psFile);
+          if (fresh !== null && !fresh.length) {
+            stop(0);
+            return;
+          }
+        }
         if (!announced) {
           announced = true;
           append(evidenceMarker(status));

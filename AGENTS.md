@@ -1,6 +1,6 @@
 # Working on this project with an agent
 
-zslayer-pc-port-tools coordinates work on the project's runtime, a fork of VIctory (GPL-3.0-or-later), an
+This repository coordinates work on the project's runtime, a descendant of VIctory (GPL-3.0-or-later), an
 open-source runtime that runs a console title's own code on a Windows PC and translates its GPU programs for
 Direct3D 12. Every contributor
 brings their own copy of the title; nothing from the game is stored here. Work happens in the open: issues are the

@@ -24,52 +24,6 @@ pub(crate) struct SigElement {
     pub half: bool,
 }
 
-/// Gives the elements sharing a signature register one interpolation mode
-/// where that changes no element the program uses: DXIL refuses a register
-/// whose elements differ ("has interpolation mode that differs from
-/// another element packed into the same row"). The console packs elements
-/// its source declared alike; here each element's mode is chosen on its
-/// own (by type, or by how the program reads it), so an element the
-/// program does not use can keep a default its register-mates do not
-/// share.
-///
-/// An unused element takes the mode of the used ones when those agree,
-/// and with none used a constant member makes the register constant (a
-/// float may be declared constant; an integer may be nothing else, so a
-/// register whose used mode is not constant and that holds an unused
-/// integer is left). A register whose used elements disagree is left for
-/// the validator to name: that needs its elements moved apart.
-pub(crate) fn unify_row_modes(elements: &mut [SigElement]) {
-    let rows: std::collections::BTreeSet<u32> = elements
-        .iter()
-        .filter(|e| e.interp != 0)
-        .filter_map(|e| e.row)
-        .collect();
-    for row in rows {
-        let member = |e: &SigElement| e.interp != 0 && e.row == Some(row);
-        let used: std::collections::BTreeSet<u8> = elements
-            .iter()
-            .filter(|e| member(e) && e.usage != 0)
-            .map(|e| e.interp)
-            .collect();
-        let mut unused = elements.iter().filter(|e| member(e) && e.usage == 0);
-        let target = match used.len() {
-            0 if unused.clone().any(|e| e.interp == CONSTANT) => CONSTANT,
-            1 => used.first().copied().unwrap_or(CONSTANT),
-            _ => continue,
-        };
-        if target != CONSTANT && unused.any(|e| e.comp != 9) {
-            continue;
-        }
-        for e in elements.iter_mut().filter(|e| member(e) && e.usage == 0) {
-            e.interp = target;
-        }
-    }
-}
-
-/// DXIL's constant interpolation mode.
-const CONSTANT: u8 = 1;
-
 impl SigElement {
     fn system_value(&self) -> u32 {
         match self.kind {
@@ -118,16 +72,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register and, within a register, by the offset of
-    // their name (so in element order there), unallocated last. Sorting a
-    // register's elements by column instead fails ("Container part ... does
-    // not match expected") wherever the console lists an element before one
-    // in an earlier column of its row (the made-up signature of
-    // `signature_order_tests`' `a_register_listed_with_its_later_column_first_validates`:
-    // COLOR5 in w before NORMAL0 in xyz of one row, and this module's
-    // `signature_rows_go_by_register_then_element_order`); keeping element
-    // order across registers fails wherever a later row is listed first
-    // (`registers_listed_with_the_later_one_first_validate` there).
+    // the rows sorted by register (unallocated last), then name offset.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -424,21 +369,40 @@ pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
 
 fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
     const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
-    let x: Vec<u32> = block
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| u32::from_le_bytes(*c))
-        .collect();
+    const K: [u32; 64] = [
+        0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee,
+        0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501,
+        0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be,
+        0x6b90_1122, 0xfd98_7193, 0xa679_438e, 0x49b4_0821,
+        0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa,
+        0xd62f_105d, 0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8,
+        0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed,
+        0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a,
+        0xfffa_3942, 0x8771_f681, 0x6d9d_6122, 0xfde5_380c,
+        0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70,
+        0x289b_7ec6, 0xeaa1_27fa, 0xd4ef_3085, 0x0488_1d05,
+        0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665,
+        0xf429_2244, 0x432a_ff97, 0xab94_23a7, 0xfc93_a039,
+        0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1,
+        0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1,
+        0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391,
+    ];
+    let x: [u32; 16] = std::array::from_fn(|i| {
+        u32::from_le_bytes([
+            block[4 * i],
+            block[4 * i + 1],
+            block[4 * i + 2],
+            block[4 * i + 3],
+        ])
+    });
     let [mut a, mut b, mut c, mut d] = *state;
-    for i in 0..64 {
+    for (i, &k) in K.iter().enumerate() {
         let (f, g) = match i / 16 {
             0 => ((b & c) | (!b & d), i),
             1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
             2 => (b ^ c ^ d, (3 * i + 5) % 16),
             _ => (c ^ (b | !d), (7 * i) % 16),
         };
-        let k = ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32;
         let rotated = a
             .wrapping_add(f)
             .wrapping_add(k)
@@ -455,129 +419,58 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 mod tests {
     use super::*;
 
-    /// An element of an arbitrary semantic (the front face for kind 13).
-    fn member(kind: u8, comp: u8, interp: u8, row: u32, col: u8, cols: u8, usage: u8) -> SigElement {
-        SigElement {
-            name: if kind == 13 { "SV_IsFrontFace" } else { "TEXCOORD" }.into(),
-            index: u32::from(col),
-            kind,
-            comp,
-            interp,
-            row: Some(row),
-            col,
-            cols,
-            usage,
-            half: false,
-        }
-    }
-
-    fn modes(sig: &[SigElement]) -> Vec<u8> {
-        sig.iter().map(|e| e.interp).collect()
-    }
-
-    /// A made-up signature: a float the program does not read shares row 4
-    /// with the constant front face, read or not.
     #[test]
-    fn an_unread_element_takes_its_row_mates_mode() {
-        for front_face_read in [0, 1] {
-            let mut sig = vec![
-                member(0, 9, 2, 2, 0, 4, 0xf),
-                member(0, 9, 2, 4, 0, 1, 0),
-                member(13, 5, 1, 4, 1, 1, front_face_read),
-            ];
-            unify_row_modes(&mut sig);
-            assert_eq!(modes(&sig), [2, 1, 1]);
-        }
-        // Beside floats read per sample, an unread float is per sample too.
-        let mut sig = vec![member(0, 9, 6, 3, 0, 2, 0b11), member(0, 9, 2, 3, 2, 2, 0)];
-        unify_row_modes(&mut sig);
-        assert_eq!(modes(&sig), [6, 6]);
-    }
-
-    /// What the program uses is never redeclared: elements used two ways in
-    /// one row keep their modes, and so does an unused one beside them.
-    #[test]
-    fn used_elements_that_disagree_keep_their_modes() {
-        let mut sig = vec![
-            member(0, 9, 2, 3, 0, 2, 0b11),
-            member(0, 9, 1, 3, 2, 1, 1),
-            member(0, 9, 2, 3, 3, 1, 0),
-        ];
-        unify_row_modes(&mut sig);
-        assert_eq!(modes(&sig), [2, 1, 2]);
-    }
-
-    /// An integer cannot be interpolated: unused beside a used linear
-    /// float it stays constant, and the row is left as it was.
-    #[test]
-    fn an_unused_integer_is_not_given_an_interpolated_mode() {
-        let mut sig = vec![member(0, 9, 2, 3, 0, 2, 0b11), member(0, 5, 1, 3, 2, 1, 0)];
-        unify_row_modes(&mut sig);
-        assert_eq!(modes(&sig), [2, 1]);
-    }
-
-    /// Over every row of two or three elements with modes none, constant,
-    /// linear and per sample, floats and integers, used and not: no used
-    /// element changes, and no integer gets an interpolated mode.
-    #[test]
-    fn row_modes_change_only_on_unused_elements() {
-        let choices: Vec<(u8, u8, u8)> = [0u8, 1, 2, 6]
-            .into_iter()
-            .flat_map(|m| [(m, 9u8, 0u8), (m, 9, 1), (m, 5, 0), (m, 5, 1)])
-            // (an integer is declared constant or nothing to begin with)
-            .filter(|&(m, comp, _)| comp == 9 || m <= 1)
-            .collect();
-        let element = |col: u8, (interp, comp, usage): (u8, u8, u8)| {
-            member(0, comp, interp, 5, col, 1, usage)
-        };
-        for &a in &choices {
-            for &b in &choices {
-                for c in choices.iter().map(|&c| Some(c)).chain([None]) {
-                    let mut sig = vec![element(0, a), element(1, b)];
-                    sig.extend(c.map(|c| element(2, c)));
-                    let before = sig.clone();
-                    unify_row_modes(&mut sig);
-                    for (was, is) in before.iter().zip(&sig) {
-                        assert!(was.usage == 0 || was.interp == is.interp, "{before:?}");
-                        assert!(is.comp == 9 || is.interp <= 1, "{before:?}");
-                        assert_eq!(was.interp == 0, is.interp == 0, "{before:?}");
-                    }
-                }
-            }
-        }
-    }
-
-    /// A made-up signature that lists COLOR5 (row 6, w) before NORMAL0
-    /// (row 6, xyz); the part keeps that order within the register, as the
-    /// validator's own serialisation does, and puts an earlier register
-    /// listed after them first.
-    #[test]
-    fn signature_rows_go_by_register_then_element_order() {
-        let element = |name: &str, index, row, col, cols| SigElement {
-            name: name.into(),
-            index,
+    fn packed_vertex_outputs_preserve_name_order_and_declared_interpolation() {
+        let integer = SigElement {
+            name: "TEXCOORD".into(),
+            index: 1,
             kind: 0,
-            comp: 9,
-            interp: 2,
-            row: Some(row),
-            col,
-            cols,
-            usage: (1 << cols) - 1,
+            comp: 5,
+            interp: 1,
+            row: Some(0),
+            col: 2,
+            cols: 2,
+            usage: 3,
             half: false,
         };
-        let sig = [
-            element("COLOR", 5, 6, 3, 1),
-            element("NORMAL", 0, 6, 0, 3),
-            element("TEXCOORD", 2, 3, 0, 4),
-        ];
-        let part = signature(&sig, true);
-        let index = |i: usize| u32::from_le_bytes(part[8 + 32 * i + 8..][..4].try_into().unwrap());
-        let mask = |i: usize| part[8 + 32 * i + 24];
-        assert_eq!(
-            [(index(0), mask(0)), (index(1), mask(1)), (index(2), mask(2))],
-            [(2, 0b1111), (5, 0b1000), (0, 0b0111)],
-            "semantic index and mask of each row"
-        );
+        let flat_float = SigElement {
+            name: "COLOR".into(),
+            index: 0,
+            comp: 9,
+            col: 0,
+            ..integer.clone()
+        };
+        let smooth_float = SigElement {
+            index: 2,
+            row: Some(1),
+            interp: 2,
+            comp: 9,
+            ..integer.clone()
+        };
+        let outputs = [integer, flat_float, smooth_float];
+        let mut recovered = super::super::signature(&signature(&outputs, false)).unwrap();
+        // DXC orders the row by semantic-name offset even though TEXCOORD
+        // occupies z/w and COLOR occupies x/y.
+        assert_eq!(recovered[0].name, "TEXCOORD");
+        assert_eq!(recovered[1].name, "COLOR");
+        // PSV records can be in a different order again.
+        let psv = psv(&Psv {
+            stage: 1,
+            flag: false,
+            inputs: &[],
+            outputs: &[outputs[2].clone(), outputs[1].clone(), outputs[0].clone()],
+            prims: &[],
+            mesh: None,
+            geometry: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        recovered[1].interp = 2;
+        super::super::vertex_output_interpolation(&psv, &mut recovered).unwrap();
+        assert_eq!(recovered.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1, 2]);
+        assert!(super::super::vertex_output_interpolation(&psv[..psv.len() - 1], &mut recovered)
+            .is_err());
     }
 
     #[test]

@@ -11,11 +11,14 @@
 #[cfg(windows)]
 pub mod apu;
 pub mod audio;
+pub mod bink;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
+#[cfg(windows)]
+pub mod fidelityfx;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
@@ -25,13 +28,10 @@ pub mod lifecycle;
 #[cfg(windows)]
 pub mod media;
 #[cfg(windows)]
-pub mod memory;
-#[cfg(windows)]
 pub mod net;
+pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
-#[cfg(windows)]
-pub mod thread;
 pub mod xasync;
 pub mod xg;
 pub mod xgame;
@@ -63,8 +63,6 @@ pub(crate) fn all() -> Vec<HleModule> {
     #[cfg(windows)]
     all.push(media::module());
     #[cfg(windows)]
-    all.push(memory::module());
-    #[cfg(windows)]
     all.push(dstorage::module());
     #[cfg(windows)]
     all.push(files::module());
@@ -72,11 +70,10 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(lifecycle::module());
     #[cfg(windows)]
     all.push(net::module());
+    all.push(rpcrt4::module());
     #[cfg(windows)]
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
-    #[cfg(windows)]
-    all.push(thread::module());
     all
 }

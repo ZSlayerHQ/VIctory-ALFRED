@@ -782,3 +782,18 @@ test('the watcher uses the hold timer’s selection and end route, not a new one
   assert.match(settled, /spawnSync\(\s*'taskkill', \['\/F', '\/PID'/);
   assert.match(settled, /'-File', psFile, '-Pids', '-Strict'/);
 });
+
+// A game that ends by itself leaves its process id free, and Windows gives it out again within seconds. The stand-in
+// here plays the program that got the id: alive, but no longer in the run's selection. The watcher must end only what
+// a fresh selection returns at the moment of the kill (end-run.mjs), never the id it saw earlier.
+test('a stall after the game has left the selection ends nothing, even while its old process id is alive', async (t) => {
+  const { dir, child, psStub, clock } = watchdogScene(t);
+  const { log, stats } = fakeRun(clock, dir);
+  const watching = outcome(watch(log, { stallSeconds: 1, pollMs: 100, statsFile: stats, psFile: psStub, clock }));
+  assert.equal(await advanceUntil(clock, () => fs.existsSync(path.join(dir, 'selected.txt'))), true, 'the watcher saw the game');
+  fs.writeFileSync(path.join(dir, 'game.pid'), ''); // the game is gone from the selection; its id lives on
+  assert.equal(await advanceUntil(clock, () => watching.done), true, 'the watcher ended within 30 s of its clock');
+  assert.equal(watching.value, 0);
+  assert.equal(alive(child.pid), true, 'the process holding the old id was not ended');
+  assert.ok(!fs.readFileSync(log, 'utf8').includes('ending the run'), 'no run was ended');
+});

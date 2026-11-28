@@ -58,8 +58,8 @@ const CASES: &[(&str, &str)] = &[
             return r;
         }"#,
     ),
-    // A wave-wide range scalarises a per-pixel loop (as light lists may):
-    // the console's 64-lane sections become host wave operations;
+    // A wave-wide range scalarises a per-pixel loop (as the title's light
+    // lists do): the console's 64-lane sections become host wave operations;
     // the result is the same for any wave the pixel lands in.
     (
         "wave range",
@@ -141,7 +141,8 @@ const CASES: &[(&str, &str)] = &[
         }"#,
     ),
     // 16-bit outputs and inputs (one value per dword with the 2020
-    // compiler; two per dword cannot be compiled here) and the front face.
+    // compiler; the title's two per dword cannot be compiled
+    // here) and the front face.
     (
         "16-bit varyings and front face",
         r#"struct V16 { float4 pos : SV_Position; half2 uv : TEXCOORD0; float4 col : COLOR0; half4 h : TEXCOORD1; };
@@ -353,8 +354,8 @@ const CS_CASES: &[(&str, &str)] = &[
                 uint4(w * 7 + h, l + asuint(r), n * 5 + ns * 3 + st, b + raw.Load(4 * (i & 31))));
         }"#,
     ),
-    // Typed loads (`tbuffer_load_format_*`, vertex fetch) convert by the
-    // format the instruction names: the PC reads the
+    // Typed loads (`tbuffer_load_format_*`, the title's vertex
+    // fetch) convert by the format the instruction names: the PC reads the
     // same bytes through typed views in those formats. Channels past the
     // format's read (0, 0, 0, 1); a byte format at unaligned offsets.
     (
@@ -586,7 +587,7 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             }
         }"#,
     ),
-    // Two waves per group, a size chosen for this test: the
+    // Two waves per group, as the title's mesh programs run: the
     // second wave's lanes are threads 64-127.
     (
         "two waves",
@@ -604,8 +605,8 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             tris[i] = i & 1 ? uint3(c + 1, c + 10, c + 9) : uint3(c, c + 1, c + 9);
         }"#,
     ),
-    // Quad reads (DPP quad permutations on the console; quad swizzles
-    // appear in mesh programs too).
+    // Quad reads (DPP quad permutations on the console; the title's
+    // tessellating mesh programs swizzle within quads too).
     (
         "quad reads",
         1,
@@ -711,24 +712,18 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
     data
 }
 
-/// The lock every GPU test of this crate holds while it uses a device
-/// (`valu_tests::ONE_AT_A_TIME` says why); each test here takes it first.
-fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-    super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
-
 #[test]
 fn translated_shaders_draw_as_pc_ones() {
-    let _one = one_at_a_time();
     let Some((console, pc)) = tools() else {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -878,14 +873,16 @@ fn translated_shaders_draw_as_pc_ones() {
 
 #[test]
 fn translated_mesh_shaders_draw_as_pc_ones() {
-    let _one = one_at_a_time();
     let Some((console, pc)) = tools() else {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-ms-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -995,15 +992,17 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
 /// angles cannot be tried from here.
 #[test]
 fn float_semantics_are_the_consoles() {
-    let _one = one_at_a_time();
     use super::host::{Dispatch, View};
     let Some((console, _)) = tools() else {
         eprintln!("no console compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
     let dir = std::env::temp_dir().join(format!("victory-float-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1085,15 +1084,17 @@ fn close(a: u32, b: u32) -> bool {
 
 #[test]
 fn translated_compute_matches_pc() {
-    let _one = one_at_a_time();
     use super::host::{Dispatch, Stride, View};
     let Some((console, pc)) = tools() else {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-cs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1163,7 +1164,7 @@ fn translated_compute_matches_pc() {
             typed_view(DXGI_FORMAT_R8_UNORM, 1),
             typed_view(DXGI_FORMAT_R16_FLOAT, 2),
             typed_view(DXGI_FORMAT_R8G8B8A8_SNORM, 4),
-            View::Cube(4, &cube_texels),
+            View::Cube(4, 1, &cube_texels),
         ])
         .collect();
     let root_cbv = floats(64, -0.125);
@@ -1227,19 +1228,43 @@ fn translated_compute_matches_pc() {
         let mut root_views: Vec<(u8, bool)> = cs_c.root_cbvs.iter().map(|&s| (s, false)).collect();
         root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
         root_views.sort_unstable();
+        let view_strides: Vec<u32> = views
+            .iter()
+            .map(|v| match *v {
+                View::RawUav(_) => 1,
+                View::HalfUav(_) => 8,
+                View::Buffer { stride, .. } => match stride {
+                    Stride::Raw => 1,
+                    Stride::Typed => 16,
+                    Stride::Structured(s) => s,
+                    Stride::Format(f, bytes) => {
+                        let kind = match f.0 as u32 {
+                            3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => {
+                                super::VIEW_INTEGER
+                            }
+                            4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => {
+                                super::VIEW_INTEGER | super::VIEW_SIGNED
+                            }
+                            _ => 0,
+                        };
+                        bytes | kind
+                    }
+                },
+                _ => 0,
+            })
+            .collect();
         for (n, (slot, srv)) in root_views.into_iter().enumerate() {
-            let data = if srv && slot == super::shader::SLOT_STRIDES && super::d16_integer_views_on() {
-                // The host's slot table, which a d16 typed load reads its
-                // view's kind from with VICTORY_D16_INTEGER_VIEWS=1 only:
-                // without the switch no program here asks for it, and the
-                // assertion below holds for every root view as before.
-                // shortcut: all zeros says every view is a float one, which
-                // is not so for the integer views this harness binds; give
-                // each slot its kind and stride before the switch goes on.
-                vec![0u32; 256]
+            let data = if srv
+                && (slot == super::SLOT_STRIDES || slot == super::SLOT_TABLE_STRIDES)
+            {
+                view_strides.clone()
             } else {
                 assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
-                if srv { root_srv.clone() } else { root_cbv.clone() }
+                if srv {
+                    root_srv.clone()
+                } else {
+                    root_cbv.clone()
+                }
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }

@@ -57,6 +57,27 @@ fn fnv(bytes: &[u8]) -> u64 {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The modules this thread wrote since the last [`take_looped`], each with
+    /// [`Module::barriers_on_cycles`].
+    static LOOPED: RefCell<Vec<(usize, u64, u32)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The barrier calls on a cycle of the control flow in the module whose bitcode the
+/// container `dxil` holds, if this thread wrote it since the last call (which forgets the
+/// others).
+#[cfg(test)]
+pub(crate) fn take_looped(dxil: &[u8]) -> Option<u32> {
+    let written = LOOPED.with(|l| std::mem::take(&mut *l.borrow_mut()));
+    let at = dxil.windows(4).position(|w| w == b"BC\xC0\xDE")?;
+    written
+        .into_iter()
+        .rev()
+        .find(|(len, hash, _)| dxil.get(at..at + len).is_some_and(|b| fnv(b) == *hash))
+        .map(|w| w.2)
+}
+
 /// Whether modules are counted (`VICTORY_SHADER_CENSUS` set).
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -78,6 +99,8 @@ pub fn take(dxil: &[u8]) -> Option<Census> {
 /// Counts `m`, whose written form is `bitcode`, and keeps the result for
 /// [`take`].
 pub(crate) fn note(m: &Module, bitcode: &[u8]) {
+    #[cfg(test)]
+    LOOPED.with(|l| l.borrow_mut().push((bitcode.len(), fnv(bitcode), m.barriers_on_cycles())));
     if !enabled() {
         return;
     }
@@ -113,6 +136,41 @@ fn kind(name: &str) -> usize {
 }
 
 impl Module {
+    /// Barrier calls in blocks reached from the entry that lie on a cycle (a block a path
+    /// from it leads back to): a wait every thread must reach once per trip of a loop.
+    #[cfg(test)]
+    pub(crate) fn barriers_on_cycles(&self) -> u32 {
+        let n = self.blocks.len();
+        let succ = |b: usize| super::successors(self.blocks[b].term);
+        let reaches = |from: usize, to: usize| {
+            let mut seen = vec![false; n];
+            let mut stack: Vec<usize> = succ(from).iter().copied().collect();
+            while let Some(b) = stack.pop() {
+                if b == to {
+                    return true;
+                }
+                if !seen[b] {
+                    seen[b] = true;
+                    stack.extend(succ(b).iter().copied());
+                }
+            }
+            false
+        };
+        let entry_reaches = |b: usize| b == 0 || n > 0 && reaches(0, b);
+        let mut count = 0;
+        for (b, blk) in self.blocks.iter().enumerate() {
+            let barriers = blk
+                .body
+                .iter()
+                .filter(|&&i| matches!(&self.insts[i as usize].op, Op::Call(f, _) if kind(&self.funcs[*f as usize].name) == KINDS.iter().position(|k| *k == "barrier").expect("kind")))
+                .count() as u32;
+            if barriers > 0 && entry_reaches(b) && reaches(b, b) {
+                count += barriers;
+            }
+        }
+        count
+    }
+
     /// The instructions [`Module::write`] writes, by kind.
     pub(crate) fn census(&self) -> Census {
         let k = |s: &str| KINDS.iter().position(|k| *k == s).expect("kind");

@@ -1,15 +1,17 @@
 //! Levels on demand: host copies of title textures that take the card's
 //! memory level by level, as the title holds the levels.
 //!
-//! A guest may place a texture's whole chain of levels in its address space
-//! and hold only some of them. The memory of the levels not held is either
-//! not mapped, or holds something else. A host copy was a committed texture: every level of it
-//! took the card's memory from the first upload on. A run's accounting
-//! line counted about half of the host copies' bytes in levels
-//! whose title memory was not mapped, on over a thousand copies; with
-//! the render targets that filled the card, and textures
-//! that needed a new host copy waited for room (a face on screen among
-//! them).
+//! The title places a texture's whole chain of levels in its address space
+//! and holds only some of them: the smallest first, at the start of the
+//! texture's memory. The memory of the larger ones is either not mapped,
+//! or belongs to the next texture, which the title packs where they would
+//! be (run 188). A host copy was a committed texture: every level of it
+//! took the card's memory from the first upload on. Run 189's accounting
+//! line counted 2.2 to 3.0 GB of 4.3 to 5.5 GB of host copies in levels
+//! whose title memory was not mapped, on some 1,600 copies; with about
+//! 2.2 to 3.1 GB of render targets that filled the card, and textures
+//! that needed a new host copy waited for room (the main character's face
+//! among them, runs 188 and 189).
 //!
 //! Here such a texture is a reserved one (`CreateReservedResource`): it has
 //! every level, so level numbers and sizes are what they were, but no
@@ -103,18 +105,19 @@ pub(crate) fn wanted() -> bool {
     })
 }
 
+fn parse_floor(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(1 << 20, |kb| kb.max(64).saturating_mul(1024))
+}
+
 /// The bytes from which a texture is made this way: a megabyte, or
-/// `VICTORY_LEVELS_MIN_KB`. (A run's accounting: the levels not
-/// held are megabytes a copy on over a thousand copies; a 512x512 texture has six
+/// `VICTORY_LEVELS_MIN_KB`. (The accounting of run 189: the levels not
+/// held are 1.9 MB a copy on some 1,600 copies; a 512x512 texture has six
 /// tiles at most, and most of the calls for nothing.)
 pub(crate) fn floor() -> u64 {
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| {
-        std::env::var("VICTORY_LEVELS_MIN_KB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(1 << 20, |kb| kb.max(64) << 10)
-    })
+    *BYTES.get_or_init(|| parse_floor(std::env::var("VICTORY_LEVELS_MIN_KB").ok().as_deref()))
 }
 
 /// The bytes of the tiles given to textures now: the card's memory they
@@ -302,14 +305,18 @@ impl Tiled {
         }
         let mut standard = Vec::with_capacity(standard_levels as usize);
         for tiling in &tilings[..standard_levels as usize] {
-            let tiles = tiling.WidthInTiles * u32::from(tiling.HeightInTiles) * u32::from(tiling.DepthInTiles);
+            let tiles = tiling
+                .WidthInTiles
+                .checked_mul(u32::from(tiling.HeightInTiles))
+                .and_then(|n| n.checked_mul(u32::from(tiling.DepthInTiles)))
+                .unwrap_or(0);
             if tiles == 0 || tiles > HEAP_TILES || tiling.StartTileIndexInOverallResource == D3D12_PACKED_TILE {
                 return None;
             }
             standard.push(tiles);
         }
         let packed_tiles = if packed.NumPackedMips > 0 { packed.NumTilesForPackedMips } else { 0 };
-        if packed_tiles > HEAP_TILES {
+        if (packed.NumPackedMips > 0 && packed_tiles == 0) || packed_tiles > HEAP_TILES {
             return None;
         }
         let full = u64::from(total) * TILE;
@@ -364,13 +371,16 @@ impl Tiled {
         held: u32,
         room: bool,
     ) -> (bool, bool) {
+        let held = held & self.every_level();
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_on(queue, device, texture, named, if room { named } else { card });
-        (changed, self.without(named) != 0)
+        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        let missing = self.without_locked(&given, named) != 0;
+        (changed, missing)
     }
 
     /// At the submission of a list in which the card itself writes the
@@ -395,12 +405,25 @@ impl Tiled {
         texture: &ID3D12Resource,
         levels: u32,
     ) -> bool {
-        let card = self.card.fetch_or(levels, Ordering::Relaxed) | levels;
-        let changed = self.give_on(queue, device, texture, card | self.held.load(Ordering::Relaxed), levels);
-        // A level that got no tiles (no heap could be had): the list's
-        // zeros and its write went nowhere, so the next list that writes
-        // the level sends its zeros again.
-        let without = self.without(levels);
+        let levels = levels & self.every_level();
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = self.card.load(Ordering::Relaxed);
+        let changed = self.give_locked(
+            &mut given,
+            queue,
+            device,
+            texture,
+            prev | levels | self.held.load(Ordering::Relaxed),
+            levels,
+        );
+        // Only levels that actually received tiles (or already had them) saw
+        // the card's write; a level that got no tiles saw its zeros and write
+        // dropped, so neither `card` nor `claimed` should keep it.
+        let without = self.without_locked(&given, levels);
+        let backed = levels & !without;
+        if backed != 0 {
+            self.card.fetch_or(backed, Ordering::Relaxed);
+        }
         if without != 0 {
             self.unclaim(without);
         }
@@ -444,6 +467,10 @@ impl Tiled {
     /// Of `levels` (a bit a level), the ones that have no tiles now.
     pub(crate) fn without(&self, levels: u32) -> u32 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        self.without_locked(&given, levels)
+    }
+
+    fn without_locked(&self, given: &Given, levels: u32) -> u32 {
         let first_packed = self.standard.len() as u32;
         let mut without = 0;
         for level in 0..self.levels.min(32) {
@@ -467,6 +494,7 @@ impl Tiled {
     /// Returns whether the first level a view may show changed
     /// ([`Tiled::first_shown`]): the caller has the texture's slots made
     /// again.
+    #[cfg(test)]
     pub(crate) fn give_on(
         &self,
         queue: &ID3D12CommandQueue,
@@ -475,9 +503,21 @@ impl Tiled {
         named: u32,
         may: u32,
     ) -> bool {
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        self.give_locked(&mut given, queue, device, texture, named, may)
+    }
+
+    fn give_locked(
+        &self,
+        given: &mut Given,
+        queue: &ID3D12CommandQueue,
+        device: &ID3D12Device,
+        texture: &ID3D12Resource,
+        named: u32,
+        may: u32,
+    ) -> bool {
         let has = |level: u32| level < 32 && named & (1 << level) != 0;
         let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
-        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         let first_packed = self.standard.len() as u32;
         // (subresource, tiles, the level if it has tiles of its own) to map now.
         let mut wanted: Vec<(u32, u32, Option<usize>)> = Vec::new();
@@ -529,6 +569,7 @@ impl Tiled {
             }
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::host::tiles_mapped_on(queue);
             match level {
                 Some(level) => given.levels[level] = true,
                 None => given.packed = true,
@@ -605,24 +646,40 @@ impl Drop for Tiled {
     }
 }
 
-/// Keeps a two-dimensional shader view from the levels before `first` of a
-/// texture of `levels` levels: it starts at `first` if it started before
-/// it, and shows as many levels fewer. A sample then lands on the first
-/// level that has memory instead of reading zeros from one that has none;
-/// level numbers and sizes a shader asks for count from that level.
+/// Keeps a two-dimensional shader view (2D or 2D array) from the levels
+/// before `first` of a texture of `levels` levels: it starts at `first` if
+/// it started before it, shows as many levels fewer (clamped to the
+/// remaining levels), and reduces `ResourceMinLODClamp` by the same shift so
+/// the effective minimum LOD stays at the same resource level.
 pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D || first >= levels {
+    if first >= levels {
         return;
     }
-    // SAFETY: a 2D view's member of the union.
-    let view = unsafe { &mut desc.Anonymous.Texture2D };
-    if first <= view.MostDetailedMip {
-        return;
-    }
-    let fewer = first - view.MostDetailedMip;
-    view.MostDetailedMip = first;
-    if view.MipLevels != u32::MAX {
-        view.MipLevels = view.MipLevels.saturating_sub(fewer).max(1);
+    let clamp = |most: &mut u32, mips: &mut u32, min_lod: &mut f32| {
+        if first <= *most {
+            return;
+        }
+        let fewer = first - *most;
+        *most = first;
+        if *mips != u32::MAX {
+            *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
+        }
+        if *min_lod > 0.0 {
+            *min_lod = (*min_lod - fewer as f32).max(0.0);
+        }
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: `ViewDimension` selects `Texture2D`.
+            let view = unsafe { &mut desc.Anonymous.Texture2D };
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: `ViewDimension` selects `Texture2DArray`.
+            let view = unsafe { &mut desc.Anonymous.Texture2DArray };
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
+        }
+        _ => {}
     }
 }
 
@@ -667,8 +724,7 @@ pub(crate) fn status() {
 /// Run by name, alone, no game needed:
 /// `cargo test -p victory-gpu --release -- --ignored levels_on_demand --nocapture`
 ///
-/// It runs on the SOFTWARE adapter unless `VICTORY_TILES_TEST_CARD=1` (and on
-/// it with `VICTORY_D3D12_WARP` as well): on
+/// It runs on the SOFTWARE adapter unless `VICTORY_TILES_TEST_CARD=1`: on
 /// that adapter nothing reaches the card or its driver, so nothing it does
 /// can reset the driver or touch the screen. Wherever it runs, the debug
 /// layer is switched on if Windows has it (the optional feature "Graphics
@@ -679,14 +735,13 @@ pub(crate) fn status() {
 #[cfg(test)]
 mod tests {
     use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Dxgi::Common::*;
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
     use windows::core::{Interface, s};
 
-    use victory_shader::adapter::{Adapter, Asked, Got};
-
     use super::*;
-    use crate::host::{compile, transition};
+    use crate::host::{compile, transition, warp_adapter};
 
     const SIDE: u32 = 1024;
     const LEVELS: u16 = 11;
@@ -732,63 +787,36 @@ void look() {
         messages: Option<ID3D12InfoQueue>,
         /// What the test is doing, for the message when it stops.
         step: &'static str,
-        /// On the card, not on the software adapter: by the device's own adapter.
+        /// On the card, not on the software adapter.
         card: bool,
-        /// Where it runs, as its lines say ([`place`]).
-        at: &'static str,
-    }
-
-    /// What the rig asks for: hardware with `VICTORY_TILES_TEST_CARD=1` (`card`), else the
-    /// software adapter itself; and the software switch for the first, `VICTORY_D3D12_WARP`
-    /// (`warp`, diagnostics builds), which puts it on the software adapter as it does the
-    /// runtime's device.
-    fn leg(card: bool, warp: bool) -> (Asked, Option<&'static str>) {
-        if card {
-            (Asked::Hardware, warp.then_some("VICTORY_D3D12_WARP"))
-        } else {
-            (Asked::Software, None)
-        }
-    }
-
-    /// Where the rig runs, as its lines say: the device's own adapter (by its LUID), whatever
-    /// was asked for.
-    fn place(on: Option<&Adapter>) -> &'static str {
-        match on {
-            Some(on) if !on.software => "ON THE CARD",
-            Some(_) => "on the software adapter",
-            None => "on an adapter DXGI does not describe",
-        }
     }
 
     impl Rig {
-        /// The software adapter, or the one the rule picks (the runtime's,
-        /// `VICTORY_ADAPTER`) with `VICTORY_TILES_TEST_CARD=1`, the software
-        /// adapter with `VICTORY_D3D12_WARP` as well; `None` without one,
-        /// without tiled resources of tier 2, or on the card without the
-        /// debug layer (which `VICTORY_REQUIRE_GPU` fails).
+        /// The software adapter, or the default one with
+        /// `VICTORY_TILES_TEST_CARD=1`; `None` without one, without tiled
+        /// resources of tier 2, or on the card without the debug layer.
         fn new() -> Option<Rig> {
             // SAFETY: plain object creation on a device of our own.
             unsafe {
                 let card = std::env::var_os("VICTORY_TILES_TEST_CARD").is_some_and(|v| v == "1");
-                let (asked, switch) = leg(card, crate::host::on_warp());
                 // The debug layer, before the device is made: a call that
                 // is not well formed is then refused and named by the
                 // runtime, not handed to the driver.
                 let mut layer: Option<ID3D12Debug> = None;
                 let layered = D3D12GetDebugInterface(&mut layer).is_ok() && layer.is_some();
                 layer.iter().for_each(|l| l.EnableDebugLayer());
-                if asked == Asked::Hardware && switch.is_none() && !layered {
-                    let why = "no D3D12 debug layer (Windows optional feature \"Graphics Tools\"): not run on the card without it";
-                    if let Err(failed) = victory_shader::adapter::require(Got::Nothing) {
-                        panic!("{failed} ({why})");
-                    }
-                    eprintln!("{why}");
+                if card && !layered {
+                    eprintln!("no D3D12 debug layer (Windows optional feature \"Graphics Tools\"): not run on the card without it");
                     return None;
                 }
-                let made = victory_shader::adapter::test_device(asked, switch).ok()?;
-                let at = place(made.adapter.as_ref());
-                let card = at == "ON THE CARD";
-                let device = made.device;
+                let mut device: Option<ID3D12Device> = None;
+                if card {
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                } else {
+                    let adapter = warp_adapter().ok()?;
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+                }
+                let device = device?;
                 let messages = device.cast::<ID3D12InfoQueue>().ok();
                 let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
                 device
@@ -799,7 +827,8 @@ void look() {
                     )
                     .ok()?;
                 eprintln!(
-                    "levels on demand, {at}: tiled resources tier {}, debug layer {}",
+                    "levels on demand, {}: tiled resources tier {}, debug layer {}",
+                    if card { "ON THE CARD" } else { "on the software adapter" },
                     options.TiledResourcesTier.0,
                     if messages.is_some() { "on" } else { "not installed" }
                 );
@@ -830,7 +859,6 @@ void look() {
                     messages,
                     step: "making the device",
                     card,
-                    at,
                 })
             }
         }
@@ -1408,32 +1436,6 @@ void look() {
         assert_eq!(tiled.claim(small), small);
     }
 
-    /// (d) The card rig under the software switch is on the software adapter and says so:
-    /// `VICTORY_TILES_TEST_CARD=1` asks for hardware, `VICTORY_D3D12_WARP` puts it on the
-    /// software adapter as it does the runtime's device, and the label is the device's own
-    /// adapter's, never what was asked for.
-    #[test]
-    fn the_card_rig_under_the_software_switch_is_labelled_software() {
-        let (asked, switch) = leg(true, true);
-        assert_eq!(asked, Asked::Hardware);
-        assert_eq!(switch, Some("VICTORY_D3D12_WARP"));
-        assert_eq!(victory_shader::adapter::software_for(asked, switch), Some("VICTORY_D3D12_WARP"));
-        assert_eq!(leg(true, false), (Asked::Hardware, None));
-        assert_eq!(leg(false, true), (Asked::Software, None));
-        let adapter = |description: &str, software| Adapter {
-            description: description.to_owned(),
-            vendor: 0,
-            device: 0,
-            luid: 1,
-            software,
-            dedicated: 0,
-            driver: None,
-        };
-        assert_eq!(place(Some(&adapter("Microsoft Basic Render Driver", true))), "on the software adapter");
-        assert_eq!(place(Some(&adapter("NVIDIA GeForce RTX 5090", false))), "ON THE CARD");
-        assert_eq!(place(None), "on an adapter DXGI does not describe");
-    }
-
     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.
     #[test]
     #[ignore = "on the card: run it by name with --ignored --nocapture"]
@@ -1456,9 +1458,8 @@ void look() {
         rig.step = "the end";
         rig.check("every step done");
         eprintln!(
-            "all steps passed {}{}",
-            rig.at,
-            if rig.card { "" } else { "; VICTORY_TILES_TEST_CARD=1 without VICTORY_D3D12_WARP is the run on the card" }
+            "all steps passed {}",
+            if rig.card { "ON THE CARD" } else { "on the software adapter; VICTORY_TILES_TEST_CARD=1 is the run on the card" }
         );
         let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
         eprintln!(
@@ -1469,5 +1470,119 @@ void look() {
             s[3] >> 20,
             s[8]
         );
+    }
+
+    #[test]
+    fn floor_saturates_instead_of_wrapping() {
+        assert_eq!(parse_floor(None), 1 << 20);
+        assert_eq!(parse_floor(Some("0")), 64 << 10);
+        assert_eq!(parse_floor(Some("2048")), 2048 << 10);
+        assert_eq!(parse_floor(Some(&(1u64 << 54).to_string())), u64::MAX);
+        assert_eq!(parse_floor(Some(&u64::MAX.to_string())), u64::MAX);
+    }
+
+    #[test]
+    fn show_from_clamps_2d_and_2d_array_and_adjusts_min_lod() {
+        let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 12,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 3.5,
+                },
+            },
+        };
+        show_from(&mut srv2d, 3, 11);
+        // SAFETY: `ViewDimension` is `TEXTURE2D`.
+        let v2d = unsafe { srv2d.Anonymous.Texture2D };
+        assert_eq!(v2d.MostDetailedMip, 3);
+        // Clamped to remaining levels (11 - 3 = 8), not 12 - 3 = 9.
+        assert_eq!(v2d.MipLevels, 8);
+        assert_eq!(v2d.ResourceMinLODClamp, 0.5);
+
+        let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 6,
+                    FirstArraySlice: 0,
+                    ArraySize: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 1.5,
+                },
+            },
+        };
+        show_from(&mut srv_arr, 2, 11);
+        // SAFETY: `ViewDimension` is `TEXTURE2DARRAY`.
+        let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
+        assert_eq!(varr.MostDetailedMip, 2);
+        assert_eq!(varr.MipLevels, 4);
+        assert_eq!(varr.ResourceMinLODClamp, 0.0);
+    }
+
+    #[test]
+    fn card_wrote_failure_does_not_poison_card_mask() {
+        let Some(host) = host() else {
+            return;
+        };
+        // A dummy live resource (never mapped because `take()` rejects `HEAP_TILES + 1`).
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = Rig::desc(DXGI_FORMAT_R8G8B8A8_UNORM, 64, 2, false);
+        let mut tex: Option<ID3D12Resource> = None;
+        // SAFETY: plain texture creation on the host device.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut tex,
+                )
+                .unwrap();
+        }
+        let tex = tex.unwrap();
+        STATS[0].fetch_add(1, Ordering::Relaxed);
+        STATS[1].fetch_add(TILE, Ordering::Relaxed);
+        let mut tiled = Tiled {
+            // Level 0 demands > HEAP_TILES so `take()` fails deterministically.
+            standard: vec![HEAP_TILES + 1, 1],
+            packed: 0,
+            levels: 2,
+            full: TILE,
+            given: Mutex::new(Given {
+                levels: vec![false, false],
+                packed: false,
+                runs: Vec::new(),
+            }),
+            shown: AtomicU32::new(u32::MAX),
+            held: AtomicU32::new(0),
+            card: AtomicU32::new(0),
+            claimed: AtomicU32::new(0),
+        };
+        assert_eq!(tiled.claim(1 << 0), 1 << 0);
+        let changed = tiled.card_wrote_on(host.queue(), &host.device, &tex, 1 << 0);
+        assert!(!changed);
+        assert_eq!(tiled.card.load(Ordering::Relaxed), 0, "failed tile allocation must not poison `card`");
+        assert_eq!(tiled.first_shown(), None);
+        assert_eq!(tiled.claim(1 << 0), 1 << 0, "failed level must be unclaimed");
+        // Even if level 0 later becomes allocatable, an upload with `room == false`
+        // that does not hold level 0 must not treat level 0 as card-owned.
+        tiled.standard[0] = 1;
+        let (changed, waiting) = tiled.uploaded_on(host.queue(), &host.device, &tex, 1 << 1, false);
+        assert!(!changed && waiting);
+        assert!(!tiled.has_tiles(0));
+        assert_eq!(tiled.given_bytes(), 0);
     }
 }

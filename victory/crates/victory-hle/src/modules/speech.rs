@@ -50,23 +50,18 @@ extern "system" fn enumerate_voices(
     _context: *mut c_void,
     _callback: *const c_void,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     S_OK
 }
 extern "system" fn create(_: This, out: *mut *const u8) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     put(out, &raw const SYNTHESIZER)
 }
 extern "system" fn close(_: This, _: *const u8) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     S_OK
 }
 extern "system" fn set_default_voice(_: This, _: *const u8) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     S_OK
 }
 extern "system" fn set_custom_voice(_: This, _: *const u8, _voice: *const c_char) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     S_OK
 }
 extern "system" fn create_stream(
@@ -75,12 +70,10 @@ extern "system" fn create_stream(
     words: *const c_char,
     out: *mut *const u8,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     tracing::debug!(text = text(words).unwrap_or_default(), "speech (silent)");
     put(out, &raw const STREAM)
 }
 extern "system" fn stream_size(_: This, _: *const u8, out: *mut usize) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     put(out, SILENCE.len())
 }
 extern "system" fn stream_data(
@@ -90,7 +83,6 @@ extern "system" fn stream_data(
     buffer: *mut u8,
     used: *mut usize,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     if buffer.is_null() || size < SILENCE.len() {
         return super::xasync::E_NOT_SUFFICIENT_BUFFER;
     }

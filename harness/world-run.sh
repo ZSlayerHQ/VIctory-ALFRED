@@ -50,6 +50,11 @@ fi
 trap 'rm -f "$LOCK/owner"; rmdir "$LOCK" 2>/dev/null' EXIT
 trap 'exit 130' INT TERM
 printf 'pid %s, started %s, VICTORY_DIR=%s, args: %s\n' "$$" "$(date '+%F %T')" "${VICTORY_DIR:-victory}" "$*" >"$LOCK/owner"
+# This run's own token in the lock: a save restore under this run checks the lock carries it, so a lock left by, or
+# held by, another run never passes for this one's.
+WORLD_RUN_LOCK_TOKEN="$$-$(date +%s)-$RANDOM$RANDOM"
+printf 'token %s\n' "$WORLD_RUN_LOCK_TOKEN" >>"$LOCK/owner"
+export WORLD_RUN_LOCK_TOKEN
 
 # A lane worktree has no victory.toml of its own (it is git-ignored), so every run reads the main one.
 VICTORY_CONFIG=${VICTORY_CONFIG:-$ROOT/victory/victory.toml}

@@ -21,6 +21,10 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+// PS5 pads (DualSense, DualSense Edge) read straight from HID, USB or Bluetooth (from AnyXboxX's VIctory copy).
+#[cfg(any(windows, test))]
+mod dualsense;
+
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -30,6 +34,7 @@ const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
+const MOUSE_KIND: u32 = 0x20;
 const GAMEPAD_KIND: u32 = 0x4_0000;
 /// Device status of a connected device: connected, input enabled.
 const STATUS_CONNECTED: u32 = 0x3;
@@ -55,7 +60,8 @@ const RIGHT_STICK: u32 = 0x2000;
 const PADS: usize = 4;
 const FALLBACK: usize = PADS;
 const KEYBOARD: usize = PADS + 1;
-const DEVICES: usize = PADS + 2;
+const MOUSE: usize = PADS + 2;
+const DEVICES: usize = PADS + 3;
 
 /// Readings kept per device for next/previous lookups.
 const HISTORY: usize = 256;
@@ -105,8 +111,41 @@ struct KeyState {
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
+/// GameInput v0: cumulative motion; scroll axes are not sampled.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MouseState {
+    buttons: u32,
+    position_x: i64,
+    position_y: i64,
+    wheel_x: i64,
+    wheel_y: i64,
+}
+const _: () = assert!(size_of::<MouseState>() == 40);
+
+/// Applies one captured mouse sample. While the F1 settings menu is open,
+/// motion deltas are discarded and button bits are cleared while keeping the
+/// virtual mouse connected at its last position (so closing the menu causes
+/// no camera jump and no disconnect/reconnect churn).
+fn apply_mouse_sample(
+    mouse: &mut MouseState,
+    (dx, dy): (i64, i64),
+    buttons: u32,
+    menu_open: bool,
+) -> MouseState {
+    if menu_open {
+        mouse.buttons = 0;
+    } else {
+        mouse.position_x += dx;
+        mouse.position_y += dy;
+        mouse.buttons = buttons;
+    }
+    *mouse
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
+    fn mouse(&mut self) -> Option<MouseState> { None }
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
@@ -137,6 +176,32 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
+/// Two pads as one: buttons of both, and of each axis and trigger the one
+/// pushed further.
+fn merged(a: PadState, b: PadState) -> PadState {
+    let further = |x: f32, y: f32| if y.abs() > x.abs() { y } else { x };
+    PadState {
+        buttons: a.buttons | b.buttons,
+        left_trigger: further(a.left_trigger, b.left_trigger),
+        right_trigger: further(a.right_trigger, b.right_trigger),
+        left_x: further(a.left_x, b.left_x),
+        left_y: further(a.left_y, b.left_y),
+        right_x: further(a.right_x, b.right_x),
+        right_y: further(a.right_y, b.right_y),
+    }
+}
+
+/// Whether the title sees one pad that is always there, fed by the keyboard
+/// and by every host pad (on by default; `VICTORY_ONE_PAD=0` shows each host
+/// pad as a device of its own, and the stand-in only while there is none).
+/// The title keeps to the pad it started with: with the stand-in taken away
+/// when a pad was switched on, it showed its controller-disconnected screen
+/// until the pad was off again. It also keeps a pad the host lists twice (its
+/// own slot and a remapper's) from being two players.
+fn one_pad() -> bool {
+    std::env::var_os("VICTORY_ONE_PAD").is_none_or(|v| v != "0")
+}
+
 #[repr(C)]
 struct Table<const N: usize>([*const (); N]);
 // SAFETY: function addresses only.
@@ -157,7 +222,7 @@ pub struct Device {
     info: DeviceInfo,
 }
 
-/// What a device says about itself: its `id` is filled in; the rest
+/// What a device says about itself. The title reads `id` (+0x20); the rest
 /// follows the public layout and is zero where we have nothing to say.
 #[repr(C)]
 #[derive(Default)]
@@ -184,6 +249,7 @@ struct DeviceInfo {
 const _: () = assert!(std::mem::offset_of!(DeviceInfo, id) == 0x20);
 
 fn kind(index: usize) -> u32 {
+    if index == MOUSE { return MOUSE_KIND; }
     if index == KEYBOARD {
         KEYBOARD_KIND
     } else {
@@ -202,7 +268,7 @@ impl Device {
             root_id: id,
             supported_input: kind(index),
             // Low and high frequency.
-            rumble_motors: if index < PADS { 0x3 } else { 0 },
+            rumble_motors: if index <= FALLBACK { 0x3 } else { 0 },
             ..Default::default()
         };
         Device {
@@ -221,6 +287,7 @@ impl Device {
 
 #[derive(PartialEq)]
 enum Value {
+    Mouse(MouseState),
     Pad(PadState),
     Keys(Vec<KeyState>),
 }
@@ -238,6 +305,7 @@ pub struct Reading {
 impl Reading {
     fn kind(&self) -> u32 {
         match self.value {
+            Value::Mouse(_) => MOUSE_KIND,
             Value::Pad(_) => GAMEPAD_KIND,
             Value::Keys(_) => KEYBOARD_KIND,
         }
@@ -333,6 +401,8 @@ pub struct Hub {
     /// Apart from the state: XInput can be slow, and the title reads
     /// readings every frame.
     source: Mutex<Box<dyn Source>>,
+    /// The title sees one pad ([`one_pad`]).
+    one_pad: bool,
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
@@ -356,7 +426,7 @@ fn now() -> u64 {
 }
 
 impl Hub {
-    fn new(source: Box<dyn Source>) -> &'static Hub {
+    fn new(source: Box<dyn Source>, one_pad: bool) -> &'static Hub {
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -364,6 +434,7 @@ impl Hub {
             },
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
+            one_pad,
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
@@ -384,7 +455,7 @@ impl Hub {
 
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source);
+        let hub = Hub::new(source, one_pad());
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -401,12 +472,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.mouse())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -449,11 +520,20 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
+        one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: Option<MouseState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
+        if one_pad {
+            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
+            self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
+            return events;
+        }
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
@@ -537,7 +617,6 @@ type Out = *mut *const c_void;
 
 /// The DLL's only export (ordinal 1): the input object, static and shared.
 pub extern "system" fn GameInputCreate(out: *mut This) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     tracing::info!("GameInputCreate");
     if out.is_null() {
         return E_INVALIDARG;
@@ -575,18 +654,15 @@ fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
 }
 
 extern "system" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     tracing::warn!("input QueryInterface not implemented");
     fail(out, E_NOINTERFACE)
 }
 /// The input object and devices live as long as the process.
 extern "system" fn add_ref(_: *const c_void) -> u32 {
-    let _entry = victory_gpu::hle_call();
     1
 }
 
 extern "system" fn timestamp(_: This) -> u64 {
-    let _entry = victory_gpu::hle_call();
     now()
 }
 
@@ -596,7 +672,6 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {
@@ -680,7 +755,6 @@ extern "system" fn next_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     relative(this, reference, kind, device, out, true)
 }
 extern "system" fn previous_reading(
@@ -690,7 +764,6 @@ extern "system" fn previous_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     relative(this, reference, kind, device, out, false)
 }
 /// The device's reading at `time`, among those still kept.
@@ -700,7 +773,6 @@ extern "system" fn temporal_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let hub = hub(this);
     let Some(index) = hub.index(device) else {
         return fail(out, E_INVALIDARG);
@@ -720,8 +792,8 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
-// shortcut: reading callbacks never run; no callback has been registered
-// (the caller polls).
+// shortcut: reading callbacks never run; the title registers none
+// (it polls).
 extern "system" fn register_reading(
     _: This,
     _device: *const c_void,
@@ -731,15 +803,14 @@ extern "system" fn register_reading(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     tracing::warn!("input reading callbacks are never called");
     token(out)
 }
 
 /// Device callbacks run on our poll thread when a device comes or goes.
 /// Enumeration reports the devices already there: blocking on the caller's
-/// thread before we return (a caller may register while holding a lock its
-/// callback takes again), asynchronous on the next poll.
+/// thread before we return (the title registers holding a lock its callback
+/// takes again), asynchronous on the next poll.
 extern "system" fn register_device(
     this: This,
     device: *const Device,
@@ -750,7 +821,6 @@ extern "system" fn register_device(
     callback: Option<DeviceCallback>,
     out: *mut u64,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let Some(callback) = callback else {
         return E_INVALIDARG;
     };
@@ -799,7 +869,6 @@ extern "system" fn register_other(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     token(out)
 }
 
@@ -809,14 +878,12 @@ fn forget(this: This, token: u64) {
     state.pending.retain(|e| e.registration.token != token);
 }
 extern "system" fn stop_callback(this: This, token: u64) {
-    let _entry = victory_gpu::hle_call();
     forget(this, token);
 }
 /// Stops the callback, then waits up to `timeout` µs for a call of it that
 /// is running; false on time-out, or from inside that callback (it cannot
 /// wait for itself), as documented. Either way it is never called again.
 extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> bool {
-    let _entry = victory_gpu::hle_call();
     forget(this, token);
     let hub = hub(this);
     let me = std::thread::current().id();
@@ -845,12 +912,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
 
 /// Dispatcher and aggregate device: no title of ours asks for them.
 extern "system" fn create_dispatcher(_: This, out: Out) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     tracing::warn!("input dispatcher not implemented");
     fail(out, E_NOTIMPL)
 }
 extern "system" fn create_aggregate(_: This, _kind: u32, out: Out) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     tracing::warn!("aggregate input device not implemented");
     fail(out, E_NOTIMPL)
 }
@@ -860,7 +925,8 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
     }
     // SAFETY: checked non-null; the title passes a device id.
     let id = unsafe { &*id };
-    match hub(this).devices.iter().find(|d| d.info.id == *id) {
+    match hub(this).devices.iter().find(|d| d.info.id == *id
+        && (d.index != MOUSE || hub(this).state().slots[MOUSE].connected)) {
         Some(device) => {
             // SAFETY: checked non-null.
             unsafe { out.write((device as *const Device).cast()) };
@@ -872,7 +938,6 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
 /// Lookup by object, platform handle or platform string: our devices have
 /// none of these.
 extern "system" fn find_device(_: This, _value: *const c_void, out: Out) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     fail(out, DEVICE_NOT_FOUND)
 }
 extern "system" fn enable_oem_device(
@@ -882,12 +947,9 @@ extern "system" fn enable_oem_device(
     _interface: u8,
     _collection: u8,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     S_OK
 }
-extern "system" fn set_focus_policy(_: This, _policy: u32) {
-    let _entry = victory_gpu::hle_call();
-}
+extern "system" fn set_focus_policy(_: This, _policy: u32) {}
 
 static INPUT: Table<22> = Table([
     no_interface as *const (),        // 0x00
@@ -915,12 +977,10 @@ static INPUT: Table<22> = Table([
 ]);
 
 extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
-    let _entry = victory_gpu::hle_call();
     // SAFETY: one of our devices.
     unsafe { &(*this).info }
 }
 extern "system" fn device_status(this: *const Device) -> u32 {
-    let _entry = victory_gpu::hle_call();
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.hub().state().slots[device.index].connected {
@@ -932,11 +992,12 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 // shortcut: trigger motors are dropped (XInput has none). The host API that
 // drives them without a redistributable is Windows.Gaming.Input (WinRT
 // `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; trigger levels arrive in this call's parameters.
+// diagnostics builds; the title sends trigger levels in slot 0x50.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
-    if device.index >= PADS {
+    let one_pad = device.hub().one_pad;
+    if device.index >= PADS && !(one_pad && device.index == FALLBACK) {
         return;
     }
     let [low, high, ..] = if params.is_null() {
@@ -946,10 +1007,19 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
         unsafe { *params }
     };
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    let mut source = lock(&device.hub().source);
+    if one_pad {
+        // The one pad is every host pad.
+        for slot in 0..PADS {
+            if source.pad(slot).is_some() {
+                source.rumble(slot, speed(low), speed(high));
+            }
+        }
+    } else {
+        source.rumble(device.index, speed(low), speed(high));
+    }
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     tracing::warn!(
         slot = format_args!("{SLOT:#x}"),
         "input device method not implemented"
@@ -986,11 +1056,9 @@ fn reading<'a>(this: *const Reading) -> &'a Reading {
     unsafe { &*this }
 }
 extern "system" fn reading_add_ref(this: *const Reading) -> u32 {
-    let _entry = victory_gpu::hle_call();
     reading(this).refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 extern "system" fn reading_release(this: *const Reading) -> u32 {
-    let _entry = victory_gpu::hle_call();
     let left = reading(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
         // SAFETY: the last reference is gone; `Ref::new` boxed it.
@@ -999,11 +1067,9 @@ extern "system" fn reading_release(this: *const Reading) -> u32 {
     left
 }
 extern "system" fn input_kind(this: *const Reading) -> u32 {
-    let _entry = victory_gpu::hle_call();
     reading(this).kind()
 }
 extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
-    let _entry = victory_gpu::hle_call();
     let reading = reading(this);
     if reading.kind() & kind != 0 {
         reading.sequence
@@ -1012,25 +1078,21 @@ extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
     }
 }
 extern "system" fn reading_timestamp(this: *const Reading) -> u64 {
-    let _entry = victory_gpu::hle_call();
     reading(this).timestamp
 }
 extern "system" fn reading_device(this: *const Reading, out: *mut *const Device) {
-    let _entry = victory_gpu::hle_call();
     if !out.is_null() {
         // SAFETY: checked non-null; devices need no reference.
         unsafe { out.write(reading(this).device) };
     }
 }
 extern "system" fn key_count(this: *const Reading) -> u32 {
-    let _entry = victory_gpu::hle_call();
     match &reading(this).value {
         Value::Keys(keys) => keys.len() as u32,
-        Value::Pad(_) => 0,
+        _ => 0,
     }
 }
 extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
-    let _entry = victory_gpu::hle_call();
     let Value::Keys(keys) = &reading(this).value else {
         return 0;
     };
@@ -1043,7 +1105,6 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
-    let _entry = victory_gpu::hle_call();
     match &reading(this).value {
         Value::Pad(state) if !out.is_null() => {
             // SAFETY: checked non-null.
@@ -1053,9 +1114,16 @@ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bo
         _ => false,
     }
 }
+extern "system" fn mouse_state(this: *const Reading, out: *mut MouseState) -> bool {
+    if let Value::Mouse(state) = &reading(this).value && !out.is_null() {
+        // SAFETY: the caller supplies room for one v0 mouse state.
+        unsafe { out.write(*state) };
+        return true;
+    }
+    false
+}
 /// Kinds our devices do not have: no count, no state.
 extern "system" fn nothing(_: *const c_void) -> usize {
-    let _entry = victory_gpu::hle_call();
     0
 }
 
@@ -1076,7 +1144,7 @@ static READING: Table<25> = Table([
     nothing as *const (),           // 0x68
     key_count as *const (),         // 0x70
     key_state as *const (),         // 0x78
-    nothing as *const (),           // 0x80 mouse
+    mouse_state as *const (),       // 0x80 mouse
     nothing as *const (),           // 0x88 touch
     nothing as *const (),           // 0x90
     nothing as *const (),           // 0x98 motion
@@ -1162,194 +1230,75 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
-        /// This poll's scripted keys: evaluated in pad(0) and taken by keys() (diagnostics only). A present
-        /// between the two views would otherwise leave a key down on the pad and up on the keyboard in one poll.
-        #[cfg(feature = "diagnostics")]
-        scripted_poll: Option<Vec<u8>>,
-    }
-
-    // The sequence parser is shared with the live `LIVE_KEYS` switch; it
-    // lives in victory-gpu so the switch can refuse a bad sequence before
-    // it is applied. The hold rule and its evaluation stay here.
-    #[cfg(any(feature = "diagnostics", test))]
-    use victory_gpu::scripted_keys::{KEY_PRESS, Hold, KeyScript, ScriptedKey, key_script};
-
-
-    /// How long a count that does not advance may keep a frame hold down: after this, the key is released and
-    /// the log says so once, naming the entry and the presents it got. No key is ever held without an end.
-    #[cfg(any(feature = "diagnostics", test))]
-    const STALL: Duration = Duration::from_secs(30);
-
-    /// What a frame hold remembers between polls: the present count its press was seen at, the count at the last
-    /// poll and the poll time it last advanced (a count that stops), whether it fired with no count at all (one
-    /// press per entry, ever), and whether each once-only warning has been said.
-    #[cfg(any(feature = "diagnostics", test))]
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    struct FrameHold {
-        pressed_at: Option<u64>,
-        last: Option<u64>,
-        advanced: Option<Duration>,
-        fired_without_count: bool,
-        warned_no_count: bool,
-        warned_stall: bool,
-    }
-
-    /// The keys down at `now`: a time hold from its start for its whole length; a frame hold from the poll that
-    /// first finds its start reached until `frames` of the title's presents have happened since (`holds` keeps
-    /// what each entry remembers between polls, an entry an index). With no present yet the count cannot be read:
-    /// the entry fires at most once, as the short press if a poll comes in time and as nothing if not, and the log
-    /// says which once. A count that stops advancing for [`STALL`] releases the hold with one warning.
-    #[cfg(any(feature = "diagnostics", test))]
-    fn keys_down_with(
-        keys: &[ScriptedKey],
-        now: Duration,
-        presents: Option<u64>,
-        holds: &mut Vec<FrameHold>,
-    ) -> Vec<u8> {
-        holds.resize(keys.len(), FrameHold::default());
-        keys.iter()
-            .enumerate()
-            .filter_map(|(i, key)| {
-                let held = &mut holds[i];
-                match key.hold {
-                    Hold::Time(hold) => (key.at..key.at + hold).contains(&now).then_some(key.key),
-                    Hold::Frames(frames) => {
-                        if now < key.at {
-                            return None;
-                        }
-                        let Some(now_presents) = presents else {
-                            // No count ever seen: the entry fires at most once, as its short press across the polls
-                            // inside the press window (or as nothing, when the first due poll is past it), and the
-                            // log says which once.
-                            if !held.fired_without_count {
-                                held.fired_without_count = true;
-                                if !held.warned_no_count {
-                                    held.warned_no_count = true;
-                                    if now < key.at + KEY_PRESS {
-                                        tracing::warn!(
-                                            key = key.key,
-                                            "a VICTORY_KEYS hold counts the title's presents but none has been presented: pressed once instead"
-                                        );
-                                    } else {
-                                        tracing::warn!(
-                                            key = key.key,
-                                            "a VICTORY_KEYS hold counts the title's presents but none has been presented, and its press window is past: nothing was pressed for it"
-                                        );
-                                    }
-                                }
-                            }
-                            return (now < key.at + KEY_PRESS).then_some(key.key);
-                        };
-                        if held.fired_without_count || held.warned_stall {
-                            return None;
-                        }
-                        let pressed = *held.pressed_at.get_or_insert(now_presents);
-                        if held.last != Some(now_presents) {
-                            held.last = Some(now_presents);
-                            held.advanced = Some(now);
-                        }
-                        if now_presents - pressed >= frames {
-                            return None;
-                        }
-                        if now.saturating_sub(held.advanced.unwrap_or(now)) >= STALL {
-                            held.warned_stall = true;
-                            tracing::warn!(
-                                key = key.key,
-                                presents = now_presents,
-                                "a VICTORY_KEYS frame hold's count stopped: the key is released"
-                            );
-                            return None;
-                        }
-                        Some(key.key)
-                    }
-                }
-            })
-            .collect()
-    }
-
-    /// [`keys_down_with`] for a time-only list (`now`, nothing to remember between polls). Test-only.
-    #[cfg(test)]
-    fn keys_down(keys: &[ScriptedKey], now: Duration) -> Vec<u8> {
-        keys_down_with(keys, now, None, &mut Vec::new())
-    }
-
-    /// Every key down, each clock's frame holds remembered in `holds`: the absolute entries at `since_start`,
-    /// and the `+` entries at `since_after` (nothing when the marker has not appeared).
-    #[cfg(any(feature = "diagnostics", test))]
-    fn keys_down_at_with(
-        script: &KeyScript,
-        since_start: Duration,
-        since_after: Option<Duration>,
-        presents: Option<u64>,
-        holds: &mut (Vec<FrameHold>, Vec<FrameHold>),
-    ) -> Vec<u8> {
-        let mut down = keys_down_with(&script.absolute, since_start, presents, &mut holds.0);
-        if let Some(since) = since_after {
-            down.extend(keys_down_with(&script.relative, since, presents, &mut holds.1));
-        }
-        down
-    }
-
-    /// [`keys_down_at_with`] with nothing between polls (a time-only list, as the tests build). Test-only.
-    #[cfg(test)]
-    fn keys_down_at(script: &KeyScript, since_start: Duration, since_after: Option<Duration>) -> Vec<u8> {
-        keys_down_at_with(script, since_start, since_after, None, &mut (Vec::new(), Vec::new()))
+        mouse: MouseState,
+        /// The input snapshot for this poll and the HID connection owning each slot.
+        pads: [Option<PadState>; PADS],
+        hid_slots: [Option<u64>; PADS],
     }
 
     impl Host {
-        /// This poll's scripted keys: pad(0) evaluated them and left them here; with no pad in slot 0 this is the
-        /// poll's one evaluation either way, and the pad and the keyboard read the same list.
-        #[cfg(feature = "diagnostics")]
-        fn scripted_once(&mut self) -> Vec<u8> {
-            self.scripted_poll.take().unwrap_or_else(scripted)
-        }
-    }
-
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+        fn xinput(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
-            #[cfg(all(test, feature = "diagnostics"))]
-            let connected = PAD_FOR_TESTS.with(|p| p.get()) || unsafe { XInputGetState(slot as u32, &mut state) } == 0;
-            #[cfg(not(all(test, feature = "diagnostics")))]
-            let connected = unsafe { XInputGetState(slot as u32, &mut state) } == 0;
-            if !connected {
+            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
                 return None;
             }
             self.empty_until[slot] = None;
+            Some(convert(&state.Gamepad))
+        }
+    }
+
+    impl Source for Host {
+        fn mouse(&mut self) -> Option<MouseState> {
+            let delta = crate::modules::lifecycle::captured_mouse_delta()?;
+            let menu_open = victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed);
+            let buttons = if menu_open {
+                0
+            } else {
+                [0x01, 0x02, 0x04, 0x05, 0x06].into_iter().enumerate()
+                    // SAFETY: virtual-key state query.
+                    .fold(0, |bits, (i, vk)| bits | ((unsafe { GetAsyncKeyState(vk) } < 0) as u32) << i)
+            };
+            Some(super::apply_mouse_sample(&mut self.mouse, delta, buttons, menu_open))
+        }
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            // XInput first; HID PS5 pads take the slots XInput leaves free (`VICTORY_DUALSENSE`: 0 off, 1 both).
+            if slot == 0 {
+                let xinput = std::array::from_fn(|slot| self.xinput(slot));
+                self.pads = super::dualsense::slots(
+                    super::dualsense::mode(),
+                    xinput,
+                    &mut self.hid_slots,
+                    super::dualsense::pads,
+                );
+            }
             #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
+            let mut pad = self.pads[slot]?;
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                let down = scripted();
-                for vk in &down {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == *vk) {
+                for vk in scripted() {
+                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
                     }
                 }
-                self.scripted_poll = Some(down);
             }
             Some(pad)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
-            let mut down = self.scripted_once();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
-            #[cfg(all(test, feature = "diagnostics"))]
-            let focused = focused() && !PHYSICAL_KEYS_FOR_TESTS.with(|p| p.get());
-            #[cfg(not(all(test, feature = "diagnostics")))]
-            let focused = focused();
-            if focused {
+            // The F1 settings menu takes the keyboard while it is shown.
+            if victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
+                return Vec::new();
+            }
+            let mut down = scripted();
+            if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
@@ -1364,8 +1313,8 @@ mod host {
                     // SAFETY: plain query.
                     scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
                     virtual_key: vk,
-                    // shortcut: no characters (code point 0); the runtime
-                    // reports scan codes and virtual keys.
+                    // shortcut: no characters (code point 0);
+                    // the title reads scan codes and virtual keys only.
                     ..Default::default()
                 })
                 .collect()
@@ -1381,288 +1330,146 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>[:<hold>],...`
-    /// presses each key that long after input starts, for its hold (0.2 s
-    /// unless given: seconds, or `<N>f` for N of the title's presents —
-    /// counted when the title presents, whether or not the frame reaches the
-    /// window — from the press, so a route ends on the same view whatever the
-    /// frame rate; with nothing presented yet, one press at most and one
-    /// warning), with or without focus. A key is a letter, a digit, or
-    /// `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the
-    /// stand-in pad's table maps them to buttons). An entry written
-    /// `+<seconds>:<key>[:<hold>]` counts from the moment the file named by
-    /// `VICTORY_KEYS_AFTER` first exists, so a harness can start a script
-    /// when the scene is playable. Without that variable, `+` entries are
-    /// skipped with one warning.
-    #[cfg(feature = "diagnostics")]
-    fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, KeyScript)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            (Instant::now(), key_script(&list))
-        });
-        static AFTER: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
-            std::env::var_os("VICTORY_KEYS_AFTER").map(std::path::PathBuf::from)
-        });
-        /// Each clock's frame holds, what they remember between polls (absolute, relative).
-        static HOLDS: std::sync::Mutex<(Vec<FrameHold>, Vec<FrameHold>)> =
-            std::sync::Mutex::new((Vec::new(), Vec::new()));
-        #[cfg(test)]
-        {
-            // The one-poll fixture's seams: a script it supplies, a count it sets, and holds of its own.
-            let supplied = SCRIPT_FOR_TESTS.with(|s| s.borrow().as_ref().map(|(start, script)| (*start, std::rc::Rc::clone(script))));
-            if let Some((start, script)) = supplied {
-                let since_start = start.elapsed();
-                let presents = presented();
-                let after = if script.relative.is_empty() { None } else { AFTER.as_deref() };
-                let mut down = HOLDS_FOR_TESTS.with(|h| {
-                    let mut holds = h.borrow_mut();
-                    evaluate(since_start, &script, after, presents, &mut holds)
-                });
-                down.extend(live_scripted(presents));
-                return down;
-            }
-        }
-        // The order a poll read these at 5051676b5: the clock, then the title's presents, then the holds; and the
-        // marker file is looked for only when a script has '+' entries.
-        let (start, script) = &*SCRIPT;
-        let since_start = start.elapsed();
-        let presents = presented();
-        let mut holds = HOLDS.lock().unwrap_or_else(|e| e.into_inner());
-        let after = if script.relative.is_empty() { None } else { AFTER.as_deref() };
-        let mut down = evaluate(since_start, script, after, presents, &mut holds);
-        drop(holds);
-        down.extend(live_scripted(presents));
-        down
-    }
-
-    /// A live `LIVE_KEYS` sequence's playback between polls: the run it
-    /// belongs to, each frame hold's memory, and whether its done line has
-    /// been let out.
-    #[cfg(feature = "diagnostics")]
-    struct LivePlay {
-        id: u64,
-        holds: Vec<FrameHold>,
-        done: bool,
-    }
-
-    /// The run playing in a real session.
-    #[cfg(feature = "diagnostics")]
-    static LIVE_PLAY: Mutex<Option<LivePlay>> = Mutex::new(None);
-
-    /// The live sequence's keys at this poll: the same delivery path as
-    /// `VICTORY_KEYS`, with every time counted from the frame boundary that
-    /// applied the change. When every press has ended the run is reported
-    /// once through [`victory_gpu::live_keys_done`].
-    #[cfg(feature = "diagnostics")]
-    fn live_scripted(presents: Option<u64>) -> Vec<u8> {
-        #[cfg(test)]
-        if let Some(run) = LIVE_FOR_TESTS.with(|l| l.borrow().clone()) {
-            return LIVE_PLAY_FOR_TESTS.with(|play| play_live(&mut play.borrow_mut(), run, presents));
-        }
-        let mut play = LIVE_PLAY.lock().unwrap_or_else(|e| e.into_inner());
-        match victory_gpu::live_keys() {
-            Some(run) => play_live(&mut play, run, presents),
-            None => {
-                *play = None;
-                Vec::new()
-            }
-        }
-    }
-
-    /// One poll of `run` through a playback state: the keys down, and the
-    /// done line once when the last of them has ended.
-    #[cfg(feature = "diagnostics")]
-    fn play_live(play: &mut Option<LivePlay>, run: victory_gpu::KeysRun, presents: Option<u64>) -> Vec<u8> {
-        if play.as_ref().is_none_or(|play| play.id != run.id) {
-            *play = Some(LivePlay {
-                id: run.id,
-                holds: Vec::new(),
-                done: false,
-            });
-        }
-        let play = play.as_mut().expect("the run was just stored");
-        let since = run.start.elapsed();
-        let down = keys_down_with(&run.presses, since, presents, &mut play.holds);
-        if !play.done && live_finished(&run.presses, since, presents, &play.holds) {
-            play.done = true;
-            victory_gpu::live_keys_done(run.id);
-        }
-        down
-    }
-
-    /// Whether every press of a live sequence has ended: each timed hold
-    /// past its end, each frame hold released by its presents, its no-count
-    /// fallback's short press over, or its stall warning.
-    #[cfg(feature = "diagnostics")]
-    fn live_finished(keys: &[ScriptedKey], since: Duration, presents: Option<u64>, holds: &[FrameHold]) -> bool {
-        keys.iter().zip(holds).all(|(key, held)| match key.hold {
-            Hold::Time(hold) => since >= key.at.saturating_add(hold),
-            Hold::Frames(frames) => {
-                if since < key.at {
-                    return false;
-                }
-                if held.warned_stall {
-                    return true;
-                }
-                if held.fired_without_count {
-                    return since >= key.at + KEY_PRESS;
-                }
-                held.pressed_at
-                    .zip(presents)
-                    .is_some_and(|(pressed, now)| now.saturating_sub(pressed) >= frames)
-            }
+    /// A scripted key's virtual key: a letter, a digit, or `Enter`, `Esc`,
+    /// `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
+    fn key_code(name: &str) -> Option<u8> {
+        Some(match name.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+            _ => return None,
         })
     }
 
-    /// The keys the script has down: one evaluation over the elapsed `since_start`, `script`, the marker
-    /// `after` and the title's presents so far.
-    #[cfg(feature = "diagnostics")]
-    fn evaluate(
-        since_start: Duration,
-        script: &KeyScript,
-        after: Option<&std::path::Path>,
-        presents: Option<u64>,
-        holds: &mut (Vec<FrameHold>, Vec<FrameHold>),
-    ) -> Vec<u8> {
-        if script.relative.is_empty() {
-            keys_down_with(&script.absolute, since_start, presents, &mut holds.0)
-        } else if let Some(path) = after {
-            let since_after = marker_elapsed(path);
-            keys_down_at_with(script, since_start, since_after, presents, holds)
-        } else {
-            warn_relative_without_marker(script.relative.len());
-            keys_down_with(&script.absolute, since_start, presents, &mut holds.0)
-        }
-    }
-
-    /// The title's presents so far; none yet (a frame hold cannot count then) is `None`. Tests set it.
-    #[cfg(feature = "diagnostics")]
-    fn presented() -> Option<u64> {
-        #[cfg(test)]
-        if let Some(count) = PRESENT_FOR_TESTS.with(|p| p.get()) {
-            return Some(count);
-        }
-        let presented = victory_gpu::queue::presented();
-        (presented >= 1).then_some(presented)
-    }
-
-    // The index fixture's seams (`one_poll_evaluates_the_script_once_for_both_views`): a script it supplies and
-    // holds of its own, a present count it sets, and a pad it makes look connected in slot 0.
-    #[cfg(all(test, feature = "diagnostics"))]
-    thread_local! {
-        static SCRIPT_FOR_TESTS: std::cell::RefCell<Option<(Instant, std::rc::Rc<KeyScript>)>> = const { std::cell::RefCell::new(None) };
-        static HOLDS_FOR_TESTS: std::cell::RefCell<(Vec<FrameHold>, Vec<FrameHold>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
-        static PRESENT_FOR_TESTS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-        static PAD_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        /// The physical keyboard reads as empty, so a person holding a key cannot change what a fixture sees.
-        static PHYSICAL_KEYS_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        /// A live run the test supplies in place of the registry's, and its playback memory.
-        static LIVE_FOR_TESTS: std::cell::RefCell<Option<victory_gpu::KeysRun>> = const { std::cell::RefCell::new(None) };
-        static LIVE_PLAY_FOR_TESTS: std::cell::RefCell<Option<LivePlay>> = const { std::cell::RefCell::new(None) };
-    }
-
-    /// Tests: the scripted keys come from `list` until the guard drops, the pad in slot 0 reads as connected,
-    /// and the present count is `presented`.
-    #[cfg(all(test, feature = "diagnostics"))]
-    fn scripted_for_tests(list: &str, presented: u64) -> impl Drop {
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                SCRIPT_FOR_TESTS.with(|s| *s.borrow_mut() = None);
-                HOLDS_FOR_TESTS.with(|h| *h.borrow_mut() = (Vec::new(), Vec::new()));
-                PRESENT_FOR_TESTS.with(|p| p.set(None));
-                PAD_FOR_TESTS.with(|p| p.set(false));
-                PHYSICAL_KEYS_FOR_TESTS.with(|p| p.set(false));
-            }
-        }
-        SCRIPT_FOR_TESTS.with(|s| *s.borrow_mut() = Some((Instant::now(), std::rc::Rc::new(key_script(list)))));
-        HOLDS_FOR_TESTS.with(|h| *h.borrow_mut() = (Vec::new(), Vec::new()));
-        PRESENT_FOR_TESTS.with(|p| p.set(Some(presented)));
-        PAD_FOR_TESTS.with(|p| p.set(true));
-        PHYSICAL_KEYS_FOR_TESTS.with(|p| p.set(true));
-        Reset
-    }
-
-    /// Tests: the present count the scripted keys read from now on.
-    #[cfg(all(test, feature = "diagnostics"))]
-    fn set_presented_for_tests(presented: u64) {
-        PRESENT_FOR_TESTS.with(|p| p.set(Some(presented)));
-    }
-
-    /// Tests: a live run of `list` that started `elapsed` ago, in the
-    /// registry's place until the guard drops. The keyboard and pad read it
-    /// through the same `scripted()` evaluation.
-    #[cfg(all(test, feature = "diagnostics"))]
-    fn live_for_tests(list: &str, elapsed: Duration, presented: u64) -> impl Drop {
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                LIVE_FOR_TESTS.with(|l| *l.borrow_mut() = None);
-                LIVE_PLAY_FOR_TESTS.with(|p| *p.borrow_mut() = None);
-            }
-        }
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let presses = victory_gpu::scripted_keys::live_keys_script(list).expect("the fixture parses");
-        let run = victory_gpu::KeysRun {
-            id: NEXT.fetch_add(1, Ordering::Relaxed),
-            start: Instant::now() - elapsed,
-            count: presses.len(),
-            presses: std::sync::Arc::from(presses),
-        };
-        LIVE_FOR_TESTS.with(|l| *l.borrow_mut() = Some(run));
-        LIVE_PLAY_FOR_TESTS.with(|p| *p.borrow_mut() = None);
-        PRESENT_FOR_TESTS.with(|p| p.set(Some(presented)));
-        Reset
-    }
-
-    /// Tests: move the supplied live run's clock back, `elapsed` in all.
-    #[cfg(all(test, feature = "diagnostics"))]
-    fn live_elapsed_for_tests(elapsed: Duration) {
-        let start = Instant::now() - elapsed;
-        LIVE_FOR_TESTS.with(|l| {
-            if let Some(run) = l.borrow_mut().as_mut() {
-                run.start = start;
-            }
+    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
+    /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
+    /// time), with or without focus. Keys as [`key_code`] names them (the
+    /// stand-in pad's table maps them to buttons). Also the keys of
+    /// [`live`] (`VICTORY_KEYS_FILE`).
+    fn scripted() -> Vec<u8> {
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
+            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
+            let keys = list.split(',').filter_map(|entry| {
+                let (at, key) = entry.split_once(':')?;
+                let vk = key_code(key)?;
+                let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
+                let (from, to) = match at.split_once('-') {
+                    Some((from, to)) => (time(from)?, time(to)?),
+                    None => (time(at)?, time(at)? + Duration::from_millis(200)),
+                };
+                Some((from, to, vk))
+            });
+            (Instant::now(), keys.collect())
         });
+        let (start, keys) = &*SCRIPT;
+        let now = start.elapsed();
+        let mut down: Vec<u8> = keys
+            .iter()
+            .filter(|&&(from, to, _)| (from..to).contains(&now))
+            .map(|&(_, _, vk)| vk)
+            .collect();
+        for vk in live() {
+            if !down.contains(&vk) {
+                down.push(vk);
+            }
+        }
+        down
     }
 
-    /// How long ago the marker `path` first existed, checked at most five times a second: `None` until it does.
-    #[cfg(feature = "diagnostics")]
-    fn marker_elapsed(path: &std::path::Path) -> Option<Duration> {
+    /// A key [`live`] holds: from `from` for `hold`.
+    struct LiveKey {
+        from: Instant,
+        hold: Duration,
+        vk: u8,
+    }
+
+    /// One line of `VICTORY_KEYS_FILE`: `<key> [<hold s> [<after s>]]`, held
+    /// 0.2 s by default, starting `after` seconds after it is read (0 by
+    /// default). `None` for a line that says nothing of the kind.
+    fn live_line(line: &str, read: Instant) -> Option<LiveKey> {
+        let mut words = line.split_whitespace();
+        let vk = key_code(words.next()?)?;
+        let mut seconds = || words.next().and_then(|w| w.parse::<f64>().ok()).and_then(|s| Duration::try_from_secs_f64(s).ok());
+        let hold = seconds().unwrap_or(Duration::from_millis(200)).min(Duration::from_secs(60));
+        let after = seconds().unwrap_or_default().min(Duration::from_secs(600));
+        Some(LiveKey { from: read + after, hold, vk })
+    }
+
+    /// Debugging aid for a driver outside the process:
+    /// `VICTORY_KEYS_FILE=<file>`, a text file the driver appends lines to
+    /// while the title runs, each `<key> [<hold seconds> [<after seconds>]]`
+    /// (keys as [`key_code`] names them), e.g. `Enter`, `W 3` (walk ahead for
+    /// three seconds) or `Enter 0.2 5`. A thread of ours reads what was
+    /// appended every 50 ms; lines in the file before the run are skipped.
+    /// With or without focus, as [`scripted`]. The keys held now.
+    fn live() -> Vec<u8> {
+        use std::io::{Read, Seek, SeekFrom};
         use std::sync::Mutex;
-        use std::time::Instant;
-
-        struct Clock {
-            seen: Option<Instant>,
-            last_check: Option<Instant>,
-        }
-        static CLOCK: Mutex<Clock> = Mutex::new(Clock {
-            seen: None,
-            last_check: None,
+        static KEYS: Mutex<Vec<LiveKey>> = Mutex::new(Vec::new());
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            let Some(path) = std::env::var_os("VICTORY_KEYS_FILE") else { return };
+            tracing::info!(file = %std::path::Path::new(&path).display(), "keys are read from a file as it grows (VICTORY_KEYS_FILE)");
+            let _ = std::thread::Builder::new().name("victory-keys-file".into()).spawn(move || {
+                // Skip what is there already.
+                let mut at = std::fs::metadata(&path).map_or(0, |m| m.len());
+                let mut rest = String::new();
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let Ok(mut file) = std::fs::File::open(&path) else { continue };
+                    let len = file.metadata().map_or(0, |m| m.len());
+                    if len < at {
+                        // Emptied or replaced: read it from the start.
+                        at = 0;
+                        rest.clear();
+                    }
+                    if len == at || file.seek(SeekFrom::Start(at)).is_err() {
+                        continue;
+                    }
+                    let mut bytes = Vec::new();
+                    let Ok(n) = file.read_to_end(&mut bytes) else { continue };
+                    at += n as u64;
+                    rest.push_str(&String::from_utf8_lossy(&bytes));
+                    let read = Instant::now();
+                    // Whole lines only; a line still being written waits.
+                    let Some(end) = rest.rfind('\n') else { continue };
+                    let lines: String = rest.drain(..=end).collect();
+                    let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
+                    for line in lines.lines().filter(|l| !l.trim().is_empty()) {
+                        match live_line(line, read) {
+                            Some(key) => keys.push(key),
+                            None => tracing::warn!(line, "VICTORY_KEYS_FILE: not a key line"),
+                        }
+                    }
+                }
+            });
         });
-        const CHECK_EVERY: Duration = Duration::from_millis(200);
-        let mut clock = CLOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if clock.seen.is_none()
-            && clock
-                .last_check
-                .is_none_or(|last| last.elapsed() >= CHECK_EVERY)
-        {
-            clock.last_check = Some(Instant::now());
-            if path.exists() {
-                clock.seen = Some(Instant::now());
-            }
-        }
-        clock.seen.map(|seen| seen.elapsed())
+        let now = Instant::now();
+        let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
+        keys.retain(|k| now < k.from + k.hold);
+        keys.iter().filter(|k| k.from <= now).map(|k| k.vk).collect()
     }
 
-    #[cfg(feature = "diagnostics")]
-    fn warn_relative_without_marker(entries: usize) {
-        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !WARNED.swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                "VICTORY_KEYS has {entries} '+'-relative entries but VICTORY_KEYS_AFTER is not set: they are skipped"
-            );
-        }
+    #[test]
+    fn live_key_lines() {
+        let t = Instant::now();
+        let k = live_line("Enter", t).unwrap();
+        assert_eq!((k.vk, k.from, k.hold), (0x0D, t, Duration::from_millis(200)));
+        let k = live_line("  w 3  ", t).unwrap();
+        assert_eq!((k.vk, k.hold), (b'W', Duration::from_secs(3)));
+        let k = live_line("Up 0.5 2", t).unwrap();
+        assert_eq!((k.vk, k.from, k.hold), (0x26, t + Duration::from_secs(2), Duration::from_millis(500)));
+        // Holds are kept to a minute; unknown keys and bad numbers say nothing or fall back.
+        assert_eq!(live_line("S 999", t).unwrap().hold, Duration::from_secs(60));
+        assert_eq!(live_line("D x", t).unwrap().hold, Duration::from_millis(200));
+        assert!(live_line("Shift", t).is_none());
+        assert!(live_line("", t).is_none());
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1696,246 +1503,6 @@ mod host {
             (1.0, -1.0, 1.0, 0.0)
         );
     }
-
-    /// `+5:S:90f` is a hold counted in presented frames, starting five seconds after the marker: parsed, not
-    /// skipped. A malformed frame count (`90x`, `f`, `0f`, a negative one) is skipped as a malformed entry is.
-    #[test]
-    fn a_hold_in_presented_frames_parses() {
-        assert_eq!(
-            key_script("+5:S:90f").relative,
-            [ScriptedKey {
-                at: Duration::from_secs(5),
-                hold: Hold::Frames(90),
-                key: 0x53,
-            }],
-            "+5:S:90f parses as 90 presented frames from five seconds after the marker"
-        );
-        let script = key_script("+5:S:90x,+5:S:f,+5:S:0f,+5:S:-5f");
-        assert!(script.relative.is_empty(), "a malformed frame hold is skipped");
-    }
-
-    /// A hold counting the title's presents stays down while fewer than its count have been presented since the
-    /// press, however much time passes, and is released at the first poll after the last of them, however little
-    /// time passes. The poll that first finds its start reached captures the present count it counts from.
-    #[test]
-    fn a_hold_in_presented_frames_ends_with_the_presents_not_with_time() {
-        let keys = key_script("5:W:90f").absolute;
-        let key = |now: Duration, presents: Option<u64>, holds: &mut Vec<FrameHold>| keys_down_with(&keys, now, presents, holds);
-        let mut holds = Vec::new();
-        assert_eq!(key(Duration::from_secs(4), Some(1_000), &mut holds), Vec::<u8>::new(), "before its start");
-        assert_eq!(holds, [FrameHold::default()], "nothing captured before the start");
-        assert_eq!(key(Duration::from_secs(5), Some(1_000), &mut holds), vec![0x57], "pressed at its start");
-        assert_eq!(holds[0].pressed_at, Some(1_000), "the present it counts from is the one at its press");
-        // Eighty-nine presents in, and an hour of time on top of the press: still down.
-        assert_eq!(key(Duration::from_secs(3_600), Some(1_089), &mut holds), vec![0x57], "89 of 90 presents");
-        // The first poll after the 90th present, a moment later: up.
-        assert_eq!(key(Duration::from_millis(3_600_001), Some(1_090), &mut holds), Vec::<u8>::new(), "the 90th present ends it");
-    }
-
-    /// With no present yet the count cannot be read: a frame hold is one press, said in the log once, never a key
-    /// held for ever.
-    #[test]
-    fn a_frame_hold_with_no_frame_presented_is_one_press_and_says_so_once() {
-        let keys = key_script("5:W:90f").absolute;
-        let mut holds = Vec::new();
-        assert_eq!(keys_down_with(&keys, Duration::from_secs(5), None, &mut holds), vec![0x57]);
-        assert!(holds[0].warned_no_count, "the fallback was said in the log");
-        assert_eq!(keys_down_with(&keys, Duration::from_millis(5_199), None, &mut holds), vec![0x57]);
-        assert_eq!(keys_down_with(&keys, Duration::from_millis(5_200), None, &mut holds), Vec::<u8>::new());
-    }
-
-    /// A count that arrives after the no-count fallback fired cannot press the entry again: the fallback is one
-    /// press per entry, ever.
-    #[test]
-    fn a_count_arriving_after_the_fallback_fired_does_not_press_again() {
-        let keys = key_script("0:W:90f").absolute;
-        let mut holds = Vec::new();
-        // No count yet: pressed once, for the short press, and said.
-        assert_eq!(keys_down_with(&keys, Duration::ZERO, None, &mut holds), vec![0x57]);
-        assert!(holds[0].warned_no_count);
-        assert!(holds[0].fired_without_count);
-        assert_eq!(keys_down_with(&keys, Duration::from_millis(200), None, &mut holds), Vec::<u8>::new());
-        // A count arrives: the entry has fired, and stays up.
-        assert_eq!(keys_down_with(&keys, Duration::from_millis(300), Some(1), &mut holds), Vec::<u8>::new(), "no second press");
-        assert_eq!(keys_down_with(&keys, Duration::from_millis(400), Some(2), &mut holds), Vec::<u8>::new());
-    }
-
-    /// A first due poll after the short press window, with no count: nothing is pressed, and the entry counts as
-    /// fired.
-    #[test]
-    fn a_late_first_poll_with_no_count_presses_nothing() {
-        let keys = key_script("0:W:90f").absolute;
-        let mut holds = Vec::new();
-        assert_eq!(keys_down_with(&keys, Duration::from_secs(2), None, &mut holds), Vec::<u8>::new(), "no press, and none claimed");
-        assert!(holds[0].warned_no_count);
-        assert!(holds[0].fired_without_count);
-        assert_eq!(keys_down_with(&keys, Duration::from_secs(3), Some(1), &mut holds), Vec::<u8>::new(), "late count: still no press");
-    }
-
-    /// A count that stops advancing releases the hold after thirty seconds of poll time, with one warning, and
-    /// the key never comes back.
-    #[test]
-    fn a_stalled_count_releases_the_frame_hold_and_says_so_once() {
-        let keys = key_script("5:W:90f").absolute;
-        let mut holds = Vec::new();
-        assert_eq!(keys_down_with(&keys, Duration::from_secs(5), Some(1_000), &mut holds), vec![0x57], "pressed");
-        assert_eq!(keys_down_with(&keys, Duration::from_secs(6), Some(1_005), &mut holds), vec![0x57], "advancing");
-        // No present for thirty seconds, the count stuck at 1,005: released, and said once.
-        assert_eq!(keys_down_with(&keys, Duration::from_secs(36), Some(1_005), &mut holds), Vec::<u8>::new(), "released by the stall");
-        assert!(holds[0].warned_stall, "the stall was said in the log");
-        assert_eq!(keys_down_with(&keys, Duration::from_secs(37), Some(1_010), &mut holds), Vec::<u8>::new(), "never held again");
-    }
-
-    /// One input poll samples the script once: the pad's sample and the keyboard's read that same evaluation, so a
-    /// present crossing the hold's release threshold between them in one poll cannot leave the pad down and the
-    /// keyboard up. Through the production sampling path: a fake pad in slot 0, a script the test supplies, and a
-    /// present count the test sets.
-    #[cfg(feature = "diagnostics")]
-    #[test]
-    fn one_poll_reads_one_evaluation_across_the_release_threshold() {
-        // Enter held for five of the title's presents from the start.
-        let _seam = scripted_for_tests("0:Enter:5f", 100);
-        let mut host = Host::default();
-        // Poll 1: pressed, on both views.
-        let pad = host.pad(0).expect("the fake pad is connected");
-        assert_ne!(pad.buttons & A, 0, "the pad view is down");
-        assert!(host.keys().iter().any(|k| k.virtual_key == 0x0D), "the keyboard view is down");
-        // Poll 2: the pad samples at 104 presents (four of five), the game presents once (105, the release) before
-        // the keyboard's sample in the same poll; both read the pad's evaluation.
-        set_presented_for_tests(104);
-        let pad = host.pad(0).expect("the fake pad is connected");
-        assert_ne!(pad.buttons & A, 0, "the pad is down at 104");
-        set_presented_for_tests(105);
-        assert!(
-            host.keys().iter().any(|k| k.virtual_key == 0x0D),
-            "the keyboard reads the pad's evaluation of 104, not its own at 105"
-        );
-        // Poll 3: past the threshold on both, whatever order they sample in.
-        let pad = host.pad(0).expect("the fake pad is connected");
-        assert_eq!(pad.buttons & A, 0, "up at 105");
-        assert!(!host.keys().iter().any(|k| k.virtual_key == 0x0D), "up on the keyboard too");
-    }
-
-    /// A live sequence plays through the same evaluation as `VICTORY_KEYS`:
-    /// the pad and the keyboard see its press, its times count from the run's
-    /// start, and its one-second hold is over two seconds in. No live run
-    /// leaves both views exactly as the launch script alone has them.
-    #[cfg(feature = "diagnostics")]
-    #[test]
-    fn a_live_sequence_plays_through_the_scripted_path_and_ends() {
-        let _seam = scripted_for_tests("", 100);
-        let live = live_for_tests("0:X:1", Duration::from_millis(100), 100);
-        let mut host = Host::default();
-        let pad = host.pad(0).expect("the fake pad is connected");
-        assert_ne!(pad.buttons & X, 0, "the pad sees the live key");
-        assert!(host.keys().iter().any(|k| k.virtual_key == 0x58), "the keyboard sees it");
-        live_elapsed_for_tests(Duration::from_secs(2));
-        let pad = host.pad(0).expect("the fake pad is connected");
-        assert_eq!(pad.buttons & X, 0, "up after its hold");
-        assert!(!host.keys().iter().any(|k| k.virtual_key == 0x58), "up on the keyboard too");
-        drop(live);
-        assert!(!host.keys().iter().any(|k| k.virtual_key == 0x58), "no run, no press");
-    }
-
-    #[test]
-    fn a_held_key_is_down_across_its_hold_and_up_after_it() {
-        let keys = key_script("300:W:20").absolute;
-        assert_eq!(
-            keys,
-            [ScriptedKey {
-                at: Duration::from_secs(300),
-                hold: Hold::Time(Duration::from_secs(20)),
-                key: 0x57,
-            }]
-        );
-        assert_eq!(keys_down(&keys, Duration::from_secs(299)), Vec::<u8>::new());
-        assert_eq!(keys_down(&keys, Duration::from_secs(300)), vec![0x57]);
-        assert_eq!(keys_down(&keys, Duration::from_secs(319)), vec![0x57]);
-        assert_eq!(keys_down(&keys, Duration::from_secs(320)), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn two_holds_that_overlap_are_both_down() {
-        // W is held 300 to 325, A 321 to 326.
-        let keys = key_script("300:W:25,321:A:5").absolute;
-        assert_eq!(keys_down(&keys, Duration::from_secs(310)), vec![0x57]);
-        assert_eq!(keys_down(&keys, Duration::from_secs(322)), vec![0x57, 0x41]);
-        assert_eq!(keys_down(&keys, Duration::from_secs(325)), vec![0x41]);
-        assert_eq!(keys_down(&keys, Duration::from_secs(326)), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn an_entry_without_a_hold_is_down_for_a_fifth_of_a_second() {
-        let keys = key_script("30:Enter").absolute;
-        assert_eq!(
-            keys,
-            [ScriptedKey {
-                at: Duration::from_secs(30),
-                hold: Hold::Time(KEY_PRESS),
-                key: 0x0D,
-            }]
-        );
-        assert_eq!(keys_down(&keys, Duration::from_millis(30_199)), vec![0x0D]);
-        assert_eq!(keys_down(&keys, Duration::from_millis(30_200)), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn malformed_entries_are_skipped_and_the_rest_kept() {
-        let keys = key_script("300:W:20,nope,310:Q:-1,320:A:notanumber,330:B:601,340:C:0,350:!:5,,355:D").absolute;
-        // Kept: 300:W:20, 340:C:0 (a hold of zero), 355:D.
-        assert_eq!(keys.len(), 3);
-        assert_eq!(keys[0].key, 0x57);
-        assert_eq!(keys[1].key, 0x43);
-        assert_eq!(keys[1].hold, Hold::Time(Duration::ZERO));
-        assert_eq!(keys[2].key, 0x44);
-        assert_eq!(keys[2].hold, Hold::Time(KEY_PRESS));
-    }
-
-    #[test]
-    fn plus_entries_count_from_the_marker_and_absolute_entries_from_the_start() {
-        let script = key_script("30:W,+5:J:10,+20:A");
-        assert_eq!(script.absolute.len(), 1);
-        assert_eq!(script.relative.len(), 2);
-        // Before the marker exists, only the absolute entry counts, from input start.
-        assert_eq!(keys_down_at(&script, Duration::from_secs(30), None), vec![0x57]);
-        assert_eq!(keys_down_at(&script, Duration::from_secs(31), None), Vec::<u8>::new());
-        // Five seconds after the marker, J is down.
-        assert_eq!(
-            keys_down_at(&script, Duration::from_secs(0), Some(Duration::from_secs(5))),
-            vec![0x4A]
-        );
-        // Fifteen seconds after the marker, J's hold is over and A is not due yet.
-        assert_eq!(
-            keys_down_at(&script, Duration::from_secs(0), Some(Duration::from_secs(15))),
-            Vec::<u8>::new()
-        );
-        // Twenty seconds after the marker, A is down.
-        assert_eq!(
-            keys_down_at(&script, Duration::from_secs(0), Some(Duration::from_secs(20))),
-            vec![0x41]
-        );
-        // Both clocks count at once: W at 30 s of input and A at 20 s after the marker.
-        assert_eq!(
-            keys_down_at(&script, Duration::from_secs(30), Some(Duration::from_secs(20))),
-            vec![0x57, 0x41]
-        );
-    }
-
-    #[test]
-    fn a_plus_entry_parses_like_an_absolute_one_and_malformed_ones_are_skipped() {
-        let script = key_script("+,+30:Enter:1,+5:!,nope,+:W");
-        assert_eq!(script.absolute, Vec::<ScriptedKey>::new());
-        assert_eq!(
-            script.relative,
-            [ScriptedKey {
-                at: Duration::from_secs(30),
-                hold: Hold::Time(Duration::from_secs(1)),
-                key: 0x0D,
-            }]
-        );
-        // The plain list keeps its old meaning: a `+` entry is not an absolute one.
-        assert_eq!(key_script("+5:J").absolute, Vec::<ScriptedKey>::new());
-    }
 }
 
 #[cfg(test)]
@@ -1950,6 +1517,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeHost {
+        mouse: Option<MouseState>,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         rumble: Vec<(usize, u16, u16)>,
@@ -1958,6 +1526,7 @@ mod tests {
     struct Fake(Arc<Mutex<FakeHost>>);
 
     impl Source for Fake {
+        fn mouse(&mut self) -> Option<MouseState> { self.0.lock().unwrap().mouse }
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             self.0.lock().unwrap().pads[slot]
         }
@@ -1970,8 +1539,12 @@ mod tests {
     }
 
     fn fake() -> (&'static Hub, Arc<Mutex<FakeHost>>) {
+        fake_with(false)
+    }
+
+    fn fake_with(one_pad: bool) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
         let host = Arc::new(Mutex::new(FakeHost::default()));
-        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))));
+        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), one_pad);
         hub.poll();
         (hub, host)
     }
@@ -2095,6 +1668,45 @@ mod tests {
     }
 
     #[test]
+    fn mouse_readings_connect_and_disconnect_in_both_pad_modes() {
+        for one_pad in [false, true] {
+            let (hub, host) = fake_with(one_pad);
+            let log = Log::default();
+            register(hub, MOUSE_KIND, 2, &log);
+            assert!(log.lock().unwrap().is_empty());
+            let sample = MouseState { position_x: 30, position_y: -12, buttons: 1, ..Default::default() };
+            host.lock().unwrap().mouse = Some(sample);
+            hub.poll();
+            let r = current(hub, MOUSE_KIND, MOUSE).unwrap();
+            let mut got = MouseState::default();
+            let get = slot::<extern "system" fn(*const Reading, *mut MouseState) -> bool, _>(r, 0x80);
+            assert!(get(r, &mut got));
+            assert_eq!(got, sample);
+            assert!(!get(r, std::ptr::null_mut()));
+            release(r);
+            host.lock().unwrap().mouse = None;
+            hub.poll();
+            assert_eq!(current(hub, MOUSE_KIND, MOUSE), Err(DEVICE_DISCONNECTED));
+            assert_eq!(*log.lock().unwrap(), [(MOUSE, STATUS_CONNECTED, 0), (MOUSE, 0, STATUS_CONNECTED)]);
+        }
+    }
+
+    #[test]
+    fn mouse_motion_and_buttons_are_suppressed_while_settings_menu_is_open() {
+        let mut mouse = MouseState::default();
+        let active = apply_mouse_sample(&mut mouse, (12, -5), 0b11, false);
+        assert_eq!(active, MouseState { position_x: 12, position_y: -5, buttons: 0b11, ..Default::default() });
+
+        // Opening the F1 menu drops motion deltas and clears buttons while keeping position.
+        let paused = apply_mouse_sample(&mut mouse, (40, 25), 0b01, true);
+        assert_eq!(paused, MouseState { position_x: 12, position_y: -5, buttons: 0, ..Default::default() });
+
+        // Closing the F1 menu resumes cleanly from the preserved position with no jump.
+        let resumed = apply_mouse_sample(&mut mouse, (3, 4), 0b10, false);
+        assert_eq!(resumed, MouseState { position_x: 15, position_y: -1, buttons: 0b10, ..Default::default() });
+    }
+
+    #[test]
     fn pads_connect_report_and_disconnect() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -2189,6 +1801,37 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn a_host_pad_feeds_the_one_pad_which_never_goes() {
+        let (hub, host) = fake_with(true);
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+        let pad = |hub: &Hub| match &hub.state().slots[FALLBACK].history.back().unwrap().value {
+            Value::Pad(p) => *p,
+            _ => unreachable!(),
+        };
+        host.lock().unwrap().keys = vec![key(b'D')];
+        hub.poll();
+        assert_eq!(pad(hub).left_x, 1.0);
+        // A pad is switched on, in any slot: its input arrives, beside the
+        // keyboard's, and no device comes or goes.
+        host.lock().unwrap().pads[2] = Some(PadState { buttons: A, left_y: -0.5, ..Default::default() });
+        hub.poll();
+        let p = pad(hub);
+        assert_eq!((p.buttons, p.left_x, p.left_y), (A, 1.0, -0.5));
+        let device: *const Device = &hub.devices[FALLBACK];
+        set_rumble(device, &[1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(host.lock().unwrap().rumble, [(2, u16::MAX, 0)]);
+        // And off again.
+        host.lock().unwrap().pads[2] = None;
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        assert_eq!(pad(hub), PadState::default());
+        assert_eq!(log.lock().unwrap().len(), 1);
+        assert!(!hub.state().slots[2].connected);
     }
 
     #[test]

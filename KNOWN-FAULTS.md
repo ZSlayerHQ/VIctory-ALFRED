@@ -1,192 +1,92 @@
 # Known faults
 
-Faults already found, each with what is seen, what is known of its cause, how that was established, and its task.
-Treat an entry as settled: link its issue, say what your work adds, and spend your tokens on what is not here. A
-cause marked "suspected" is not shown yet. "Held" means a maintainer holds the work (TASKS.md, "Held by a
-maintainer"). Figures are from the maintainers' test scene at the larger console's profile on an NVIDIA card.
+Faults already found, each with what is seen and what is known of its cause. Treat an entry as settled: say what
+your work adds, and spend your tokens on what is not here. A cause marked "suspected" is not shown yet. Figures are
+from the maintainers' test scene at the larger console's profile and its 4K picture, on an NVIDIA RTX 5090, measured
+with PresentMon on 2026-11-28.
+
+**The runtime's base changed on 2026-11-28** (see `THIRD-PARTY.md`). This page describes the new base. Faults recorded
+on the earlier one (ghosting behind moving characters, lighting that flips for single frames, textures that flash
+black while moving, white-outs in the opening scene, dark bands across hair) have not been re-checked here: treat
+them as open questions, not as known.
 
 ## Speed
 
 ### The frame is limited by one thread
 
-- **Seen:** about 4 to 5 frames a second in the open world.
-- **Cause:** the thread that submits each frame is busy for about two thirds of the frame, more than half of that
-  inside Windows: reading title memory through the kernel (tens of thousands of calls a frame), changing and
-  querying page protection, and the card's interrupt work landing on its processor. It also waits about a fifth of
-  the frame for copy-back. The other cores are mostly idle.
-- **Established by:** a system trace (WPR and WPA) with the camera still.
-- **Task:** held (spreading the thread's work across cores); measurements on other machines: [71](issues/71-speed-switches-ab.md).
+- **Seen:** about 40 to 45 ms a frame (22 to 25 frames a second) in the open world. A build's first start is slower
+  while its shaders are prepared.
+- **Known:** by the runtime's own count, most of a frame goes to one thread that prepares the title's GPU work:
+  copies between the memory the title shares with its GPU and the card's own memory.
+- **Open:** a system trace of that thread, to say which waits and copies can go.
+
+### The title's ray-traced light costs about 12 ms a frame
+
+- **Seen:** about 54 to 56 ms a frame with `VICTORY_RT_RESOLVE=1` and `VICTORY_ACTIVATE_RAYS=1`.
+- **Known:** the title traces its own rays in compute programs; here they run as ordinary compute work, and the
+  extra time is on the submitting thread. Both switches are off by default, and a stand-in lights interiors.
 
 ## Picture
 
-### Faces: 16-bit integer values read as zero
+### Grain on the edges of sun shadows, hair and beards
 
-- **Seen:** through a 16-bit unsigned integer view the translator reads zero for every value, through a signed one
-  0 or 0xFFFF; normalised and float views read correctly.
-- **Cause:** every view is read through one float-typed handle and narrowed as a float.
-- **Established by:** six fixtures on the software adapter; the cause by reading the code. Open until a run:
-  whether the title's face programs make these loads.
-- **Task:** held (the fix, behind a switch).
+- **Seen:** speckled edges where sunlight falls through leaves, and dithered hair and beard outlines. It comes and
+  goes with the lighting: none in shade.
+- **Suspected:** the title draws these with per-pixel noise and smooths them by blending several frames; that blend
+  is not accumulating as it should.
 
-### Black dashes along clothing seams, hems and silhouettes
+### Red blocks flicker at the bottom and right edges of the screen
 
-- **Seen:** single black pixels and short dashes along seams, hems and silhouettes, and on some wooden edges.
-- **Cause, suspected:** the notices that title memory changed are global queues drained by whichever heap's walk
-  runs first, so another heap never learns its texture changed, and a texture uploaded before its bytes were final
-  is not uploaded again.
-- **Established by:** reading the code, and failing fixtures for the missed notice; a fix is merged behind
-  `VICTORY_TEXTURE_RECEIPTS` (off) and has not been run in the game.
-- **Task:** held (texture receipts, step two).
+- **Seen:** solid red patches made of blocks about 16 pixels across, appearing in one frame and changing a block at
+  a time. They stay fixed on the screen while the scene moves behind them.
+- **Suspected:** the per-tile light lists are not written for the last row or column of tiles, which keep stale
+  lists.
 
-### Textures flash black for a moment while moving
+### At a distance a character's head is not drawn
 
-- **Seen:** during a camera pan, a single frame with a whole surface black; in an earlier build, clouds missing
-  for two frames.
-- **Cause, suspected:** draws dropped while the driver compiles their pipeline: both moments fall where about 1,000
-  draws a frame were dropped for want of a pipeline. A new build starts with no pipelines on disk.
-- **Established by:** the runtime's own dropped-draw counter beside a recording; no pipeline is named yet.
-- **Task:** [59](issues/59-dropped-draws-by-pipeline.md) names the pipelines; pipelines carried across builds and
-  made ahead are held.
+- **Seen:** the head's skin is missing, the eyes remain, and the hair sits on a shoulder. Close up the head is right.
+- **Suspected:** programs that prepare distant characters use all 64 lanes of a console wave; on 32-lane cards they
+  run in an approximate form (see Shaders) that picks wrong values for half the lanes.
 
-### A glass door's dirt layer drops out for a frame or two
+### With the title's ray-traced light on
 
-- **Seen:** the dirt layer on a glass door flickers away for a frame or two.
-- **Cause:** not known; the stats give dropped draws only as averages over seconds and name no pipeline, so it
-  could not be tied to one.
-- **Established by:** a live session with the runtime's stats.
-- **Task:** [59](issues/59-dropped-draws-by-pipeline.md), then a skip of the named pipeline to confirm.
+- **Seen:** a strip of blocks along the bottom edge, and near geometry double-exposed with edges that step in blocks
+  about 16 pixels across.
+- **Suspected:** tiles whose light probes were never activated.
 
-### Ghosting behind moving characters and objects
+### The water's own light is switched off
 
-- **Seen:** moving characters leave a faint duplicate; a pale block trails a moving object reflected in water.
-- **Cause, suspected:** the title's temporal blend at about 4 frames a second: the block follows the object as the
-  camera sways (in some samples of a recording, not all). The motion vectors are not checked yet.
-- **Established by:** recordings.
-- **Task:** [66](issues/66-ghosting.md)
-
-### Characters lit wrongly for single frames
-
-- **Seen:** characters lit very differently for one frame, then normal again.
-- **Cause:** not known; the next step is the buffer present only some frames.
-- **Established by:** recordings.
-- **Task:** [67](issues/67-lighting-flips.md)
-
-### A character's forearms render purple or as coloured noise
-
-- **Seen:** one character's forearms are purple; others show coloured noise where tattoo or decal layers sit over
-  skin, while faces are right.
-- **Cause:** not known; the skin, decal and tattoo programs translate and run.
-- **Established by:** recordings and the warm-up's refusal list.
-- **Task:** [23](issues/23-forearm-noise.md)
-
-### An interior blows out to white, with hard-edged slabs of light
-
-- **Seen:** in some interiors, characters blow out to white and hard-edged slabs of
-  coloured light lie across surfaces.
-- **Cause:** not known; the lighting programs translate and run.
-- **Established by:** recordings.
-- **Task:** [25](issues/25-interior-white-out.md)
-
-### A dark band across hair
-
-- **Seen:** a dark band runs across characters' hair.
-- **Cause, suspected:** a 64-lane program behind the hair's mask, run in a 32-lane form.
-- **Established by:** recordings on an NVIDIA card.
-- **Task:** [68](issues/68-hair-band.md)
-
-### Walls in shadow darken after about 35 seconds at rest
-
-- **Seen:** with the camera still, shadowed walls darken after about 35 seconds.
-- **Cause:** not known.
-- **Established by:** recordings.
-- **Task:** [69](issues/69-walls-darken-at-rest.md)
-
-### The world's first 30 seconds are washed out, and white-outs
-
-- **Seen:** the first 30 seconds or so look washed out; at times the whole screen goes white.
-- **Cause:** not known.
-- **Established by:** recordings.
-- **Task:** [14](issues/14-white-out.md)
-
-### Ray-traced lighting and reflections are not drawn
-
-- **Seen:** no ray-traced reflections or bounce light; most dropped draws belong to the ray-tracing structure
-  builder, which ships switched off, and the frame line counts them apart.
-- **Cause:** the title's ray-tracing structures are not built for the host's ray tracing on any card yet.
-- **Established by:** the runtime's frame line; the builder's scope by reading the code.
-- **Task:** the build is held for the maintainers' decision; starter tasks [52](issues/52-builder-call-logging.md),
-  [53](issues/53-dxr-tier-probe.md), [54](issues/54-rehydrate-inputs-note.md).
-
-### A pipeline drawn into a target of another format
-
-- **Seen:** nothing yet; a claim to verify.
-- **Cause, suspected:** a host pipeline keeps the target formats the title declared, and the draw path does not
-  compare them with the targets bound; Direct3D 12 calls such a draw invalid.
-- **Established by:** reading the code, and another fork's fix for the same case.
-- **Task:** [60](issues/60-pipeline-target-format.md)
+- **Seen:** with it on, dark rectangles on the water.
+- **Known:** two tiled water-light passes produce them; the base leaves both off by default.
 
 ## Shaders
 
-### A few dozen programs are refused
+### 64-lane programs on 32-lane cards
 
-- **Seen:** with the paired 64-lane form on (the default), the warm-up refuses a few dozen programs, in five
-  groups: pixel programs with a sampler chosen behind a branch the proof does not accept; pixel programs needing a
-  hardware input (primitive-ordered pixel shading); wide-wave compute programs the paired form does not
-  take; compute programs that read a descriptor as data (the shadow rays); and a few one-off lane-mask cases. With
-  the form off, more are refused. Your own warm-up's list is the baseline: note its count before and after a
-  change.
-- **Cause:** each refusal names its reason.
-- **Established by:** the warm-up's refusal list on an NVIDIA card (the runtime's own count, matched by program id).
-- **Tasks:** [40](issues/40-sampler-branch-proof.md), [41](issues/41-primitive-ordered-preamble.md),
-  [42](issues/42-wide-wave-census.md), [72](issues/72-other-refused-programs.md)
+- **Known:** the console's GPU runs programs 64 lanes at a time; NVIDIA cards run 32. Each console wave is split in
+  two halves here, and a program that reads across the whole wave is translated in an approximate form.
+- **Switches:** `VICTORY_STRICT_HALVES=1` refuses those programs instead (their draws are dropped: characters lose
+  their bodies). `VICTORY_WAVE_WIDE=1` is an exact last-resort form that is slower and can hang the card.
 
-### A linked mesh pipeline the card refuses loses its draw
+### Programs that do not translate
 
-- **Seen:** a draw is lost when the card refuses the linked mesh and pixel pipeline made for it.
-- **Cause:** no fallback to the unlinked pair; the stages' interface is not checked before linking.
-- **Established by:** a review of the code, then fixtures; a fix is built and in review.
-- **Task:** held.
-
-## Memory and ordering (all held)
-
-Each was found by reading the code unless it says otherwise; a fix for each is held.
-
-- **Title buffer copies run out of order:** the title's in-frame buffer copies can run out of order, so an earlier
-  submission reads bytes a later one wrote. Confirmed by five failing tests on the path the title's lists take.
-- **A title memory copy written while earlier readers run:** a step that may write title memory waits for
-  submissions in the air only when they declare writes, so a copy can land under readers still running. Not
-  reproduced yet.
-- **Pages mapped while earlier submissions may still write there:** mapping on the title's call does not wait for
-  submissions in the air, and a late store into memory the title freed faults. Shown by two fixtures.
-- **The page opener can reopen memory the title has since re-protected or freed:** with the guard ledger off (the
-  default), stale watch entries outlive a protect, free or decommit. Not reproduced yet.
-- **The default card hash misses one two-block pattern of sign-bit changes:** a card write of that shape would
-  never reach the title. Found by a review; the wide form (`VICTORY_HASH_WIDE=1`, off) does not have the gap.
-- **Textures are made again in a still scene:** about 1,600 host textures a minute with the camera still. Counted
-  by the runtime's own `VICTORY_TEXTURE_MADE` line; the cause is not known.
+- **Seen:** about 225 of the title's roughly 25,800 programs do not translate at 32 lanes. The test scene uses one
+  of them, a compute program that collects triangles of small mesh pieces; its draws are dropped.
+- **How to count them:** the harness's run summary prints the programs a run could not translate.
 
 ## Tools and tests
 
-### The caption's GPU figure is not a load
+### Some of the base's own tests and lints fail
 
-- **Seen:** the caption's GPU busy figure once disagreed by a wide margin with an independent GPU clock in the same
-  frame.
-- **Cause:** it was built from the runtime's own waits for the card.
-- **Established by:** the comparison; PresentMon is the judge.
-- **Task:** [19](issues/19-caption-gpu-number.md)
+- **Known:** a handful of the base's tests fail or flake, and `cargo clippy -- -D warnings` reports findings the
+  base came with. The public CI builds the runtime and reports both without failing on them until they are cleared.
 
 ### The runtime's own measures are glue, not judges
 
-- **Seen:** an independent check found that the runtime's frame timings and GPU timestamps overlap and do not sum
-  ("idle" is not idle), and that the kernel-call counters do not see the title's own protection calls in the
-  default setup.
-- **Established by:** an independent review reading the code against what each tool reports.
-- **Task:** the counters' fixes are held; use the established tools (docs/DIAGNOSTICS.md) for any figure that
-  decides something.
+- **Known:** frame times come from PresentMon, a thread's time from a system trace, the card's time from a GPU
+  trace. The figures the runtime prints about itself are for orientation only (`docs/DIAGNOSTICS.md`).
 
-### A watch test fails now and then
+### Left out of this public copy
 
-- **Seen:** `write_watched_memory_reused_at_a_guarded_view_is_asked_about` failed once in 15 runs.
-- **Cause:** the test frees an address and asks for it again; another test can take it first.
-- **Established by:** reading the test.
-- **Task:** [64](issues/64-fixed-address-test.md)
+- The base's 1440p output mode, DLSS and frame generation: they work by changing the title's own code, and files
+  that do that are not published here.

@@ -3,10 +3,10 @@
 //! slice lies, and to copy linear data into tiled memory and back. Served
 //! from `victory_formats::texture`.
 //!
-//! The runtime exports `XGCreateTextureComputer` and
-//! `XGSuggestSwizzleMode` and implements these computer methods: Release
-//! (0x08), the layout (0x10), copies into (0x40) and out of (0x48) a
-//! subresource, and the 64 KiB tiling (0x50). The other slots log and fail.
+//! The title imports `XGCreateTextureComputer` and
+//! `XGSuggestSwizzleMode` and calls these computer methods: Release (0x08),
+//! the layout (0x10), copies into (0x40) and out of (0x48) a subresource,
+//! and the 64 KiB tiling (0x50). The other slots log and fail.
 #![allow(non_snake_case)]
 // Title code passes pointers the real library would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -74,7 +74,6 @@ pub extern "system" fn XGSuggestSwizzleMode(
     _flags: u32,
     out: *mut u32,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     // SAFETY: the title passes a description and room for the layout
     // (either may be null).
     match unsafe { (desc.as_ref(), out.as_mut()) } {
@@ -106,7 +105,6 @@ pub extern "system" fn XGCreateTextureComputer(
     desc: *const ResourceDesc,
     out: *mut This,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     // SAFETY: the title passes a description and room for a pointer.
     let (Some(&desc), false) = (unsafe { desc.as_ref() }, out.is_null()) else {
         return E_INVALIDARG;
@@ -166,8 +164,9 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
 
 const MIPS: usize = 15;
 
-/// One mip in the layout the runtime reads (offsets 0x00, 0x08, 0x10 and
-/// 0x1c are read; the rest follow the library's older public shape).
+/// One mip in the layout the title reads (offsets 0x00, 0x08, 0x10 and
+/// 0x1c are read by the title; the rest follow the library's
+/// older public shape).
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MipOut {
@@ -277,12 +276,10 @@ fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
 }
 
 extern "system" fn add_ref(this: This) -> u32 {
-    let _entry = victory_gpu::hle_call();
     computer(this).refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 extern "system" fn release(this: This) -> u32 {
-    let _entry = victory_gpu::hle_call();
     let left = computer(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
         // SAFETY: made by `Box::into_raw` in `XGCreateTextureComputer`; the
@@ -293,7 +290,6 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -385,7 +381,6 @@ extern "system" fn copy_into(
     row: u32,
     depth: u32,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let c = computer(this);
     let Some(a) = copy_args(c, plane, subresource, row, depth) else {
         return E_INVALIDARG;
@@ -423,7 +418,6 @@ extern "system" fn copy_from(
     row: u32,
     depth: u32,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let c = computer(this);
     let Some(a) = copy_args(c, plane, subresource, row, depth) else {
         return E_INVALIDARG;
@@ -471,8 +465,8 @@ const TILE: u64 = 64 << 10;
 /// 64 KiB modes only (others fail, as on the console). The mip tail is the
 /// packed part, tile 0 of each slice; tilings list the standard mips of
 /// every slice in turn. With a tail the console's library lists two slices
-/// at most and zeroes all but the first; so do we (a reader may read slice
-/// 0 only).
+/// at most and zeroes all but the first; so do we (the title reads slice 0
+/// only).
 extern "system" fn tiling(
     this: This,
     tiles: *mut u32,
@@ -545,8 +539,8 @@ extern "system" fn tiling(
 }
 
 /// Slot 0x30 `(plane, mip, x, y, z or slice, sample, bit position)`: an
-/// element's byte offset from the texture's start. A title reads
-/// texels on the CPU through it;
+/// element's byte offset from the texture's start. The title reads
+/// texels of a 128x4 `4KB_S` texture on the CPU through it;
 /// an error returned as an offset made it read wild memory. 0 if outside.
 extern "system" fn element_offset(
     this: This,
@@ -558,7 +552,6 @@ extern "system" fn element_offset(
     _sample: u32,
     bit: *mut u32,
 ) -> u64 {
-    let _entry = victory_gpu::hle_call();
     if !bit.is_null() {
         // SAFETY: the caller passes room for the bit position or null.
         unsafe { bit.write(0) };
@@ -576,10 +569,9 @@ extern "system" fn element_offset(
     }
 }
 
-/// Slots not exercised: size, alignment, offsets, coordinates, view
-/// descriptor, tiled-resource query.
+/// Slots the title does not call: size, alignment, offsets, coordinates,
+/// view descriptor, tiled-resource query.
 extern "system" fn unused(this: This) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     tracing::warn!(desc = ?computer(this).desc, "unimplemented texture computer method");
     E_NOTIMPL
 }
@@ -636,7 +628,7 @@ mod tests {
         }
     }
 
-    /// Method `index` of a computer, as a caller calls it.
+    /// Method `index` of a computer, as the title calls it.
     fn slot<T: Copy>(c: This, index: usize) -> T {
         // SAFETY: the computer is live; T is the slot's function type.
         unsafe { std::mem::transmute_copy(&(*c).vtable.0[index]) }
@@ -673,6 +665,10 @@ mod tests {
         d.flags = ALLOW_DEPTH_STENCIL;
         XGSuggestSwizzleMode(&d, 0, &mut out);
         assert_eq!(out, 0x118);
+        // A 1D texture has no tiled layout, whatever its use.
+        d.dimension = TEXTURE_1D;
+        XGSuggestSwizzleMode(&d, 0, &mut out);
+        assert_eq!(out, 0x100);
     }
 
     /// The title's calls: layout, then a copy in and out of each mip.

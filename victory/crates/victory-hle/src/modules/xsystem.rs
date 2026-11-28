@@ -41,8 +41,8 @@ const DEVICE_ID: &str = "VkljdG9yeSBvZmZsaW5lIGRldmljZSBpZGVudGl0eSE=";
 pub static OBJECT: Object = Object::new("system", &VTABLE);
 pub static ANALYTICS_OBJECT: Object = Object::new("analytics", &ANALYTICS_VTABLE);
 
-/// A later id of the interface (2026): the three slots implemented (0x18,
-/// 0x20, 0x28) take the same arguments as under the earlier id.
+/// The interface as the title (2026) asks for it; it calls the
+/// same three slots (0x18, 0x20, 0x28) with the same arguments.
 pub const IID_2026: Guid = Guid::new(
     0x1861_cf2e,
     0xe18b,
@@ -59,16 +59,13 @@ pub const INTERFACES: &[Interface] = &[
 type This = *const Object;
 
 extern "system" fn console_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     put_string(CONSOLE_ID, size, buffer, used)
 }
 extern "system" fn sandbox_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     put_string(SANDBOX, size, buffer, used)
 }
 /// The device id this title sees (titles see different ones).
 extern "system" fn device_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     put_string(DEVICE_ID, size, buffer, used)
 }
 
@@ -106,7 +103,6 @@ fn text(s: &str) -> [u8; 64] {
 /// A struct this large comes back through the caller's buffer, whose
 /// address is also the return value.
 extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut AnalyticsInfo {
-    let _entry = victory_gpu::hle_call();
     let info = AnalyticsInfo {
         os: OS,
         hosting_os: OS,
@@ -201,7 +197,6 @@ mod device_type {
     // Our titles import only these registry functions (and `RegOpenKeyExW`
     // below), so no other call can reach the host with our key.
     pub extern "system" fn RegOpenKeyW(root: Key, sub: *const u16, out: *mut Key) -> u32 {
-        let _entry = victory_gpu::hle_call();
         open(root, sub, out).unwrap_or_else(|| {
             host!("advapi32.dll", "RegOpenKeyW": extern "system" fn(Key, *const u16, *mut Key) -> u32)(
                 root, sub, out,
@@ -216,7 +211,6 @@ mod device_type {
         access: u32,
         out: *mut Key,
     ) -> u32 {
-        let _entry = victory_gpu::hle_call();
         open(root, sub, out).unwrap_or_else(|| {
             host!("advapi32.dll", "RegOpenKeyExW": extern "system" fn(
                 Key, *const u16, u32, u32, *mut Key,
@@ -232,7 +226,6 @@ mod device_type {
         data: *mut u8,
         size: *mut u32,
     ) -> u32 {
-        let _entry = victory_gpu::hle_call();
         if key != oem() {
             return host!("advapi32.dll", "RegQueryValueExW": extern "system" fn(
                 Key, *const u16, *mut u32, *mut u32, *mut u8, *mut u32,
@@ -268,7 +261,6 @@ mod device_type {
     }
 
     pub extern "system" fn RegCloseKey(key: Key) -> u32 {
-        let _entry = victory_gpu::hle_call();
         if key == oem() {
             return SUCCESS;
         }

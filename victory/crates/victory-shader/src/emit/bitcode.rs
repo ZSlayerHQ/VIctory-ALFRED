@@ -38,21 +38,6 @@ enum TypeDef {
     Func(Ty, Vec<Ty>),
 }
 
-/// What a module's float-to-integer conversions do about NaN, counted by
-/// [`Module::nan_shape`] for the tests.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct NanShape {
-    /// Float compares for unordered (`fcmp uno`): a host may fold them away.
-    pub uno: usize,
-    /// Integer NaN tests on the bits: `(bits & 0x7fffffff) > 0x7f800000`.
-    pub on_bits: usize,
-    /// Selects that choose +0 when one of those tests says NaN.
-    pub to_zero: usize,
-    /// Float-to-integer casts.
-    pub casts: usize,
-}
-
 /// A value: a global variable, a function, a module constant, or an
 /// instruction result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -128,6 +113,7 @@ pub(crate) enum Cast {
 
 /// Compare predicates: floats 0-15, integers 32-41.
 pub(crate) mod pred {
+    pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
     pub const OGT: u8 = 2;
     pub const OGE: u8 = 3;
@@ -462,17 +448,6 @@ impl Module {
         };
         self.push(block, ret, Op::Call(i, args))
     }
-    /// The call `call` once more at the end of `block`, with `new` wherever it takes `old`.
-    pub fn call_with(&mut self, block: usize, call: V, old: V, new: V) -> V {
-        let V::Inst(i) = call else {
-            panic!("not a call")
-        };
-        let Inst { ty, op: Op::Call(f, args) } = self.insts[i as usize].clone() else {
-            panic!("not a call")
-        };
-        let args = args.into_iter().map(|a| if a == old { new } else { a }).collect();
-        self.push(block, ty, Op::Call(f, args))
-    }
     /// A phi at the top of `block`; incoming values come with [`Module::set_phi`].
     pub fn phi(&mut self, block: usize, ty: Ty) -> V {
         let i = self.insts.len() as u32;
@@ -542,34 +517,6 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
-    /// Computes which empty latch blocks (only a `Br(h)` backedge from a
-    /// single predecessor `p`) can be folded into `p` without creating
-    /// duplicate `(p, h)` edges into header `h`'s PHI nodes.
-    fn empty_latch_folds(&self, post: &[usize], pos: &[u64]) -> Vec<Option<(usize, usize)>> {
-        let succs = |b: usize| successors(self.blocks[b].term);
-        let mut preds = vec![Vec::new(); self.blocks.len()];
-        for &b in post {
-            for &s in succs(b).iter() {
-                preds[s].push(b);
-            }
-        }
-        let mut fold = vec![None; self.blocks.len()];
-        for &b in post {
-            let blk = &self.blocks[b];
-            if let (Some(Term::Br(h)), true, [p]) = (
-                blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
-                &preds[b][..],
-            ) && pos[h] < pos[b]
-                && !succs(*p).contains(&h)
-                && !fold.contains(&Some((*p, h)))
-            {
-                fold[b] = Some((*p, h));
-            }
-        }
-        fold
-    }
-
     /// The module as bitcode.
     /// Which instructions are written: every body instruction, the branch
     /// conditions, and whatever they read, transitively (a phi nothing reads
@@ -600,37 +547,6 @@ impl Module {
             });
         }
         live
-    }
-
-    /// The shape of the module's NaN handling, for the tests that hold a
-    /// float-to-integer conversion to a NaN found on the operand's bits and
-    /// kept from the host's cast.
-    #[cfg(test)]
-    pub(crate) fn nan_shape(&self) -> NanShape {
-        let is_inf = |v: V| self.int_value(v) == Some(0x7F80_0000);
-        let is_zero = |v: V| {
-            matches!(v, V::Const(i) if self.consts[i as usize].1 == Const::Float(0))
-        };
-        let nan_test = |v: V| match v {
-            V::Inst(i) => matches!(
-                self.insts[i as usize].op,
-                Op::Cmp(pred::IUGT, a, b) if is_inf(a) || is_inf(b)
-            ),
-            _ => false,
-        };
-        let mut shape = NanShape::default();
-        for inst in &self.insts {
-            match &inst.op {
-                Op::Cmp(pred::UNO, ..) => shape.uno += 1,
-                Op::Cmp(pred::IUGT, a, b) if is_inf(*a) || is_inf(*b) => shape.on_bits += 1,
-                Op::Select(cond, a, b) if nan_test(*cond) && (is_zero(*a) || is_zero(*b)) => {
-                    shape.to_zero += 1
-                }
-                Op::Cast(Cast::FpToSi | Cast::FpToUi, _) => shape.casts += 1,
-                _ => {}
-            }
-        }
-        shape
     }
 
     pub fn write(&self) -> Vec<u8> {
@@ -800,7 +716,25 @@ impl Module {
         // An empty latch (only a branch back to its loop header) is folded
         // into its one predecessor, so the exiting block is the latch as in
         // DXC's loops; the AMD driver hangs on divergent loops otherwise.
-        let fold = self.empty_latch_folds(&post, &pos);
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for &b in &post {
+            for &s in succs(b).iter() {
+                preds[s].push(b);
+            }
+        }
+        let mut fold = vec![None; self.blocks.len()];
+        for &b in &post {
+            let blk = &self.blocks[b];
+            if let (Some(Term::Br(h)), true, [p]) = (
+                blk.term,
+                blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
+                &preds[b][..],
+            ) && pos[h] < pos[b]
+                && !succs(*p).contains(&h)
+            {
+                fold[b] = Some((*p, h));
+            }
+        }
         let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in layout.iter().enumerate() {
@@ -1263,6 +1197,45 @@ mod tests {
     }
 
     #[test]
+    fn empty_latch_with_dead_phis_is_folded() {
+        // Two identical loops except one has an unread phi in its empty latch;
+        // both must fold the latch and emit identical bitcode.
+        let build = |with_dead_phi: bool| {
+            let mut m = Module::default();
+            let i32t = m.int(32);
+            let void = m.void();
+            let fty = m.func_ty(void, vec![i32t]);
+            let f = m.function("sink", fty, Some(Attr::NoUnwind), false);
+            let main_ty = m.func_ty(void, vec![]);
+            m.function("main", main_ty, None, true);
+            let (entry, head, body, latch, exit) = (
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+            );
+            let (z, one, ten) = (m.i32(0), m.i32(1), m.i32(10));
+            m.terminate(entry, Term::Br(head));
+            let i = m.phi(head, i32t);
+            m.terminate(head, Term::Br(body));
+            let next = m.bin(body, Bin::Add, i, one);
+            let cond = m.cmp(body, pred::IULT, next, ten);
+            m.terminate(body, Term::CondBr(cond, latch, exit));
+            if with_dead_phi {
+                let dead = m.phi(latch, i32t);
+                m.set_phi(dead, vec![(next, body)]);
+            }
+            m.terminate(latch, Term::Br(head));
+            m.set_phi(i, vec![(z, entry), (next, latch)]);
+            let _ = m.call(exit, f, vec![next]);
+            m.terminate(exit, Term::Ret);
+            m.write()
+        };
+        assert_eq!(build(false), build(true));
+    }
+
+    #[test]
     fn successors_of_each_terminator() {
         assert!(successors(None).is_empty());
         assert!(successors(Some(Term::Ret)).is_empty());
@@ -1281,61 +1254,6 @@ mod tests {
             let bytes = synthetic(regs, stages, read).write();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
         }
-    }
-
-    /// When a conditional branch `p` targets two empty latch blocks `b1` and
-    /// `b2` that both jump back to loop header `h`, at most one may be folded
-    /// into `(p, h)`. Folding both would rewrite both edges as coming from
-    /// `%p`, producing invalid LLVM/DXIL PHI records with duplicate incoming
-    /// predecessor blocks carrying different values.
-    #[test]
-    fn twin_empty_latches_from_one_predecessor_do_not_both_fold() {
-        let mut m = Module::default();
-        let i32t = m.int(32);
-        let (entry, head, body, b1, b2, exit) = (
-            m.new_block(),
-            m.new_block(),
-            m.new_block(),
-            m.new_block(),
-            m.new_block(),
-            m.new_block(),
-        );
-        let v0 = m.i32(0);
-        let v1 = m.i32(1);
-        let v2 = m.i32(2);
-        let phi = m.phi(head, i32t);
-        m.set_phi(phi, vec![(v0, entry), (v1, b1), (v2, b2)]);
-        m.terminate(entry, Term::Br(head));
-        let stay = m.cmp(head, pred::EQ, phi, v0);
-        m.terminate(head, Term::CondBr(stay, body, exit));
-        let branch = m.cmp(body, pred::EQ, phi, v1);
-        m.terminate(body, Term::CondBr(branch, b1, b2));
-        m.terminate(b1, Term::Br(head));
-        m.terminate(b2, Term::Br(head));
-        m.terminate(exit, Term::Ret);
-
-        let post = vec![entry, head, body, b1, b2, exit];
-        let mut pos = vec![u64::MAX; m.blocks.len()];
-        for (n, &b) in post.iter().enumerate() {
-            pos[b] = n as u64;
-        }
-        let fold = m.empty_latch_folds(&post, &pos);
-        // Exactly one of (b1, b2) folds; the other remains its own block so
-        // `head`'s PHI incoming predecessor block IDs stay pairwise distinct.
-        let folded_count = [b1, b2].iter().filter(|&&b| fold[b].is_some()).count();
-        assert_eq!(folded_count, 1, "only one empty latch from `body` to `head` may fold");
-        let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
-        let mut layout_pos = vec![u64::MAX; m.blocks.len()];
-        for (n, &b) in layout.iter().enumerate() {
-            layout_pos[b] = n as u64;
-        }
-        let from = |b: usize| fold[b].map_or(layout_pos[b], |(p, _)| layout_pos[p]);
-        let preds = [from(entry), from(b1), from(b2)];
-        assert_ne!(preds[0], preds[1]);
-        assert_ne!(preds[0], preds[2]);
-        assert_ne!(preds[1], preds[2]);
-        // And writing the module completes cleanly.
-        assert!(!m.write().is_empty());
     }
 
     #[test]

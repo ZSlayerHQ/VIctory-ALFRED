@@ -4,7 +4,7 @@
 //! types.
 //!
 //! Host pipelines are made on a pipeline's first draw, not at creation:
-//! The title creates tens of thousands of pipelines in its first
+//! The title creates some 60,000 pipelines in its first 20
 //! seconds and draws with a few dozen (decision 0007, step 3). Shader
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
@@ -61,6 +61,9 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Its part in the stand-in for the indirect light.
+    #[cfg(windows)]
+    pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -97,29 +100,22 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
-/// Host pipelines made and loaded from the library since the start: what
-/// tells, once a scene has settled, whether pipeline states are being made
-/// again (the 600-frame line and the live stats file; `host/background.rs`).
-#[cfg(windows)]
-pub(crate) fn library_counts() -> (u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
-}
-
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
-    let (full, id) = victory_shader::container_id(bytes);
+    let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(full)
+        .entry(*full.as_bytes())
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             Arc::new(Shader {
                 stage,
-                hash: id,
+                hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -127,49 +123,22 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
-/// Puts the translation of a container of the title's into the cache on
-/// disk, and with `compute` its host pipeline into the driver's, before any
-/// run wants them. Whether it translated, and whether it has a pipeline
-/// (`None`: not asked for, or left out).
-#[cfg(windows)]
-pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Option<bool>) {
-    let full = blake3::hash(container);
-    // Not through the table, which lets nothing go.
-    let shader = Arc::new(Shader {
-        stage,
-        hash: full.to_hex()[..16].to_owned(),
-        container: container.to_vec(),
-        translated: OnceLock::new(),
-    });
-    let translated = shader.translated().is_some();
-    let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
-    (translated, made)
-}
-
-/// Tests: a compute shader already translated to `host`, its console
-/// program reading `used`, for [`host::HostPipeline::new`] to make a
-/// pipeline of as it makes the title's.
-#[cfg(all(windows, test))]
-pub(crate) fn test_translated_program(
-    host: victory_shader::emit::HostShader,
-    used: Vec<victory_shader::UsedResource>,
-) -> Arc<Shader> {
-    Arc::new(Shader {
-        stage: "compute",
-        hash: "translated test".to_owned(),
-        container: Vec::new(),
-        translated: OnceLock::from(Some(Translated { host, used, stores: true })),
-    })
-}
-
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
+    /// A compute program's threads in a group.
+    pub(crate) threads: Option<[u32; 3]>,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    pub(crate) tables: crate::draw::TablePlan,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store through raw addresses ([`stores_by_address`]).
+    pub(crate) stores_by_address: bool,
+    /// Whether it stores through a view it picks from the heap by an index,
+    /// once asked (`crate::picked`).
+    pub(crate) picks: std::sync::atomic::AtomicU8,
 }
 
 #[cfg(windows)]
@@ -217,17 +186,33 @@ impl Shader {
 }
 
 #[cfg(windows)]
+impl Shader {
+    /// The console programs of the container; `None` if they are not known.
+    pub(crate) fn programs(&self) -> Option<Vec<victory_shader::NativeProgram>> {
+        use victory_shader::{Container, FourCC};
+        let c = Container::parse(&self.container).ok()?;
+        let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
+        victory_shader::native_programs(part.data).ok()
+    }
+}
+
+#[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
+    let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let threads = programs.iter().find_map(|p| match &p.io {
+        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
+        _ => None,
+    });
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -238,21 +223,36 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    Ok(Translated {
+        host,
+        threads,
+        used,
+        tables,
+        stores,
+        stores_by_address,
+        picks: Default::default(),
+    })
 }
 
-/// The compute pipelines taken for a ray-tracing structure builder's
-/// stages ([`of_builder`]) run **all or none**. Such stages feed each
-/// other through memory: a stage that runs on what a dropped stage never
-/// wrote can compute where it stores from garbage. The structures it
-/// builds lie in plain title memory, and a root view has no size, so
-/// nothing stops such a store from landing on whatever lies next to them.
+/// The compute pipelines of the console's ray-tracing structure builder
+/// (`XboxBvhBuilder.dll`; its programs are the ones with a spilled
+/// user-data table) run **all or none**. Its stages feed each other
+/// through memory: a stage that runs on what a dropped stage never wrote
+/// computes its store offsets from garbage. The structures lie in plain
+/// title memory, between the title's own objects, and a root view has no
+/// size, so those stores land on the neighbours (run 98, with 14 of 35
+/// stages translated: the title died within a second of the first builder
+/// submission, on pointers that had become bounding-box bit patterns).
 ///
 /// So a builder dispatch runs only while every builder pipeline the title
 /// has created has a host pipeline; the first builder dispatch makes them
 /// all on the spot instead of over the next frames (a stage "still being
-/// made" would be a dropped stage). One that cannot be made turns the
-/// builder off for the rest of the run.
+/// made" would be a dropped stage). While one cannot be made the builder
+/// is off; it is looked at again when the title creates another. A stage
+/// that could not be bound stops the stages after it for the rest of that
+/// frame and the next ([`builder_rests`]); it turned the builder off for the
+/// rest of the run at first.
 ///
 /// shortcut: and only with `VICTORY_BVH_BUILDER=1`, until a run has shown
 /// the whole builder and the host side of title memory by address
@@ -263,15 +263,18 @@ struct Builder {
     pipelines: Vec<Arc<make::Pending>>,
     /// Every one of `pipelines` has a host pipeline.
     whole: bool,
-    /// One could not be made.
-    off: bool,
+    /// One could not be made, of so many (0: none).
+    off: usize,
+    /// No stage runs before this frame.
+    rests: u64,
 }
 
 #[cfg(windows)]
 static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     pipelines: Vec::new(),
     whole: false,
-    off: false,
+    off: 0,
+    rests: 0,
 });
 
 /// Whether `shaders` are a pipeline of the structure builder.
@@ -300,15 +303,8 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// memory when the title writes them.
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
-    is_builder(this) && bvh_quarantine()
-}
-
-/// Whether `VICTORY_BVH_QUARANTINE=1` is set: the builder's stores then run undeclared, and
-/// the copy-back's fetch stays on the drawing queue (`host/fetch.rs`).
-#[cfg(windows)]
-pub(crate) fn bvh_quarantine() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -317,13 +313,15 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
-/// A stage of the builder was dropped after all: none runs from here on.
+/// A stage of the builder was dropped after all: none runs for the rest of
+/// this frame and the next (what it fed is not there).
 #[cfg(windows)]
-pub(crate) fn builder_off(why: &'static str) {
+pub(crate) fn builder_rests(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if !b.off {
-        b.off = true;
-        tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
+    b.rests = crate::frame::current() + 2;
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+        tracing::warn!(why, "the ray-tracing structure builder rests for this frame and the next: its stages run all or none");
     }
 }
 
@@ -336,22 +334,24 @@ pub(crate) fn builder_runs() -> bool {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.off {
+    if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
         return false;
     }
     if b.whole {
         return true;
     }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
-    if missing > 0 {
-        b.off = true;
+    let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
+    if !missing.is_empty() {
+        b.off = b.pipelines.len();
         tracing::warn!(
-            missing,
+            missing = missing.len(),
             of = b.pipelines.len(),
+            which = ?missing,
             "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
         );
         return false;
     }
+    b.off = 0;
     tracing::info!(
         pipelines = b.pipelines.len(),
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
@@ -389,6 +389,23 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
     })
 }
 
+/// Whether a console program can store to memory through raw addresses
+/// (`crate::memory`): a flat or global store or atomic, or code that does
+/// not decode. The programs that only walk ray-tracing structures do not,
+/// whatever they store through views.
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        matches!(i.encoding, Encoding::Flat | Encoding::Global)
+            && i.name()
+                .is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+    })
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
@@ -413,24 +430,6 @@ const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geomet
 fn pipeline<'a>(this: This) -> &'a Pipeline {
     // SAFETY: the title passes one of our pipelines.
     unsafe { &*this.cast::<Pipeline>() }
-}
-
-/// The id of title pipeline `this` as the log names it: its stages and
-/// shader ids, `[compute 0123..]` (`None` for no pipeline). The live skip
-/// switches ([`crate::live`]) match their lists against this.
-pub(crate) fn live_id(this: This) -> Option<String> {
-    (!this.is_null()).then(|| format!("{:?}", pipeline(this).shaders))
-}
-
-/// The stages and hashes of title pipeline `this`, as `[mesh 0123..,
-/// pixel 4567..]` (diagnostics); "no pipeline" for none.
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn shaders_of(this: This) -> String {
-    if this.is_null() {
-        return "no pipeline".to_owned();
-    }
-    let names: Vec<String> = pipeline(this).shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
-    format!("[{}]", names.join(", "))
 }
 
 /// List method: logs each pipeline's shaders the first time a list binds
@@ -464,6 +463,13 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
+}
+
+/// Draws and dispatches asked of pipelines left out on purpose since the last
+/// call (ray-tracing passes without the structure builder).
+#[cfg(windows)]
+pub(crate) fn take_left_out() -> u64 {
+    make::take_left_out()
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
@@ -570,6 +576,8 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
+    known::note(host.key(), &shaders, host.graphics.as_deref());
+    #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
     let builder = of_builder(&shaders);
@@ -600,7 +608,6 @@ pub(crate) extern "system" fn create_graphics(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    let _entry = crate::budget::entry(crate::budget::Phase::ObjectCalls);
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -623,7 +630,6 @@ pub(crate) extern "system" fn create_compute(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    let _entry = crate::budget::entry(crate::budget::Phase::ObjectCalls);
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -649,7 +655,6 @@ pub(crate) extern "system" fn create_compute_x(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    let _entry = crate::budget::entry(crate::budget::Phase::ObjectCalls);
     create_compute(this, desc, iid, out)
 }
 
@@ -697,7 +702,6 @@ pub(crate) extern "system" fn create_stream(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    let _entry = crate::budget::entry(crate::budget::Phase::ObjectCalls);
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -742,12 +746,10 @@ pub(crate) extern "system" fn create_stream(
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    let _entry = crate::budget::entry(crate::budget::Phase::ObjectCalls);
     let found = object::is(iid, &PIPELINE_IIDS).then_some(this);
     object::answer(PIPELINE, iid, found, out)
 }
 extern "system" fn release(this: This) -> u32 {
-    let _entry = crate::budget::entry(crate::budget::Phase::ObjectCalls);
     object::release_boxed::<Pipeline>(this)
 }
 
@@ -762,6 +764,8 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub mod known;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
@@ -781,12 +785,6 @@ pub(crate) fn library_removal_note() -> String {
     library::removal_note()
 }
 
-/// Tests: holds a library call open, as a pipeline being made does, until dropped.
-#[cfg(test)]
-pub(crate) fn hold_call_for_tests() -> impl Drop {
-    library::call_for_tests()
-}
-
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
@@ -798,144 +796,6 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
-}
-
-/// Tests: containers of the console's made here, with one native vertex
-/// program each (GFX10 code and its root tables, as `victory_shader::native`
-/// reads them), and title pipelines made of them as the title makes them,
-/// from a stream, with their host pipelines made: what draws reach through
-/// the bind path (`crate::draw::State::bind`) and its classification of
-/// programs that store ([`stores`]).
-#[cfg(all(test, windows, feature = "diagnostics"))]
-pub(crate) mod test_programs {
-    use super::*;
-    use victory_shader::{FourCC, ResourceType, RootParam, RootType, UsedResource};
-
-    /// A container holding one native vertex program: wave32, `vgprs`
-    /// VGPRs, `code`, the root layout `layout` and the resources `used`, and
-    /// stage data with no inputs and no outputs.
-    pub(crate) fn vertex_container(vgprs: u32, code: &[u32], layout: &[RootParam], used: &[UsedResource]) -> Vec<u8> {
-        const ABSENT: u64 = 0xDEAD_BEEF_DEAD_BEEF;
-        const RECORD: usize = 0x54;
-        const STAGE_DATA: usize = 0x200;
-        // The payload's record table: LS HS ES GS VS PS, mesh, compute.
-        const VERTEX: usize = 0x28;
-        let root = |r: RootType| match r {
-            RootType::Constants => 0u8,
-            RootType::Descriptor => 1,
-            RootType::Table => 3,
-            _ => unimplemented!("a root type the tests do not make"),
-        };
-        let mut payload = 6u64.to_le_bytes().to_vec();
-        payload.resize(0x68, 0);
-        for at in [0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x48, 0x60] {
-            payload[at..at + 8].copy_from_slice(&ABSENT.to_le_bytes());
-        }
-        let record = payload.len();
-        payload[VERTEX..VERTEX + 8].copy_from_slice(&(record as u64).to_le_bytes());
-        payload.resize(record + RECORD + STAGE_DATA, 0);
-        let tables = payload.len();
-        for p in layout {
-            let mut e = [0u8; 20];
-            e[0] = root(p.root);
-            e[4..8].copy_from_slice(&p.table_offset_dwords.to_le_bytes());
-            e[8..12].copy_from_slice(&p.sgprs.to_le_bytes());
-            e[12..16].copy_from_slice(&p.base_register.to_le_bytes());
-            (e[16], e[17]) = (p.user_data, p.slot);
-            payload.extend_from_slice(&e);
-        }
-        let used_at = payload.len();
-        for u in used {
-            let mut e = [0u8; 20];
-            e[0] = match u.kind {
-                ResourceType::Srv => 0,
-                ResourceType::Sampler => 1,
-                ResourceType::Cbv => 2,
-                ResourceType::Uav => 3,
-                ResourceType::Other(n) => n,
-            };
-            e[1] = root(u.root);
-            e[4..8].copy_from_slice(&u.table_offset_dwords.to_le_bytes());
-            e[8..12].copy_from_slice(&u.lower_bound.to_le_bytes());
-            e[12..16].copy_from_slice(&u.stride.to_le_bytes());
-            (e[16], e[17], e[18]) = (u.dwords, u.user_data, u.slot);
-            payload.extend_from_slice(&e);
-        }
-        let code_at = payload.len();
-        payload.extend(code.iter().flat_map(|w| w.to_le_bytes()));
-        let put = |payload: &mut Vec<u8>, at: usize, bytes: &[u8]| payload[record + at..record + at + bytes.len()].copy_from_slice(bytes);
-        put(&mut payload, 0x00, &(code_at as u64).to_le_bytes());
-        put(&mut payload, 0x08, &(4 * code.len() as u64).to_le_bytes());
-        put(&mut payload, 0x14, &(1u32 << 5).to_le_bytes());
-        put(&mut payload, 0x28, &(tables as u64).to_le_bytes());
-        put(&mut payload, 0x30, &(used_at as u64).to_le_bytes());
-        put(&mut payload, 0x38, &(layout.len() as u32).to_le_bytes());
-        put(&mut payload, 0x3c, &(used.len() as u32).to_le_bytes());
-        put(&mut payload, 0x50, &(vgprs | 16 << 20).to_le_bytes());
-        let mut fssm = b"FSSM".to_vec();
-        fssm.extend_from_slice(&0x101u32.to_le_bytes());
-        fssm.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        fssm.extend_from_slice(&payload);
-        let mut packed = vec![0u8; zlib_rs::compress_bound(fssm.len())];
-        let (stream, rc) = zlib_rs::compress_slice(&mut packed, &fssm, zlib_rs::DeflateConfig::new(6));
-        assert_eq!(rc, zlib_rs::ReturnCode::Ok);
-        let mut blob = b"XBCH".to_vec();
-        blob.extend_from_slice(&3u32.to_le_bytes());
-        blob.extend_from_slice(&(stream.len() as u64).to_le_bytes());
-        blob.extend_from_slice(&(fssm.len() as u64).to_le_bytes());
-        blob.extend_from_slice(stream);
-        // The part: its program header, the index of one blob, the blob.
-        let mut part = vec![0u8; 0x18];
-        part.extend_from_slice(b"XDAT");
-        part.extend_from_slice(&1u32.to_le_bytes());
-        part.extend_from_slice(&0x24u32.to_le_bytes());
-        let at = part.len() + 12;
-        for v in [0x0d, at as u32, blob.len() as u32] {
-            part.extend_from_slice(&v.to_le_bytes());
-        }
-        part.extend_from_slice(&blob);
-        // The container: its header (no digest), the part's offset, the part.
-        let total = 32 + 4 + 8 + part.len();
-        let mut out = b"DXBC".to_vec();
-        out.extend_from_slice(&[0; 16]);
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&(total as u32).to_le_bytes());
-        out.extend_from_slice(&1u32.to_le_bytes());
-        out.extend_from_slice(&36u32.to_le_bytes());
-        out.extend_from_slice(&FourCC::DXIL.0);
-        out.extend_from_slice(&(part.len() as u32).to_le_bytes());
-        out.extend_from_slice(&part);
-        out
-    }
-
-    /// A title graphics pipeline of the vertex program in `vs`, drawing
-    /// `topology` (a primitive topology type) with no targets and no depth
-    /// test, made from a stream as the title makes one; its host pipeline
-    /// made on this thread (`None` if it was refused).
-    pub(crate) fn graphics(vs: &[u8], topology: u32) -> (This, Option<&'static host::HostPipeline>) {
-        let mut stream = Vec::new();
-        // A subobject: its type, then its data from `from` on, `size` bytes in all.
-        let mut sub = |kind: u32, from: usize, data: &[u8], size: usize| {
-            let at = stream.len();
-            stream.resize(at + size, 0);
-            stream[at..at + 4].copy_from_slice(&kind.to_le_bytes());
-            stream[at + from..at + from + data.len()].copy_from_slice(data);
-        };
-        let code = [(vs.as_ptr() as u64).to_le_bytes(), (vs.len() as u64).to_le_bytes()].concat();
-        sub(1, 8, &code, 24);
-        sub(14, 4, &topology.to_le_bytes(), 8);
-        // Depth-stencil: no depth or stencil test; comparisons "always", stencil
-        // operations "keep".
-        let words: [u32; 13] = [0, 0, 8, 0, 0xffff, 1, 1, 1, 8, 1, 1, 1, 8];
-        let depth: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        sub(11, 4, &depth, 56);
-        let desc = StreamDesc { size: stream.len(), stream: stream.as_ptr() };
-        let mut p = std::ptr::null();
-        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), crate::object::S_OK);
-        let made = make::now(&pipeline(p).host);
-        (p, made.then(|| host_pipeline(p)).flatten())
-    }
 }
 
 #[cfg(test)]
@@ -1003,41 +863,41 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 
-    /// A stream assembled for this test, its subobjects in an order of the test's own, each
-    /// where the sizes of those before it put it (the sizes written out here, not taken
-    /// from [`subobject`]): topology, a pixel shader, a sample description, the render
-    /// target formats, a mesh shader, the rasterizer state and the sample mask.
+    /// The stream layout the title builds: root
+    /// signature, five shader slots (the first a mesh shader), blend, sample
+    /// mask, rasterizer, depth-stencil 1, sample description, input layout,
+    /// topology, render target and depth formats: 0x2b0 bytes.
     #[test]
     fn streams_yield_their_shaders() {
         let (ms, ps) = ([9u8; 7], [4u8; 5]);
-        let mut stream: Vec<u8> = Vec::new();
-        // Appends a zeroed subobject of `kind` and `size` bytes; its offset.
-        let add = |stream: &mut Vec<u8>, kind: u32, size: usize| {
-            let at = stream.len();
-            stream.resize(at + size, 0);
-            stream[at..at + 4].copy_from_slice(&kind.to_le_bytes());
-            at
-        };
-        let put = |stream: &mut Vec<u8>, at: usize, v: u32| stream[at..at + 4].copy_from_slice(&v.to_le_bytes());
-        let shader = |stream: &mut Vec<u8>, at: usize, code: &[u8]| {
-            stream[at + 8..at + 16].copy_from_slice(&(code.as_ptr() as u64).to_le_bytes());
-            stream[at + 16..at + 24].copy_from_slice(&(code.len() as u64).to_le_bytes());
-        };
-        // Topology type 2 (lines).
-        let at = add(&mut stream, 14, 8);
-        put(&mut stream, at + 4, 2);
-        let at = add(&mut stream, 2, 24);
-        shader(&mut stream, at, &ps);
-        add(&mut stream, 17, 16);
-        // Two render targets, of formats 10 and 24.
-        let at = add(&mut stream, 15, 40);
-        put(&mut stream, at + 4, 10);
-        put(&mut stream, at + 8, 24);
-        put(&mut stream, at + 36, 2);
-        let at = add(&mut stream, 24, 24);
-        shader(&mut stream, at, &ms);
-        add(&mut stream, 10, 48);
-        add(&mut stream, 9, 8);
+        let mut stream = vec![0u8; 0x2b0];
+        let mut put = |at: usize, v: u64| stream[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        for (at, kind) in [
+            (0x10, 24),
+            (0x28, 2),
+            (0x40, 3),
+            (0x58, 4),
+            (0x70, 5),
+            (0x88, 8),
+            (0x1d8, 9),
+            (0x1e0, 10),
+            (0x210, 21),
+            (0x250, 17),
+            (0x260, 12),
+            (0x278, 14),
+            (0x280, 15),
+            (0x2a8, 16),
+        ] {
+            put(at, kind);
+        }
+        put(0x18, ms.as_ptr() as u64);
+        put(0x20, ms.len() as u64);
+        put(0x30, ps.as_ptr() as u64);
+        put(0x38, ps.len() as u64);
+        // Topology type 3 (triangles), one render target of format 28.
+        put(0x278, 14 | 3 << 32);
+        put(0x280, 15 | 28 << 32);
+        put(0x2a0, 1 << 32);
         let desc = StreamDesc {
             size: stream.len(),
             stream: stream.as_ptr(),
@@ -1045,15 +905,14 @@ mod tests {
         let mut p = std::ptr::null();
         let hr = create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
         assert_eq!(hr, S_OK);
-        // In the stream's order.
-        assert_eq!(shaders(p), [("pixel", ps.to_vec()), ("mesh", ms.to_vec())]);
+        assert_eq!(shaders(p), [("mesh", ms.to_vec()), ("pixel", ps.to_vec())]);
         #[cfg(windows)]
         {
             let g = pipeline(p).host.graphics.as_deref().unwrap();
-            assert_eq!(g.topology.0, 2);
+            assert_eq!(g.topology.0, 3);
             assert_eq!(
-                (g.targets.NumRenderTargets, g.targets.RTFormats[0].0, g.targets.RTFormats[1].0),
-                (2, 10, 24)
+                (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
+                (1, 28)
             );
         }
     }

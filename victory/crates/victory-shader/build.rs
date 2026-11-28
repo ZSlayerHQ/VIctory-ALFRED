@@ -1,8 +1,7 @@
 //! Fingerprint of the translator's own source, for the shader cache key
 //! (`victory-gpu`'s `shader_cache`): a rebuilt executable whose translator did
 //! not change keeps its cached translations. Also lists every `VICTORY_*`
-//! switch the translator reads, whose values join the key at run time (not
-//! the names in `NOT_SWITCHES`, which choose a device or a gate).
+//! switch the translator reads, whose values join the key at run time.
 //! Reads only this crate's `src` folder; writes nothing but cargo directives.
 
 use std::path::{Path, PathBuf};
@@ -20,22 +19,6 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
 }
-
-/// `"VICTORY_..."` names in the sources that are no translation switches: they choose the
-/// device a host is made on, or what a gate requires of it, and never change what the translator
-/// emits (the host facts that do, its waves, join the key on their own). They stay out of the
-/// list, whose values key the shader cache: set, even to the adapter the rule takes anyway, they
-/// put every translation under a new key (the hybrid laptop, 2026-11-25: `hits=0 misses=641`
-/// at the start screen with `VICTORY_ADAPTER=default` on the card it had without it).
-const NOT_SWITCHES: &[&str] = &[
-    // `adapter.rs`: the adapter rule's override, and a gate's requirement of a test host.
-    "VICTORY_ADAPTER",
-    "VICTORY_REQUIRE_GPU",
-    // `adapter.rs` names the runtime's software switch (victory-gpu's) in its tests.
-    "VICTORY_D3D12_WARP",
-    // `oracle/tests.rs`: the folder of an offline coverage census (an ignored test's input).
-    "VICTORY_ORACLE_COVERAGE",
-];
 
 /// FNV-1a, 64 bits, two lanes with different offsets: a mismatch only costs
 /// a cache miss, so this need not be cryptographic.
@@ -70,7 +53,7 @@ fn main() {
             let end = tail
                 .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
                 .unwrap_or(tail.len());
-            if tail[end..].starts_with('"') && !NOT_SWITCHES.contains(&&tail[..end]) {
+            if tail[end..].starts_with('"') {
                 switches.insert(tail[..end].to_string());
             }
             rest = &tail[end..];

@@ -48,13 +48,25 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
     };
     let host_of = |rest: &str| rest.split(['/', '\\']).next().unwrap_or("").to_string();
+    // Two leading separators, of either kind: to the host, a share.
+    let share = |s: &str| {
+        let b = s.as_bytes();
+        b.len() >= 2 && b[..2].iter().all(|c| b"/\\".contains(c))
+    };
     let path = if let Some(rest) = text.strip_prefix(r"\\?\") {
         if !drive(rest) {
             return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
         }
         text.clone()
-    } else if let Some(rest) = text.strip_prefix(r"\\").or_else(|| text.strip_prefix("//")) {
-        return Err(("unc".into(), host_of(rest)));
+    } else if let Some(rest) = text.strip_prefix(r"\??\") {
+        // The same prefix as the object manager spells it; the host's file
+        // calls take it too.
+        if !drive(rest) {
+            return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
+        }
+        return Ok(with_nul(url));
+    } else if share(&text) {
+        return Err(("unc".into(), host_of(&text[2..])));
     } else if drive(&text) {
         text.clone()
     } else if let Some((scheme, rest)) = text.split_once(':').filter(|(s, _)| {
@@ -67,18 +79,24 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         if scheme != "file" {
             return Err((scheme, authority.map(host_of).unwrap_or_default()));
         }
-        let path = match authority {
+        let (path, this_machine) = match authority {
             Some(rest) => {
                 let host = host_of(rest);
                 if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
                     return Err((scheme, host));
                 }
-                &rest[host.len()..]
+                (&rest[host.len()..], !host.is_empty())
             }
-            None => rest,
+            None => (rest, false),
         };
+        let whole = percent_decode(path);
         let path = percent_decode(path.trim_start_matches(['/', '\\'])).replace('/', "\\");
         if !drive(&path) {
+            // With no host named, a path that starts with two separators
+            // names one: `file:////server/share` is `\\server\share`.
+            if !this_machine && share(&whole) {
+                return Err((scheme, host_of(whole.trim_start_matches(['/', '\\']))));
+            }
             // A local file without a drive: the host resolves it as is.
             return Ok(with_nul(url));
         }
@@ -100,8 +118,11 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        // `from_str_radix` accepts a leading sign, so `%+1` would decode as
+        // a control byte. A percent escape is exactly two hex digits.
         let hex = b
             .get(i + 1..i + 3)
+            .filter(|h| h.iter().all(|c| c.is_ascii_hexdigit()))
             .and_then(|h| std::str::from_utf8(h).ok());
         match (b[i], hex.and_then(|h| u8::from_str_radix(h, 16).ok())) {
             (b'%', Some(v)) => {
@@ -267,13 +288,11 @@ extern "system" fn query_interface(
 }
 
 extern "system" fn add_ref(this: *mut Resolver) -> u32 {
-    let _entry = victory_gpu::hle_call();
     // SAFETY: as in `host`.
     unsafe { (*this).refs.fetch_add(1, Ordering::Relaxed) + 1 }
 }
 
 extern "system" fn release(this: *mut Resolver) -> u32 {
-    let _entry = victory_gpu::hle_call();
     // SAFETY: as in `host`.
     let left = unsafe { (*this).refs.fetch_sub(1, Ordering::AcqRel) } - 1;
     if left == 0 {
@@ -430,7 +449,6 @@ extern "system" fn cancel(this: *mut Resolver, cookie: Unknown) -> HRESULT {
 
 /// The host's resolver behind our proxy.
 pub extern "system" fn MFCreateSourceResolver(out: *mut *mut Resolver) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     if out.is_null() {
         return E_POINTER;
     }
@@ -479,6 +497,15 @@ mod tests {
     }
 
     #[test]
+    fn percent_decode_requires_two_hex_digits() {
+        assert_eq!(percent_decode("%20"), " ");
+        assert_eq!(percent_decode("%+1"), "%+1");
+        assert_eq!(percent_decode("%2"), "%2");
+        assert_eq!(percent_decode("%%20"), "% ");
+        assert_eq!(percent_decode("a%2Gb"), "a%2Gb");
+    }
+
+    #[test]
     fn only_local_files_reach_the_host() {
         // Network schemes and shares are refused, naming scheme and host.
         let refused = |url: &str| local(&wide(url)).unwrap_err();
@@ -502,18 +529,18 @@ mod tests {
         // Checked by opening the files: `files` may spell the host root
         // differently (absolute, `\\?\` for long paths) from the temp dir.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("clips")).unwrap();
-        std::fs::write(dir.path().join("clips").join("sample.mp4"), b"1").unwrap();
-        std::fs::write(dir.path().join("clips").join("sample a.mp4"), b"2").unwrap();
+        std::fs::create_dir(dir.path().join("movies")).unwrap();
+        std::fs::write(dir.path().join("movies").join("intro.mp4"), b"1").unwrap();
+        std::fs::write(dir.path().join("movies").join("intro a.mp4"), b"2").unwrap();
         let letter = files::mount(dir.path()).expect("a free drive letter");
-        let host = text(&local(&wide(&format!(r"{letter}:\clips\sample.mp4"))).unwrap());
+        let host = text(&local(&wide(&format!(r"{letter}:\movies\intro.mp4"))).unwrap());
         assert_eq!(
             std::fs::read(&host).ok().as_deref(),
             Some(&b"1"[..]),
             "{host}"
         );
         let from_url =
-            text(&local(&wide(&format!("file:///{letter}:/clips/sample%20a.mp4"))).unwrap());
+            text(&local(&wide(&format!("file:///{letter}:/movies/intro%20a.mp4"))).unwrap());
         assert_eq!(
             std::fs::read(&from_url).ok().as_deref(),
             Some(&b"2"[..]),
@@ -524,6 +551,86 @@ mod tests {
             r"C:\Windows\a.wav"
         );
         assert_eq!(text(&local(&wide("clip.mp4")).unwrap()), "clip.mp4");
+    }
+
+    /// Other spellings of `\\server\share\a.mp4`, as paths and as `file:`
+    /// URLs without a host.
+    const SHARE_PATHS: [&str; 3] = [
+        r"/\server\share\a.mp4",
+        r"\/server/share/a.mp4",
+        r"\??\UNC\server\share\a.mp4",
+    ];
+    const SHARE_URLS: [&str; 5] = [
+        "file:////server/share/a.mp4",
+        "file://///server/share/a.mp4",
+        r"file:\\server\share\a.mp4",
+        "file:/%5Cserver/share/a.mp4",
+        "file:///%5C%5Cserver/share/a.mp4",
+    ];
+
+    #[test]
+    fn shares_are_refused_however_they_are_spelled() {
+        let asked = |url: &str| local(&wide(url)).map(|v| text(&v));
+        for path in SHARE_PATHS {
+            assert_eq!(asked(path), Err(("unc".into(), "server".into())), "{path}");
+        }
+        for url in SHARE_URLS {
+            assert_eq!(asked(url), Err(("file".into(), "server".into())), "{url}");
+        }
+        // Local files that look alike still pass: one leading separator, a
+        // drive after the slashes, a drive after the object prefix, and the
+        // path of a URL that names this machine.
+        for local_file in [
+            r"\movies\a.mp4",
+            "file:///movies/a.mp4",
+            r"\??\C:\Windows\a.wav",
+            "file://localhost//server/share/a.mp4",
+        ] {
+            assert_eq!(asked(local_file), Ok(local_file.into()), "{local_file}");
+        }
+        assert_eq!(
+            asked("file:////C:/Windows/a.wav"),
+            Ok(r"C:\Windows\a.wav".into())
+        );
+    }
+
+    /// What the host makes of those spellings: the share, for each.
+    #[cfg(windows)]
+    #[test]
+    fn the_host_reads_those_spellings_as_shares() {
+        for path in &SHARE_PATHS[..2] {
+            assert_eq!(
+                std::path::absolute(path).unwrap().to_str(),
+                Some(r"\\server\share\a.mp4"),
+                "{path}"
+            );
+        }
+        // The object prefix reaches the host's file calls as it is.
+        let windows = std::env::var("SystemRoot").unwrap();
+        assert!(std::fs::metadata(format!(r"\??\{windows}")).is_ok());
+
+        let from_url = files::host!("shlwapi.dll", "PathCreateFromUrlW":
+            extern "system" fn(*const u16, *mut u16, *mut u32, u32) -> HRESULT);
+        let host_path = |url: &str| {
+            let url: Vec<u16> = url.encode_utf16().chain([0]).collect();
+            let (mut path, mut n) = ([0u16; 260], 260);
+            assert_eq!(from_url(url.as_ptr(), path.as_mut_ptr(), &mut n, 0), S_OK);
+            String::from_utf16_lossy(&path[..n as usize])
+        };
+        for url in SHARE_URLS {
+            let path = host_path(url);
+            assert!(
+                path.starts_with(r"\\") && path.ends_with(r"server\share\a.mp4"),
+                "{url}: {path}"
+            );
+        }
+        // And of the ones that pass: local paths.
+        assert_eq!(
+            host_path("file://localhost//server/share/a.mp4"),
+            r"\server\share\a.mp4"
+        );
+        assert_eq!(host_path("file:////C:/Windows/a.wav"), r"C:\Windows\a.wav");
+        assert_eq!(host_path("file:///movies/a.mp4"), r"\movies\a.mp4");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
 //! cache folder, keyed by the container's content and by the translator
-//! that translated it (its source fingerprint and settings, see `build`), so
-//! a changed translator never serves an old translation. Entries go through
+//! (the BLAKE3 of its sources) and its settings, so a changed translator
+//! never serves an old translation. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostCaps, HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
@@ -37,89 +37,105 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies the translation, besides the container: the shader
-/// crate's fingerprint (its source, every switch it reads, the host facts the
-/// device gave it, the loop limit, barrier waits and clean-up passes) and
-/// this file's encoding of the result. Not the whole executable any more: a
-/// rebuild that leaves the translator alone keeps its translations (each new
-/// build used to translate the title's thousands of shaders again, which kept
-/// the first minutes of every test run short of pipelines).
-/// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
-/// Worked out per lookup, so a translation made before the device said its
-/// wave sizes is never filed under the later key; `host` is the snapshot of
-/// the device's answer that the lookup also translates with, so the key and
-/// the translation are of one host even where another device answers in
-/// between.
-fn build(host: HostCaps) -> [u8; 32] {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    let limit = victory_shader::emit::loop_limit();
-    if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-        WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
-    }
-    // The view heap's null slot is part of the translation (it differs
-    // by host GPU): found before it goes into the key, so a translation
-    // cached without the clamp is never served.
+/// What identifies a translation beside its container: the translator
+/// (the BLAKE3 of its sources, `build.rs`), the settings it runs with, and
+/// what it was told of the host. Not our executable: a rebuild of anything
+/// else used to translate every shader again.
+fn build() -> [u8; 32] {
+    // The view heap's null slot differs by host GPU: a translation cached
+    // without the clamp must not be served (`host_settings` below).
     crate::descriptor::host::probe_view_limit();
-    static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
-    let exe = EXE.get_or_init(|| {
-        if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {
-            match std::env::current_exe().and_then(std::fs::read) {
-                Ok(bytes) => Some(*blake3::hash(&bytes).as_bytes()),
-                Err(e) => {
-                    tracing::warn!(error = %e, "cannot read our executable; keying on the translator");
-                    None
-                }
-            }
-        } else {
-            None
+    static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
+    let fixed = FIXED.get_or_init(|| {
+        let limit = victory_shader::emit::loop_limit();
+        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+            tracing::warn!(
+                limit,
+                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+            );
         }
+        let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
+        bytes.extend_from_slice(&limit.to_le_bytes());
+        // Which group barriers wait is part of the translation too.
+        bytes.push(victory_shader::emit::group_sync());
+        // So are the switches that pick the form of a wave64 program:
+        // without them here a run with `VICTORY_WAVE_WIDE=0` was
+        // served the translations an earlier run of the same
+        // executable had cached with the switch unset.
+        for name in [
+            "VICTORY_WAVE_WIDE",
+            "VICTORY_WAVE_DEEP_SKIPS",
+            "VICTORY_WAVE_OWN_BITS",
+            "VICTORY_WAVE_LOCAL",
+            "VICTORY_F16_NEAREST",
+            "VICTORY_FILTER_3D",
+            "VICTORY_HELPER_OWN",
+            "VICTORY_FIRSTLANE_OWN",
+            "VICTORY_FIRST_HALF",
+            "VICTORY_STRICT_JOINS",
+            "VICTORY_MESH_OUTPUT_STRICT",
+            "VICTORY_BVH_FENCES",
+            "VICTORY_BVH_BOUNDS",
+            "VICTORY_THREAD_TICKET",
+            // (the strip job's strict forms for wave64 programs in two host waves)
+            "VICTORY_STRICT_HALVES",
+            // (A program translated with it binds a table only a heap made
+            // with it has.)
+            "VICTORY_SLOT_ADDRESSES",
+            "VICTORY_PAIR_MEETINGS",
+        ] {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(b'=');
+            if let Some(value) = std::env::var_os(name) {
+                bytes.extend_from_slice(value.as_encoded_bytes());
+            }
+            bytes.push(0);
+        }
+        // So is whether pixel programs keep the console's early depth test
+        // (`VICTORY_EARLY_DEPTH=1`): only while it is on, so that the
+        // translations cached without it are still served without it.
+        if victory_shader::emit::early_depth() {
+            tracing::info!(
+                "VICTORY_EARLY_DEPTH=1: pixel programs whose console code tests depth before them get the host's early depth-stencil test"
+            );
+            bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
+            bytes.push(0);
+        }
+        // And which clean-up passes ran over the translated code.
+        bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        bytes
     });
-    let mut h = blake3::Hasher::new();
-    // 3: the translator's fingerprint tells an unset switch from an empty one.
-    h.update(b"victory shader cache key 3\0");
-    if let Some(exe) = exe {
-        h.update(exe);
+    let mut hash = blake3::Hasher::new();
+    hash.update(fixed);
+    for value in victory_shader::emit::host_settings() {
+        hash.update(&value.to_le_bytes());
     }
-    hash_switches(&mut h, |name| std::env::var_os(name), host);
-    h.update(include_bytes!("shader_cache.rs"));
-    *h.finalize().as_bytes()
+    *hash.finalize().as_bytes()
 }
 
-/// The offline warm-up (`victory translate --warm`): `container` is
-/// translated into the cache unless it is there already. `Ok(true)`: it
-/// was translated now. Needs [`use_shader_cache`] and the same host facts
-/// the run will have (`victory_shader::emit::translation_fingerprint`).
-pub fn warm(container: &[u8]) -> Result<bool, String> {
-    let cache = CACHE.get().ok_or("no shader cache")?;
-    let ran = AtomicBool::new(false);
-    let host = victory_shader::emit::host_caps();
-    let translate = |c: &[u8]| {
-        ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate_for(c, host).map_err(|e| e.to_string())
-    };
-    cached(cache, &build(host), container, translate).map(|_| ran.load(Ordering::Relaxed))
+/// What tells one set of translations from another ([`build`]).
+pub(crate) fn translation() -> [u8; 32] {
+    build()
 }
 
-/// Adds the translator's fingerprint to the build hash
-/// (`victory_shader::emit::translation_fingerprint`), for `host` and with
-/// each switch the translator reads as `get` reads it (nothing when unset). The
-/// switches are every `VICTORY_*` name in the translator's sources, found
-/// when it is built: a list kept here by hand had missed
-/// `VICTORY_FIRST_HALF` and `VICTORY_FIRSTLANE_OWN`, and a run with
-/// `VICTORY_WAVE_WIDE=0` was once served the translations an earlier run
-/// had cached with the switch unset.
-fn hash_switches(hash: &mut blake3::Hasher, get: impl Fn(&str) -> Option<std::ffi::OsString>, host: HostCaps) {
-    hash.update(&victory_shader::emit::translation_fingerprint_for(get, host));
+/// Puts the translation of `container` into the cache before any title asks
+/// for it (`victory shaders`): whether it was there already, or why it does
+/// not translate. The host is opened first, as a run does: what the card
+/// can do decides the form of some programs.
+pub fn precompile(container: &[u8]) -> Result<bool, String> {
+    let _ = crate::host::host();
+    let misses = MISSES.load(Ordering::Relaxed);
+    host_shader(container)?;
+    // (Counts other threads' misses too: the caller only adds them up.)
+    Ok(MISSES.load(Ordering::Relaxed) == misses)
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    // One snapshot of the device's answer for the key and for the translation.
-    let host = victory_shader::emit::host_caps();
-    let translate = |c: &[u8]| victory_shader::emit::translate_for(c, host).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(host), container, translate),
+        Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }
 }
@@ -436,96 +452,5 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
-    }
-
-    /// The interpolation and first-lane switches change what the translator
-    /// emits: a run with one value is not served another value's entries.
-    #[test]
-    fn translation_switches_give_their_own_build_keys() {
-        let key = |set: Option<(&str, &str)>| {
-            let mut hash = blake3::Hasher::new();
-            hash_switches(
-                &mut hash,
-                |name| set.filter(|&(n, _)| n == name).map(|(_, v)| v.into()),
-                HostCaps::Unknown,
-            );
-            *hash.finalize().as_bytes()
-        };
-        for (name, a, b) in [
-            ("VICTORY_FIRST_HALF", "0", "1"),
-            ("VICTORY_FIRSTLANE_OWN", "1", "0"),
-        ] {
-            assert_ne!(
-                key(Some((name, a))),
-                key(Some((name, b))),
-                "{name}={a} and {name}={b}"
-            );
-            assert_ne!(
-                key(None),
-                key(Some((name, a))),
-                "{name} unset and {name}={a}"
-            );
-        }
-    }
-
-    /// The switches that choose a device or what a gate requires of it change nothing the
-    /// translator emits: they are no translation switches, and each set, to any value, keys as
-    /// unset. (The hybrid laptop, 2026-11-25: `VICTORY_ADAPTER=default`, on the card it had
-    /// anyway, gave `hits=0 misses=641` at the start screen.)
-    #[test]
-    fn device_and_gate_switches_leave_the_build_key_alone() {
-        let key = |set: Option<(&str, &str)>| {
-            let mut hash = blake3::Hasher::new();
-            hash_switches(
-                &mut hash,
-                |name| set.filter(|&(n, _)| n == name).map(|(_, v)| v.into()),
-                HostCaps::Unknown,
-            );
-            *hash.finalize().as_bytes()
-        };
-        let listed: Vec<&str> = victory_shader::emit::translation_switches().collect();
-        for (name, values) in [
-            ("VICTORY_ADAPTER", ["default", "nvidia"]),
-            ("VICTORY_REQUIRE_GPU", ["1", "nvidia"]),
-            ("VICTORY_D3D12_WARP", ["1", ""]),
-        ] {
-            assert!(!listed.contains(&name), "{name} is in the translation switches: {listed:?}");
-            for value in values {
-                assert_eq!(key(None), key(Some((name, value))), "{name} unset and {name}={value}");
-            }
-        }
-        // The pattern still tells a translation switch apart.
-        assert!(listed.contains(&"VICTORY_FIRST_HALF"));
-        assert_ne!(key(None), key(Some(("VICTORY_FIRST_HALF", "1"))));
-    }
-
-    /// The device's waves change what the translator hands over and what it refuses (the
-    /// form for a widest wave of 32 lanes; a wave size outside the device's fewest and most
-    /// lanes, or on a device without wave operations): no two hosts share a key, an unknown
-    /// one included.
-    #[test]
-    fn hosts_give_their_own_build_keys() {
-        use victory_shader::emit::HostWaves;
-        let key = |host: HostCaps| {
-            let mut hash = blake3::Hasher::new();
-            hash_switches(&mut hash, |_| None, host);
-            *hash.finalize().as_bytes()
-        };
-        let known = |min, max, wave_ops| HostCaps::Known(HostWaves { min, max, wave_ops });
-        let hosts = [
-            HostCaps::Unknown,
-            known(4, 4, true),
-            known(4, 32, true),
-            known(32, 32, true),
-            known(32, 64, true),
-            known(64, 64, true),
-            known(32, 32, false),
-        ];
-        for (i, a) in hosts.iter().enumerate() {
-            assert_eq!(key(*a), key(*a), "{a:?}");
-            for b in &hosts[i + 1..] {
-                assert_ne!(key(*a), key(*b), "{a:?} and {b:?}");
-            }
-        }
     }
 }

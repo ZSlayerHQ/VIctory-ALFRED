@@ -72,5 +72,6 @@ test('run-world.sh lowers the warm-up through obs.sh and passes --jobs only when
   assert.match(wrapper, /\. "\$HERE\/obs\.sh"\n\s+warm_mode_decide\n\s+warm_mode_line\n/);
   assert.match(wrapper, /if \[ "\$WARM_MODE" = gentle \]; then\n\s+WARM_ARGS=\(--jobs "\$\(warm_jobs\)"\)\n\s+WARM_PS_FLAGS="-Translate -Gentle"\n\s+fi/);
   assert.match(wrapper, /raise-priority\.ps1" \$WARM_PS_FLAGS /);
-  assert.match(wrapper, /"\$BIN" warm \$\{WARM_ARGS\[@\]\+"\$\{WARM_ARGS\[@\]\}"\} /);
+  // The warm-up's command is the build's `shaders` where it has one, else `warm`: either takes the same arguments.
+  assert.match(wrapper, /"\$BIN" "\$WARM_CMD" \$\{WARM_ARGS\[@\]\+"\$\{WARM_ARGS\[@\]\}"\} /);
 });

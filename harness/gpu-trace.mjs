@@ -65,8 +65,11 @@ export function commandFor(options) {
       String(afterMs),
       '--limit-to-frames',
       String(frames),
+      // `unaltered` leaves the card's clocks as the run has them (the default, `base`, locks them for the trace).
       '--set-gpu-clocks',
       'unaltered',
+      // The title takes minutes to reach the world, longer than the tool's own launch timeout.
+      '--no-timeout',
       '--auto-export',
       '--output-dir',
       out,
@@ -133,6 +136,14 @@ function main(argv) {
   if (options.what === 'print') {
     console.log([command.file, ...command.args].map(quoteArg).join(' '));
     return 0;
+  }
+  // Nsight does not create its output folder: without it, it prints "No such output directory" and
+  // "Invalid general options" and writes no trace (runs world-trace and world-trace-2, 2026-11-27).
+  try {
+    fs.mkdirSync(options.out, { recursive: true });
+  } catch (err) {
+    console.error(`gpu-trace: cannot make the output folder: ${err.message}`);
+    return 1;
   }
   const result = spawnSync(command.file, command.args, { stdio: 'inherit' });
   if (result.error) {

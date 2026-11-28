@@ -60,6 +60,7 @@ test('the command is Nsight GPU Trace around the run, with the environment joine
     '1',
     '--set-gpu-clocks',
     'unaltered',
+    '--no-timeout',
     '--auto-export',
     '--output-dir',
     'D:/captures/20261125-073000-trace/gputrace',

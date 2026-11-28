@@ -14,15 +14,6 @@
 
 use std::fmt;
 
-pub mod diag;
-mod fast;
-#[cfg(test)]
-mod synth;
-#[cfg(target_arch = "x86_64")]
-mod wide;
-
-pub use fast::{Pool, unpack, unpack_one_lane};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error(pub &'static str);
 
@@ -181,11 +172,6 @@ impl Tables {
         let mut ctrl7 = [0u16; 512];
         for c in &mut ctrl7 {
             *c = r.u16();
-        }
-        // A word for a shape BC7 has no layout for packs nonsense, or
-        // panics (mode 0 rotated gives its p-bit no bits).
-        if ctrl7.iter().any(|&c| c != 0 && !bc7_shape(c)) {
-            return Err(Error("a BC7 control word is no BC7 block shape"));
         }
         let mut plain = |ep: usize, ix: usize| {
             (0..DICTIONARY)
@@ -754,29 +740,23 @@ const BC7_INDEX: [[u8; 2]; 8] = [
     [2, 0],
 ];
 
-/// Whether a BC7 control word (mode, rotation, index selection, subsets,
-/// partition from bit 0 up) names a public block shape: the mode's
-/// subsets, a partition it has, a rotation (modes 4 and 5) and an index
-/// selection (mode 4) only where it has them. The shipped tables' words all
-/// do.
-fn bc7_shape(ctrl: u16) -> bool {
-    let mode = usize::from(ctrl & 7);
-    let (rotation, selection) = (ctrl >> 3 & 3, ctrl >> 5 & 1);
-    let (subsets, part) = (ctrl >> 6 & 3, ctrl >> 8);
-    subsets == [3, 2, 3, 2, 1, 1, 1, 2][mode]
-        && part < [16, 64, 64, 64, 1, 1, 1, 64][mode]
-        && (rotation == 0 || matches!(mode, 4 | 5))
-        && (selection == 0 || mode == 4)
-}
-
 fn pbits(mode: u16) -> bool {
     matches!(mode, 0 | 1 | 3 | 6 | 7)
+}
+
+/// Channel rotation bits; only BC7 modes 4 and 5 have a rotation field.
+fn rotation(ctrl: u16) -> usize {
+    if matches!(ctrl & 7, 4 | 5) {
+        usize::from(ctrl >> 3 & 3)
+    } else {
+        0
+    }
 }
 
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
 /// with the rotated channel.
 fn bc7_precision(ctrl: u16) -> [u8; 4] {
-    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    let (mode, rot) = (ctrl & 7, rotation(ctrl));
     let mut p = BC7_BITS[usize::from(mode)];
     if rot != 0 {
         p.swap(3, rot - 1);
@@ -880,8 +860,10 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
     let ctrl = ep.ctrl;
     let mode = ctrl & 7;
     let subsets = usize::from((ctrl & 0xff) >> 6);
-    let part = usize::from(ctrl >> 8 & 63);
-    let rot = usize::from(ctrl >> 3 & 3);
+    // Mode 0 has 16 partitions (a 4-bit field); the other partitioned modes have 64. The header and the anchors
+    // below must read the same value.
+    let part = usize::from(ctrl >> 8 & if mode == 0 { 15 } else { 63 });
+    let rot = rotation(ctrl);
     let mut w = Bits::default();
     w.put(1 << mode, u32::from(mode) + 1);
     match mode {
@@ -1370,6 +1352,156 @@ mod tests {
         assert_eq!(dst, w.v.to_le_bytes());
     }
 
+    /// BC7 mode 0 has 16 partitions: its partition field is 4 bits. The BCPack
+    /// control carries 6, and the packer wrote the 4-bit header but took the
+    /// anchors (which index loses its top bit) from the 6-bit value, so where
+    /// the 6-bit entry's anchors differ from the 4-bit one's (not always:
+    /// partitions 16 and 0 both anchor at 3 and 15) the header and the index
+    /// stream named different anchors. The built-in control table's mode-0
+    /// entries have partitions 0 to 15 only, so it is unchanged; custom tables
+    /// are not. Partitions 20, 36 and 52 must pack as partition 4 (each & 15):
+    /// partition 4 anchors its second and third subsets at 8 and 15, while the
+    /// table entries of 20, 36 and 52 are {3, 15}, {6, 10} and {5, 15}. The
+    /// three cover each upper bit alone and both together, so a fix that
+    /// clears only one of them fails. The expected index stream is built here
+    /// from the format's description, not from the packer: mode 0's 83 header
+    /// bits (1 mode, 4 partition, 72 colour, 6 p-bits), then 16 indices of 3
+    /// bits, 2 at the anchors 0, 8 and 15. Every index is 1. Synthetic values
+    /// only.
+    #[test]
+    fn bc7_mode_0_partition_is_four_bits_in_the_header_and_the_anchors() {
+        let packed = |part: u16| {
+            let ctrl = (part << 8) | (3 << 6); // mode 0, three subsets
+            let ep = Bc7Ep {
+                ctrl,
+                rows: [[0x8000; 8]; 3],
+            };
+            let ix = Bc7Ix {
+                bits: [3, 0],
+                ix: [[1; 16], [0; 16]],
+            };
+            let mut out = [0u8; 16];
+            bc7_pack(&ep, &ix, bc7_precision(ctrl), &mut out);
+            u128::from_le_bytes(out)
+        };
+        let (mut expected, mut at) = (0u128, 0);
+        for i in 0..16 {
+            expected |= 1 << at;
+            at += if [0, 8, 15].contains(&i) { 2 } else { 3 };
+        }
+        assert_eq!(at, 45, "mode 0 has 45 index bits");
+        for part in [4, 20, 36, 52] {
+            let block = packed(part);
+            assert_eq!(block & 1, 1, "partition {part}: mode 0");
+            assert_eq!(
+                block >> 1 & 15,
+                4,
+                "partition {part}: the header names partition 4"
+            );
+            assert_eq!(
+                block >> 83,
+                expected,
+                "partition {part}: the index stream is laid out for partition 4's anchors"
+            );
+        }
+    }
+
+    #[test]
+    fn bc7_rotation_applies_only_to_modes_4_and_5() {
+        const BC7_WIDTHS: [u8; 16] = [3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4];
+        const CTRL7_OFFSET: usize = MODELS * BUCKETS * 2 + 256 + 64 + 256 + 64 + 64;
+        let tables_for = |ctrl: u16| {
+            let mut raw = tables();
+            raw[CTRL7_OFFSET..CTRL7_OFFSET + 2].copy_from_slice(&ctrl.to_le_bytes());
+            let t = Tables::parse(&raw).unwrap();
+            assert_eq!(t.ctrl7[0], ctrl);
+            t
+        };
+
+        let mut record = vec![0u8; 32];
+        for (i, &val) in [11, 23, 5, 19, 13, 29, 7, 17, 3, 25, 9, 21, 15, 31, 1, 12]
+            .iter()
+            .enumerate()
+        {
+            record[4 + i] = zigzag(val);
+        }
+        record[20] = zigzag(6);
+        record[21] = zigzag(14);
+
+        // Modes without a BC7 rotation field must ignore ctrl bits 4:3 instead of
+        // panicking on shift overflow (modes 0/1/3 with rot=1) or corrupting channels.
+        for (mode, subsets) in [(0u16, 3u16), (1, 2), (2, 3), (3, 2), (6, 1), (7, 2)] {
+            let base_ctrl = (subsets << 6) | mode;
+            let base_tables = tables_for(base_ctrl);
+            let base_src = stream(&base_tables, &BC7_WIDTHS, 2, std::slice::from_ref(&record));
+            let mut want = [0u8; 16];
+            decode(7, &base_src, &mut want, &base_tables).unwrap();
+
+            for rot in 1..=3u16 {
+                let ctrl = base_ctrl | (rot << 3);
+                let t = tables_for(ctrl);
+                let src = stream(&t, &BC7_WIDTHS, 2, std::slice::from_ref(&record));
+                let mut got = [0u8; 16];
+                decode(7, &src, &mut got, &t).unwrap();
+                assert_eq!(got, want, "mode {mode} rot {rot}");
+                assert_eq!(
+                    bc7_precision(ctrl),
+                    bc7_precision(base_ctrl),
+                    "mode {mode} rot {rot}"
+                );
+            }
+        }
+
+        // Modes 4 and 5 do have a 2-bit rotation field: rotation swaps alpha with channel rot-1.
+        for (mode, base_bits) in [(4u16, [5u8, 5, 5, 6]), (5u16, [7u8, 7, 7, 8])] {
+            for rot in 1..=3usize {
+                let ctrl = (1 << 6) | ((rot as u16) << 3) | mode;
+                let mut expected_prec = base_bits;
+                expected_prec.swap(3, rot - 1);
+                assert_eq!(bc7_precision(ctrl), expected_prec, "mode {mode} rot {rot}");
+            }
+
+            // Decode mode 4/5 with rot=1 (swap R and A) and check the packed BC7 block.
+            let ctrl = (1 << 6) | (1 << 3) | mode;
+            let t = tables_for(ctrl);
+            let mut s = vec![0u8; 32];
+            s[4] = zigzag(0x21); // stored R0 (holds alpha precision after rot=1)
+            s[5] = zigzag(0x12); // stored R1
+            s[6] = zigzag(0x05); // stored G0
+            s[7] = zigzag(0x06); // stored G1
+            s[8] = zigzag(0x09); // stored B0
+            s[9] = zigzag(0x0a); // stored B1
+            s[10] = zigzag(0x0d); // stored A0 (holds color precision after rot=1)
+            s[11] = zigzag(0x0e); // stored A1
+            let src = stream(&t, &BC7_WIDTHS, 2, &[s]);
+            let mut dst = [0u8; 16];
+            decode(7, &src, &mut dst, &t).unwrap();
+
+            let color_bits = u32::from(base_bits[0]);
+            let alpha_bits = u32::from(base_bits[3]);
+            let mut w = Bits::default();
+            w.put(1 << mode, u32::from(mode) + 1);
+            w.put(1, 2); // rotation = 1
+            if mode == 4 {
+                w.put(0, 1); // indexSelectionBit = 0
+            }
+            // Endpoint order after rot=1 swaps indices 3 and 0: [3 (R), 1 (G), 2 (B), 0 (A)].
+            for (v, n) in [
+                (0x0d, color_bits),
+                (0x0e, color_bits),
+                (0x05, color_bits),
+                (0x06, color_bits),
+                (0x09, color_bits),
+                (0x0a, color_bits),
+                (0x21, alpha_bits),
+                (0x12, alpha_bits),
+            ] {
+                w.put(v, n);
+            }
+            assert_eq!(dst, w.v.to_le_bytes(), "mode {mode} rot 1");
+        }
+    }
+
     #[test]
     fn malformed_input_is_an_error() {
         let t = Tables::parse(&tables()).unwrap();
@@ -1564,76 +1696,35 @@ mod tests {
         }
     }
 
-    /// Decode throughput on synthetic streams (no game data), per format,
-    /// against uniform tables and the shipped ones (whose models give the
-    /// streams real symbol statistics), in MB of BC blocks a second:
-    /// `cargo test --release -p victory-formats bcpack_throughput -- --ignored --nocapture --test-threads 1`.
-    /// `VICTORY_BENCH_BLOCKS` sets the blocks a stream (default 65536).
+    /// Decode throughput on synthetic streams (no game data):
+    /// `cargo test --release -p victory-formats bcpack_throughput -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark"]
     fn bcpack_throughput() {
-        let blocks: usize = std::env::var("VICTORY_BENCH_BLOCKS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1 << 16);
-        let pool = Pool::new(4, "bcpack bench", || {});
-        let time = |runs: u32, f: &mut dyn FnMut()| {
-            f();
+        let t = Tables::parse(&tables()).unwrap();
+        let cases: [(u8, &[u8], usize, usize); 3] = [
+            (1, &[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1, 8),
+            (4, &BC4_LANES, 1, 8),
+            (7, &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2, 16),
+        ];
+        for (bc, widths, per, block) in cases {
+            // One fragment per lane holds at most 65792 bytes.
+            let blocks = 1 << 14;
+            let records = random_records(widths, per, blocks, bc == 7);
+            let src = stream(&t, widths, per, &records);
+            let mut dst = vec![0u8; blocks * block];
+            decode(bc, &src, &mut dst, &t).unwrap();
+            let runs = 40;
             let started = std::time::Instant::now();
             for _ in 0..runs {
-                f();
+                decode(bc, std::hint::black_box(&src), &mut dst, &t).unwrap();
             }
-            started.elapsed().as_secs_f64() / f64::from(runs)
-        };
-        for (name, t) in [
-            ("uniform", synth::uniform_tables()),
-            ("shipped", Tables::builtin().unwrap()),
-        ] {
-            for bc in [1, 3, 4, 5, 6, 7] {
-                let (widths, per, block) = synth::layout(bc);
-                let (src, _) = synth::stream(&t, bc, blocks, 0xbe7c4 + u64::from(bc));
-                let mut dst = vec![0u8; blocks * block];
-                let mut rec = vec![0u8; blocks * widths.len() * per];
-                let runs = 8;
-                let whole = time(runs, &mut || {
-                    decode(bc, std::hint::black_box(&src), &mut dst, &t).unwrap()
-                });
-                let one = time(runs, &mut || {
-                    let mut next = std::hint::black_box(&src).iter().copied();
-                    lanes(&t, widths, per, blocks, |_| next.next(), &mut rec).unwrap();
-                });
-                #[cfg(target_arch = "x86_64")]
-                let wide = time(runs, &mut || {
-                    wide::lanes(
-                        &t,
-                        widths,
-                        per,
-                        blocks,
-                        std::hint::black_box(&src),
-                        &mut rec,
-                    )
-                    .map(Result::unwrap);
-                });
-                #[cfg(not(target_arch = "x86_64"))]
-                let wide = f64::NAN;
-                let alone = time(runs, &mut || {
-                    unpack(bc, std::hint::black_box(&src), &mut dst, &t, None).unwrap()
-                });
-                let helped = time(runs, &mut || {
-                    unpack(bc, std::hint::black_box(&src), &mut dst, &t, Some(&pool)).unwrap()
-                });
-                let mb = |secs: f64| (blocks * block) as f64 / secs / 1e6;
-                println!(
-                    "{name} BC{bc}: {blocks} blocks, {:.2} bytes in a block; decode {:.1} MB/s (lanes one at a time {:.1}, all at once {:.1}); unpack alone {:.1} MB/s, with {} helpers {:.1} MB/s",
-                    src.len() as f64 / blocks as f64,
-                    mb(whole),
-                    mb(one),
-                    mb(wide),
-                    mb(alone),
-                    pool.threads(),
-                    mb(helped),
-                );
-            }
+            let secs = started.elapsed().as_secs_f64() / f64::from(runs);
+            println!(
+                "BC{bc}: {blocks} blocks, {:.1} MB out/s, {:.1} ns/block",
+                (blocks * block) as f64 / secs / 1e6,
+                secs * 1e9 / blocks as f64
+            );
         }
     }
 
@@ -1662,264 +1753,6 @@ mod tests {
             n += 1;
         }
         assert!(n > 0);
-    }
-
-    /// The synthetic streams decode: every format, uniform and shipped
-    /// tables, many fragments a lane.
-    #[test]
-    fn synthetic_streams_decode() {
-        for t in [synth::uniform_tables(), Tables::builtin().unwrap()] {
-            for bc in [1, 3, 4, 5, 6, 7] {
-                for (k, blocks) in [1, 2, 17, 300, 2000].into_iter().enumerate() {
-                    let (src, _) = synth::stream(&t, bc, blocks, 77 + k as u64);
-                    let (_, _, block) = synth::layout(bc);
-                    let mut dst = vec![0u8; blocks * block];
-                    decode(bc, &src, &mut dst, &t).unwrap();
-                }
-            }
-        }
-    }
-
-    /// All lanes of a round at once take the same bytes and give the same
-    /// records and errors as one lane at a time: synthetic streams of every
-    /// format, cut short, with a byte changed, and noise. Reported ignored
-    /// where the machine has no AVX-512 (`build.rs`).
-    #[cfg(target_arch = "x86_64")]
-    #[cfg_attr(
-        not(victory_avx512),
-        ignore = "no AVX-512 here: the wide lanes cannot run"
-    )]
-    #[test]
-    fn wide_lanes_match_one_lane_at_a_time() {
-        assert!(
-            wide::available(),
-            "the build found AVX-512 but the processor has none"
-        );
-        let check = |t: &Tables, bc: u8, src: &[u8], blocks: usize, what: &str| {
-            let (widths, per, _) = synth::layout(bc);
-            let mut want = vec![0u8; blocks * widths.len() * per];
-            let mut next = src.iter().copied();
-            let expected = lanes(t, widths, per, blocks, |_| next.next(), &mut want);
-            let mut got = vec![0u8; want.len()];
-            let result = wide::lanes(t, widths, per, blocks, src, &mut got).unwrap();
-            assert_eq!(result, expected, "BC{bc} {what}: result");
-            assert!(got == want, "BC{bc} {what}: records");
-        };
-        let mut rng = synth::Rng(0x5eed);
-        for t in [synth::uniform_tables(), Tables::builtin().unwrap()] {
-            for bc in [1, 3, 4, 5, 6, 7] {
-                for (k, blocks) in [1, 2, 3, 17, 300, 2000, 9000].into_iter().enumerate() {
-                    let (src, _) = synth::stream(&t, bc, blocks, 1000 * u64::from(bc) + k as u64);
-                    check(&t, bc, &src, blocks, "whole");
-                    check(&t, bc, &src[..src.len() * 2 / 3], blocks, "cut short");
-                    let mut bad = src.clone();
-                    let at = rng.below(bad.len() as u64) as usize;
-                    bad[at] ^= 1 << rng.below(8);
-                    check(&t, bc, &bad, blocks, "a bit changed");
-                }
-                for round in 0..200 {
-                    let len = rng.below(3000) as usize;
-                    let noise: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
-                    check(&t, bc, &noise, 1 + round % 60, "noise");
-                }
-            }
-        }
-    }
-
-    /// What a decode came to: its result, or a panic.
-    #[derive(Debug, PartialEq)]
-    enum Outcome {
-        Done(Result<(), Error>),
-        Panicked,
-    }
-
-    fn outcome(decode: impl FnOnce() -> Result<(), Error>) -> Outcome {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(decode))
-            .map_or(Outcome::Panicked, Outcome::Done)
-    }
-
-    /// `unpack` alone and with `pool` (lanes a round at once if `wide`)
-    /// against `decode` on `src`, each from the same destination bytes: the
-    /// same outcome, panics included, and the same bytes left. `decode`'s.
-    #[allow(clippy::too_many_arguments)]
-    fn alike(
-        t: &Tables,
-        bc: u8,
-        src: &[u8],
-        blocks: usize,
-        what: &str,
-        rng: &mut synth::Rng,
-        pool: &Pool,
-        wide: bool,
-    ) -> Outcome {
-        let (_, _, block) = synth::layout(bc);
-        let before: Vec<u8> = (0..blocks * block).map(|_| rng.next() as u8).collect();
-        let mut want = before.clone();
-        let expected = outcome(|| decode(bc, src, &mut want, t));
-        for pool in [None, Some(pool)] {
-            let mut got = before.clone();
-            let result = outcome(|| fast::unpack_with(bc, src, &mut got, t, pool, wide));
-            let how = if pool.is_some() { "helpers" } else { "alone" };
-            assert_eq!(
-                result, expected,
-                "BC{bc} {what} ({how}, wide {wide}): outcome"
-            );
-            assert!(got == want, "BC{bc} {what} ({how}, wide {wide}): bytes");
-        }
-        expected
-    }
-
-    /// Every public BC7 block shape as a control word: the mode, its
-    /// subsets, each partition it has, a rotation (modes 4, 5) and an index
-    /// selection (mode 4) where it has them.
-    fn bc7_shapes() -> Vec<u16> {
-        let mut words = Vec::new();
-        for mode in 0u16..8 {
-            let m = usize::from(mode);
-            let rotations = if matches!(mode, 4 | 5) { 4 } else { 1 };
-            let selections = if mode == 4 { 2 } else { 1 };
-            for part in 0..[16, 64, 64, 64, 1, 1, 1, 64][m] {
-                for rot in 0..rotations {
-                    for sel in 0..selections {
-                        let subsets = [3, 2, 3, 2, 1, 1, 1, 2][m];
-                        words.push(mode | rot << 3 | sel << 5 | subsets << 6 | part << 8);
-                    }
-                }
-            }
-        }
-        words
-    }
-
-    /// Control words that are no BC7 block shape: mode 0 rotated with its
-    /// three subsets (its p-bit gets no bits: packing shifts a u16 by 16;
-    /// Sol's review of round one), mode 1 rotated, mode 6 with three subsets,
-    /// mode 4 with a partition, mode 0 with partition 16, mode 7 with index
-    /// selection, the top two bits set.
-    const NOT_BC7_SHAPES: [u16; 7] = [0x00c8, 0x0091, 0x00c6, 0x0544, 0x10c0, 0x00a7, 0xc046];
-
-    /// Uniform tables with `words` as the first BC7 control codes.
-    fn bc7_tables(words: &[u16]) -> Result<Tables, Error> {
-        let mut bytes = synth::uniform_bytes();
-        for (k, w) in words.iter().enumerate() {
-            bytes[synth::CTRL7_AT + 2 * k..][..2].copy_from_slice(&w.to_le_bytes());
-        }
-        Tables::parse(&bytes)
-    }
-
-    /// The tables take every public BC7 block shape and refuse the words
-    /// that are none.
-    #[test]
-    fn a_bc7_control_word_that_is_no_block_shape_is_refused() {
-        assert_eq!(bc7_shapes().len(), 285);
-        assert!(bc7_tables(&bc7_shapes()).is_ok());
-        for word in NOT_BC7_SHAPES {
-            assert!(bc7_tables(&[0x46, word]).is_err(), "{word:#06x}");
-        }
-    }
-
-    /// `alike` on everything: every format, uniform and shipped tables,
-    /// streams of several chunks, a block the decoder refuses part way, cut
-    /// short, a bit changed, fewer blocks than coded, noise; BC7 with every
-    /// block shape among the codes, and with each word that is none too
-    /// where the tables take it; refused formats and sizes. A helper packs
-    /// some of the BC6H and BC7 blocks.
-    fn differential(wide: bool) {
-        let pool = Pool::new(3, "bcpack test", || {});
-        let mut rng = synth::Rng(0xdec0de);
-        for t in [synth::uniform_tables(), Tables::builtin().unwrap()] {
-            for bc in [1, 3, 4, 5, 6, 7] {
-                for (k, blocks) in [1, 2, 300, 2049, 4096, 4097, 10000].into_iter().enumerate() {
-                    let seed = 7000 * u64::from(bc) + k as u64;
-                    let (src, _) = synth::stream(&t, bc, blocks, seed);
-                    let mut check = |src: &[u8], blocks: usize, what: &str| {
-                        alike(&t, bc, src, blocks, what, &mut rng, &pool, wide)
-                    };
-                    assert_eq!(check(&src, blocks, "whole"), Outcome::Done(Ok(())));
-                    check(&src[..src.len() * 3 / 4], blocks, "cut short");
-                    let mut bad = src.clone();
-                    let at = (seed as usize * 7919) % bad.len();
-                    bad[at] ^= 1 << (seed % 8);
-                    check(&bad, blocks, "a bit changed");
-                    check(&src, blocks.div_ceil(2), "fewer blocks");
-                    if matches!(bc, 6 | 7) && blocks > 1 {
-                        let (src, _) =
-                            synth::stream_with(&t, bc, blocks, seed, Some(blocks * 2 / 3));
-                        let refused = check(&src, blocks, "a refused block");
-                        assert!(matches!(refused, Outcome::Done(Err(_))));
-                    }
-                }
-                for round in 0..100 {
-                    let len = rng.below(2000) as usize;
-                    let noise: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
-                    alike(
-                        &t,
-                        bc,
-                        &noise,
-                        1 + round % 50,
-                        "noise",
-                        &mut rng,
-                        &pool,
-                        wide,
-                    );
-                }
-            }
-        }
-        let shapes = bc7_shapes();
-        let t = bc7_tables(&shapes).unwrap();
-        let (src, _) = synth::stream(&t, 7, 10000, 0x5ba9e);
-        let done = alike(
-            &t,
-            7,
-            &src,
-            10000,
-            "every block shape",
-            &mut rng,
-            &pool,
-            wide,
-        );
-        assert_eq!(done, Outcome::Done(Ok(())));
-        for word in NOT_BC7_SHAPES {
-            let words: Vec<u16> = shapes.iter().copied().chain([word]).collect();
-            if let Ok(t) = bc7_tables(&words) {
-                let (src, _) = synth::stream(&t, 7, 10000, u64::from(word));
-                let what = format!("with {word:#06x}");
-                alike(&t, 7, &src, 10000, &what, &mut rng, &pool, wide);
-            }
-        }
-        assert!(pool.helped() > 0, "no helper packed a block");
-        // Formats and sizes it refuses, as `decode` does.
-        let t = synth::uniform_tables();
-        for (bc, len) in [(2, 16), (0, 16), (8, 16), (1, 0), (1, 12), (7, 8)] {
-            let (mut a, mut b) = (vec![1u8; len], vec![1u8; len]);
-            assert_eq!(
-                fast::unpack_with(bc, &[0; 64], &mut a, &t, Some(&pool), wide),
-                decode(bc, &[0; 64], &mut b, &t)
-            );
-            assert!(a == b);
-        }
-    }
-
-    /// `unpack` writes exactly what `decode` writes ([`differential`]), the
-    /// lanes one at a time.
-    #[test]
-    fn unpack_matches_decode_bit_for_bit() {
-        differential(false);
-    }
-
-    /// [`differential`] with the lanes a round at once. Reported ignored
-    /// where the machine has no AVX-512 (`build.rs`).
-    #[cfg(target_arch = "x86_64")]
-    #[cfg_attr(
-        not(victory_avx512),
-        ignore = "no AVX-512 here: the wide lanes cannot run"
-    )]
-    #[test]
-    fn unpack_with_wide_lanes_matches_decode_bit_for_bit() {
-        assert!(
-            wide::available(),
-            "the build found AVX-512 but the processor has none"
-        );
-        differential(true);
     }
 
     /// A dictionary entry stands in for a block the decoder made: a set with

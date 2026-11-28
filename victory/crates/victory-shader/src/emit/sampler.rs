@@ -34,14 +34,12 @@ pub struct StaticSampler {
 impl Eq for StaticSampler {}
 
 impl StaticSampler {
-    /// The filter a host whose static samplers may (`aniso_point_mip`) or
-    /// may not be anisotropic with a point mip filter gives the sampler:
-    /// without it, the linear mip filter the translation had before
-    /// (`D3D12_OPTIONS19`'s optional filter). Reduction bits and the LOD
-    /// bounds stay as they are; the translation itself is the same on every
-    /// device.
-    pub fn filter_for_host(&self, aniso_point_mip: bool) -> u32 {
-        if !aniso_point_mip && self.filter & !0x180 == 0x54 {
+    /// The filter supported by the host device. Anisotropic point-mip
+    /// filtering is optional (`D3D12_OPTIONS19`); older devices retain the
+    /// previous linear-mip approximation. Comparison/min/max reduction
+    /// bits and the sampler's LOD bounds are unchanged.
+    pub fn filter_for_host(&self, aniso_point_mip_supported: bool) -> u32 {
+        if !aniso_point_mip_supported && self.filter & !0x180 == 0x54 {
             self.filter | 1
         } else {
             self.filter

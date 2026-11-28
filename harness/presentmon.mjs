@@ -176,6 +176,48 @@ export function readPresentMon(csvPath) {
   };
 }
 
+// Per-frame rows of one process for a windowed report: { atMs, ms, gpuMs }, `atMs` the frame's start on the
+// capture's clock — PresentMon 2.x's TimeInMs or CPUStartTimeInMs, 1.x's TimeInSeconds, else the running sum of
+// the game process's own frame times (another process's interval is its own, not the game's). Rows are kept for
+// `pid` alone, never pooled across processes, as presentmon-compare.mjs does. Null when the file, the frame-time
+// column, the ProcessID column or `pid` is missing.
+export function readPresentMonFrames(csvPath, pid) {
+  if (!csvPath || !fs.existsSync(csvPath) || pid === undefined || pid === null) return null;
+
+  const lines = fs.readFileSync(csvPath, 'utf8').split('\n');
+  const headerIndex = lines.findIndex((line) => line.trim() !== '');
+  if (headerIndex < 0) return null;
+
+  const header = splitCsvLine(lines[headerIndex].replace(/^﻿/, ''));
+  const names = header.map((name) => name.trim().toLowerCase());
+  const frameIndex = names.findIndex((name) => name === 'frametime' || name === 'msbetweenpresents');
+  const gpuIndex = names.findIndex(
+    (name) => name === 'gpubusy' || name === 'msgpubusy' || name === 'msgpuactive',
+  );
+  const pidIndex = names.findIndex((name) => name === 'processid');
+  const atIndex = names.findIndex(
+    (name) => name === 'timeinms' || name === 'timeinseconds' || name === 'cpustarttimeinms',
+  );
+  if (frameIndex < 0 || pidIndex < 0) return null;
+
+  const scale = names[atIndex] === 'timeinseconds' ? 1000 : 1;
+  const frames = [];
+  let clock = 0;
+  for (let i = headerIndex + 1; i < lines.length; i += 1) {
+    const line = lines[i].replace(/\r$/, '');
+    if (!line.trim()) continue;
+    const cells = splitCsvLine(line);
+    const frame = csvNumber(cells[frameIndex]);
+    const rowPid = csvNumber(cells[pidIndex]);
+    if (rowPid === pid && frame !== null) clock += frame;
+    if (frame === null || rowPid !== pid) continue;
+    const at = atIndex >= 0 ? csvNumber(cells[atIndex]) : null;
+    const gpu = gpuIndex >= 0 ? csvNumber(cells[gpuIndex]) : null;
+    frames.push({ ms: frame, gpuMs: gpu, atMs: at === null ? clock : at * scale });
+  }
+  return { frames };
+}
+
 // The watcher's PresentMon command: every flag is one PresentMon 2.6.0's --help lists (checked on 2026-11-26 against
 // the installed build, whose CSV header is the 28-column one readPresentMon's tests pin).
 export function presentMonArgs(csvPath, seconds) {

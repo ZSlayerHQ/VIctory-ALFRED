@@ -62,133 +62,10 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
-/// A DXGI adapter, as a run's record names the one a program ran on.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Adapter {
-    /// DXGI's description: the card's name.
-    pub description: String,
-    pub vendor: u32,
-    pub device: u32,
-    /// The adapter's LUID, high part and low: which adapter of this machine, since its start.
-    pub luid: (i32, u32),
-    /// Flagged software, or Microsoft's Basic Render Driver (vendor 0x1414, device 0x8c).
-    pub software: bool,
-}
-
-impl Adapter {
-    fn of(desc: &DXGI_ADAPTER_DESC1) -> Adapter {
-        let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-        Adapter {
-            description: String::from_utf16_lossy(&desc.Description[..len]),
-            vendor: desc.VendorId,
-            device: desc.DeviceId,
-            luid: (desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart),
-            software: desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c),
-        }
-    }
-}
-
-impl std::fmt::Display for Adapter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "\"{}\" (vendor {:#06x}, device {:#06x}, LUID {:08x}:{:08x}; {})",
-            self.description,
-            self.vendor,
-            self.device,
-            self.luid.0,
-            self.luid.1,
-            if self.software { "software" } else { "hardware" }
-        )
-    }
-}
-
-/// The adapter `device` is on, by its LUID; None where DXGI does not say.
-fn adapter_of(device: &ID3D12Device) -> Option<Adapter> {
-    // SAFETY: plain DXGI queries of a live device's adapter.
-    unsafe {
-        let factory = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-        let adapter = factory.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()).ok()?;
-        adapter.GetDesc1().ok().map(|desc| Adapter::of(&desc))
-    }
-}
-
-/// Whether `device` is on the software adapter ([`Adapter::software`]).
-fn software(device: &ID3D12Device) -> bool {
-    adapter_of(device).is_some_and(|a| a.software)
-}
-
-/// Whether static samplers may be anisotropic with a point mip filter on
-/// `device`: the device says so (`D3D12_OPTIONS19`), and a root signature
-/// with such a sampler serializes and is made on it. (The runtime's
-/// serializer here refuses the filter as unrecognized on a software
-/// adapter that says it supports it.)
-fn aniso_point_mip(device: &ID3D12Device) -> bool {
-    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-    // SAFETY: writes `options` of the given size; a runtime that does not
-    // know the query refuses it, which means no support.
-    let said = unsafe {
-        device.CheckFeatureSupport(
-            D3D12_FEATURE_D3D12_OPTIONS19,
-            (&raw mut options).cast(),
-            size_of_val(&options) as u32,
-        )
-    }
-    .is_ok()
-        && options.AnisoFilterWithPointMipSupported.as_bool();
-    if !said {
-        return false;
-    }
-    let sampler = D3D12_STATIC_SAMPLER_DESC {
-        Filter: D3D12_FILTER_MIN_MAG_ANISOTROPIC_MIP_POINT,
-        AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        MaxAnisotropy: 16,
-        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
-        MaxLOD: D3D12_FLOAT32_MAX,
-        RegisterSpace: super::SAMPLER_SPACE,
-        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        ..Default::default()
-    };
-    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
-        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
-        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
-            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
-                NumStaticSamplers: 1,
-                pStaticSamplers: &sampler,
-                ..Default::default()
-            },
-        },
-    };
-    // SAFETY: the description points at a live sampler; the blob is read
-    // before it is released.
-    unsafe {
-        let mut blob: Option<ID3DBlob> = None;
-        if D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).is_err() {
-            return false;
-        }
-        let Some(blob) = blob else { return false };
-        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        device.CreateRootSignature::<ID3D12RootSignature>(0, bytes).is_ok()
-    }
-}
-
-/// What a shader test host asks for, and the software switch in effect: `warp`, the caller's
-/// request for the software adapter; `switched`, `VICTORY_WARP=1`, which puts a caller that
-/// asked for hardware on the software adapter and leaves its request one for hardware.
-fn leg(warp: bool, switched: bool) -> (crate::adapter::Asked, Option<&'static str>) {
-    use crate::adapter::Asked;
-    let asked = if warp { Asked::Software } else { Asked::Hardware };
-    (asked, switched.then_some("VICTORY_WARP=1"))
-}
-
 impl Host {
-    /// The adapter the one rule picks (`crate::adapter`), or WARP with `warp` (the caller's
-    /// request) or `VICTORY_WARP=1` (the switch, for a caller that asked for hardware).
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
-        let switched = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-        let (asked, switch) = leg(warp, switched);
+        let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
@@ -201,59 +78,49 @@ impl Host {
                     debug.EnableDebugLayer();
                 }
             }
-            // Either leg by the one rule (`crate::adapter::test_device`), its line said once a
-            // process: the software adapter checked to be one; the hardware adapter Windows
-            // ranks first for high performance, or `VICTORY_ADAPTER`'s, held to the host's
-            // baseline. `VICTORY_REQUIRE_GPU` holds for a caller that asked for hardware: no
-            // hardware device, the software adapter (the switch's too) or one not described
-            // is a panic, not an `Err` a test skips on; so is a `VICTORY_ADAPTER` that names
-            // no adapter. A machine without a card (the rule's adapter the software one, a
-            // hosted runner) is a skip for such a caller without the requirement.
-            let made = crate::adapter::test_device(asked, switch)?;
-            let device = made.device;
-            // Every device here runs SM 6.6 shaders (a hardware one was held to it already).
+            let mut device: Option<ID3D12Device> = None;
+            if warp {
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            } else {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                // A machine without a graphics card gives the software
+                // adapter as its default device (a hosted test runner,
+                // whose first adapter is a display stub that cannot make a
+                // device): that is no hardware device, and the tests that
+                // ask for one skip it, as they do where there is none.
+                if let Some(made) = &device {
+                    let factory: IDXGIFactory4 =
+                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
+                        && let Ok(desc) = adapter.GetDesc1()
+                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
+                    {
+                        return Err("the default device is the software adapter".to_owned());
+                    }
+                }
+            }
+            let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
-            let short = match device.CheckFeatureSupport(
-                D3D12_FEATURE_SHADER_MODEL,
-                (&raw mut sm).cast(),
-                size_of_val(&sm) as u32,
-            ) {
-                Err(e) => Some(format!("the shader model query failed: {}", err(e))),
-                Ok(()) => (sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0)
-                    .then(|| format!("the device supports SM {:#x} only", sm.HighestShaderModel.0)),
-            };
-            if let Some(short) = short {
-                // (no SM 6.6 device for a caller that asked for hardware: what
-                // `VICTORY_REQUIRE_GPU` fails, a query error too)
-                if asked == crate::adapter::Asked::Hardware
-                    && let Err(failed) = crate::adapter::require(crate::adapter::Got::Nothing)
-                {
-                    panic!("{failed} ({short})");
-                }
-                return Err(short);
+            device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut sm).cast(),
+                    size_of_val(&sm) as u32,
+                )
+                .map_err(err)?;
+            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+                return Err(format!(
+                    "the device supports SM {:#x} only",
+                    sm.HighestShaderModel.0
+                ));
             }
             Ok(Host { device })
         }
-    }
-
-    /// Whether the device is the software adapter (WARP): asked of the
-    /// device itself, the one a test then runs on.
-    pub fn is_software(&self) -> bool {
-        software(&self.device)
-    }
-
-    /// The adapter the device is on, asked of the device (its LUID) and of DXGI (for a
-    /// test's record: which card, or the software adapter, a program ran on); None where
-    /// DXGI does not say.
-    pub fn adapter(&self) -> Option<Adapter> {
-        adapter_of(&self.device)
-    }
-
-    /// The name of that adapter, as DXGI describes it; "unknown" where DXGI does not say.
-    pub fn adapter_name(&self) -> String {
-        self.adapter().map_or("unknown".to_owned(), |a| a.description)
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -318,14 +185,24 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        // Older runtimes may not recognize OPTIONS19; that means no support.
+        let aniso_point_mip_supported = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool();
         let mut samplers = Vec::new();
-        let point_mip = stages.iter().any(|(s, _)| s.static_samplers.iter().any(|d| d.filter & !0x180 == 0x54))
-            && aniso_point_mip(&self.device);
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
                 let [u, v, w] = d.address.map(|a| D3D12_TEXTURE_ADDRESS_MODE(a as i32));
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(d.filter_for_host(point_mip) as i32),
+                    Filter: D3D12_FILTER(d.filter_for_host(aniso_point_mip_supported) as i32),
                     AddressU: u,
                     AddressV: v,
                     AddressW: w,
@@ -780,19 +657,6 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
-        self.draw_with(root, pso, d, &[])
-    }
-
-    /// [`Host::draw`] with constant buffers of these dwords at the view-heap indices
-    /// after the textures. A texture given more texels than its size holds has them as
-    /// its smaller levels, each half the one before.
-    pub fn draw_with(
-        &self,
-        root: &ID3D12RootSignature,
-        pso: &ID3D12PipelineState,
-        d: &Draw,
-        cbvs: &[&[u32]],
-    ) -> Result<Vec<[f32; 4]>, String> {
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -878,7 +742,7 @@ impl Host {
             let views: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: (d.textures.len() + cbvs.len()).max(1) as u32,
+                    NumDescriptors: d.textures.len().max(1) as u32,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     ..Default::default()
                 })
@@ -898,69 +762,54 @@ impl Host {
                 dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
             let mut keep = Vec::new();
             for (i, &(tw, th, texels)) in d.textures.iter().enumerate() {
-                // Each level's size and first texel.
-                let mut levels = vec![(tw, th, 0usize)];
-                while let Some(&(lw, lh, at)) = levels.last() {
-                    let next = at + (lw * lh) as usize;
-                    if next >= texels.len() || (lw, lh) == (1, 1) {
-                        break;
-                    }
-                    levels.push(((lw / 2).max(1), (lh / 2).max(1), next));
-                }
-                let mut desc = tex_desc(tw, th, D3D12_RESOURCE_FLAG_NONE);
-                desc.MipLevels = levels.len() as u16;
                 let tex = make(
                     D3D12_HEAP_TYPE_DEFAULT,
-                    &desc,
+                    &tex_desc(tw, th, D3D12_RESOURCE_FLAG_NONE),
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     None,
                 )?;
-                for (level, &(tw, th, first)) in levels.iter().enumerate() {
-                    let texels = &texels[first..];
-                    let pitch = (tw as usize * 16).next_multiple_of(256);
-                    let upload = make(
-                        D3D12_HEAP_TYPE_UPLOAD,
-                        &buf_desc((pitch * th as usize) as u64),
-                        D3D12_RESOURCE_STATE_GENERIC_READ,
-                        None,
-                    )?;
-                    let mut p = std::ptr::null_mut();
-                    upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                    for y in 0..th as usize {
-                        let row = &texels[y * tw as usize..(y + 1) * tw as usize];
-                        std::ptr::copy_nonoverlapping(
-                            row.as_ptr().cast::<u8>(),
-                            p.cast::<u8>().add(y * pitch),
-                            row.len() * 16,
-                        );
-                    }
-                    upload.Unmap(0, None);
-                    let dst = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: std::mem::transmute_copy(&tex),
-                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            SubresourceIndex: level as u32,
-                        },
-                    };
-                    let src = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: std::mem::transmute_copy(&upload),
-                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                                Offset: 0,
-                                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-                                    Width: tw,
-                                    Height: th,
-                                    Depth: 1,
-                                    RowPitch: pitch as u32,
-                                },
+                let pitch = (tw as usize * 16).next_multiple_of(256);
+                let upload = make(
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    &buf_desc((pitch * th as usize) as u64),
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                )?;
+                let mut p = std::ptr::null_mut();
+                upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                for y in 0..th as usize {
+                    let row = &texels[y * tw as usize..(y + 1) * tw as usize];
+                    std::ptr::copy_nonoverlapping(
+                        row.as_ptr().cast::<u8>(),
+                        p.cast::<u8>().add(y * pitch),
+                        row.len() * 16,
+                    );
+                }
+                upload.Unmap(0, None);
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&tex),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&upload),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                Width: tw,
+                                Height: th,
+                                Depth: 1,
+                                RowPitch: pitch as u32,
                             },
                         },
-                    };
-                    list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-                    keep.push(upload);
-                }
+                    },
+                };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
                 list.ResourceBarrier(&[transition(
                     &tex,
                     D3D12_RESOURCE_STATE_COPY_DEST,
@@ -971,29 +820,7 @@ impl Host {
                 at.ptr += i * view_size;
                 dev.CreateShaderResourceView(&tex, None, at);
                 keep.push(tex);
-            }
-            for (i, data) in cbvs.iter().enumerate() {
-                let size = (data.len() * 4).next_multiple_of(256);
-                let buffer = make(
-                    D3D12_HEAP_TYPE_UPLOAD,
-                    &buf_desc(size as u64),
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                )?;
-                let mut p = std::ptr::null_mut();
-                buffer.Map(0, None, Some(&mut p)).map_err(err)?;
-                std::ptr::copy_nonoverlapping(data.as_ptr(), p.cast::<u32>(), data.len());
-                buffer.Unmap(0, None);
-                let mut at = views.GetCPUDescriptorHandleForHeapStart();
-                at.ptr += (d.textures.len() + i) * view_size;
-                dev.CreateConstantBufferView(
-                    Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                        BufferLocation: buffer.GetGPUVirtualAddress(),
-                        SizeInBytes: size as u32,
-                    }),
-                    at,
-                );
-                keep.push(buffer);
+                keep.push(upload);
             }
             for (i, s) in d.samplers.iter().enumerate() {
                 let mut at = sampler_heap.GetCPUDescriptorHandleForHeapStart();
@@ -1141,17 +968,6 @@ impl Host {
     }
 }
 
-/// Whether the work before a fence's signal of `signal` is done, by the value the fence
-/// reports (`ID3D12Fence::GetCompletedValue`): not below the signal. A fence of a removed
-/// device reports `UINT64_MAX`, which is no completion: an error, whatever the signal.
-#[cfg(test)]
-fn fence_reached(completed: u64, signal: u64) -> Result<bool, &'static str> {
-    if completed == u64::MAX {
-        return Err("the fence reports UINT64_MAX");
-    }
-    Ok(completed >= signal)
-}
-
 #[cfg(test)]
 fn transition(
     r: &ID3D12Resource,
@@ -1178,8 +994,10 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
-    /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
-    Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
+    Cube(u32, u16, &'a [[f32; 4]]),
+    /// An RGBA32F 3D texture SRV (width, height, depth, texels x fastest).
+    Texture3D(u32, u32, u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1188,15 +1006,16 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// A typed buffer UAV pre-filled with `data` (`format`, bytes per element).
+    TypedUav {
+        data: &'a [u32],
+        format: DXGI_FORMAT,
+        elem_bytes: u32,
+    },
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
-    /// The null descriptor of slot-map class `class` (`slot_map::class`):
-    /// a constant buffer view for class 13, a raw buffer UAV for
-    /// unordered-access classes, a raw or typed buffer SRV for buffer
-    /// classes, else a 2D RGBA32F texture SRV. Not read back.
-    Null(u32),
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1358,21 +1177,66 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
-                        let (w, h, texels, faces) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1),
-                            View::Cube(n, t) => (n, n, t, 6),
-                            _ => unreachable!(),
+                    View::Texture3D(w, h, depth, texels) => {
+                        let desc = D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+                            DepthOrArraySize: depth as u16,
+                            ..texture(w, h, D3D12_RESOURCE_FLAG_NONE)
                         };
-                        let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
-                        desc.DepthOrArraySize = faces as u16;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         let pitch = (w as usize * 16).next_multiple_of(256);
-                        for face in 0..faces as usize {
+                        let upload = make(
+                            D3D12_HEAP_TYPE_UPLOAD,
+                            &buffer(
+                                (pitch * (h * depth) as usize) as u64,
+                                D3D12_RESOURCE_FLAG_NONE,
+                            ),
+                            D3D12_RESOURCE_STATE_GENERIC_READ,
+                        )?;
+                        let mut p = std::ptr::null_mut();
+                        upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                        for (row, line) in texels.chunks(w as usize).enumerate() {
+                            std::ptr::copy_nonoverlapping(
+                                line.as_ptr().cast::<u8>(),
+                                p.cast::<u8>().add(row * pitch),
+                                line.len() * 16,
+                            );
+                        }
+                        upload.Unmap(0, None);
+                        let mut from = footprint(&upload, w, h);
+                        from.Anonymous.PlacedFootprint.Footprint.Depth = depth;
+                        list.CopyTextureRegion(&subresource(&tex), 0, 0, 0, &from, None);
+                        keep.push(upload);
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
+                        keep.push(tex);
+                    }
+                    View::Texture(..) | View::Cube(..) => {
+                        let (w, h, mut texels, faces, mips) = match *v {
+                            View::Texture(w, h, t) => (w, h, t, 1, 1),
+                            View::Cube(n, mips, t) => (n, n, t, 6, mips),
+                            _ => unreachable!(),
+                        };
+                        let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
+                        desc.DepthOrArraySize = faces as u16;
+                        desc.MipLevels = mips;
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        for sub in 0..u32::from(mips) * faces {
+                            let mip = sub % u32::from(mips);
+                            let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
+                            let pitch = (w as usize * 16).next_multiple_of(256);
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
                                 &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
@@ -1380,9 +1244,10 @@ impl Host {
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let texels = &texels[face * (w * h) as usize..];
+                            let (level, rest) = texels.split_at((w * h) as usize);
+                            texels = rest;
                             for y in 0..h as usize {
-                                let row = &texels[y * w as usize..(y + 1) * w as usize];
+                                let row = &level[y * w as usize..(y + 1) * w as usize];
                                 std::ptr::copy_nonoverlapping(
                                     row.as_ptr().cast::<u8>(),
                                     p.cast::<u8>().add(y * pitch),
@@ -1391,7 +1256,7 @@ impl Host {
                             }
                             upload.Unmap(0, None);
                             let mut at_face = subresource(&tex);
-                            at_face.Anonymous.SubresourceIndex = face as u32;
+                            at_face.Anonymous.SubresourceIndex = sub;
                             list.CopyTextureRegion(
                                 &at_face,
                                 0,
@@ -1413,7 +1278,7 @@ impl Host {
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                 TextureCube: D3D12_TEXCUBE_SRV {
-                                    MipLevels: 1,
+                                    MipLevels: u32::from(mips),
                                     ..Default::default()
                                 },
                             },
@@ -1452,6 +1317,46 @@ impl Host {
                                 Buffer: D3D12_BUFFER_UAV {
                                     NumElements: elements,
                                     Flags: flags,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((b, None, n, rb));
+                    }
+                    View::TypedUav {
+                        data,
+                        format,
+                        elem_bytes,
+                    } => {
+                        let n = data.len() as u32;
+                        let bytes = u64::from(n) * 4;
+                        let elements = (bytes / u64::from(elem_bytes)) as u32;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let up = upload(data)?;
+                        list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
+                        keep.push(up);
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: elements,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_NONE,
                                     ..Default::default()
                                 },
                             },
@@ -1554,72 +1459,6 @@ impl Host {
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
                         keep.push(b);
                     }
-                    View::Null(class) => {
-                        // (DXIL kinds: 10 typed buffer, 11 raw, 12 structured.)
-                        let raw = D3D12_BUFFER_SRV {
-                            NumElements: 1,
-                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                            ..Default::default()
-                        };
-                        if class == 13 {
-                            // A null constant buffer view: no address.
-                            dev.CreateConstantBufferView(
-                                Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                                    BufferLocation: 0,
-                                    SizeInBytes: 0,
-                                }),
-                                at,
-                            );
-                        } else if class & 32 != 0 {
-                            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                                Format: DXGI_FORMAT_R32_TYPELESS,
-                                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-                                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                                    Buffer: D3D12_BUFFER_UAV {
-                                        NumElements: 1,
-                                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                                        ..Default::default()
-                                    },
-                                },
-                            };
-                            dev.CreateUnorderedAccessView(None, None, Some(&desc), at);
-                        } else {
-                            let (format, dimension, anonymous) = match class {
-                                10 => (
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT,
-                                    D3D12_SRV_DIMENSION_BUFFER,
-                                    D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                                        Buffer: D3D12_BUFFER_SRV {
-                                            NumElements: 1,
-                                            ..Default::default()
-                                        },
-                                    },
-                                ),
-                                11 | 12 => (
-                                    DXGI_FORMAT_R32_TYPELESS,
-                                    D3D12_SRV_DIMENSION_BUFFER,
-                                    D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Buffer: raw },
-                                ),
-                                _ => (
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT,
-                                    D3D12_SRV_DIMENSION_TEXTURE2D,
-                                    D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                                        Texture2D: D3D12_TEX2D_SRV {
-                                            MipLevels: 1,
-                                            ..Default::default()
-                                        },
-                                    },
-                                ),
-                            };
-                            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                                Format: format,
-                                ViewDimension: dimension,
-                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                                Anonymous: anonymous,
-                            };
-                            dev.CreateShaderResourceView(None, Some(&desc), at);
-                        }
-                    }
                 }
             }
             for (i, s) in d.samplers.iter().enumerate() {
@@ -1684,20 +1523,11 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            let removed = |why: &str| match dev.GetDeviceRemovedReason() {
-                Err(e) => format!("device removed{why}: {}", err(e)),
-                Ok(()) => format!("device removed{why}"),
-            };
-            while !fence_reached(fence.GetCompletedValue(), 1).map_err(|why| removed(&format!(" ({why})")))? {
-                if dev.GetDeviceRemovedReason().is_err() {
-                    return Err(removed(""));
+            while fence.GetCompletedValue() < 1 {
+                if let Err(e) = dev.GetDeviceRemovedReason() {
+                    return Err(format!("device removed: {}", err(e)));
                 }
                 std::thread::yield_now();
-            }
-            // (a device removed between the fence's last value and here: nothing read back
-            // from it counts as the program's)
-            if dev.GetDeviceRemovedReason().is_err() {
-                return Err(removed(" after the fence completed"));
             }
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
@@ -1725,94 +1555,5 @@ impl Host {
             drop(keep);
             Ok(out)
         }
-    }
-}
-
-#[cfg(test)]
-mod gate_tests {
-    use super::fence_reached;
-
-    /// The fourth review's Question 3: a fence of a removed device reports `UINT64_MAX`,
-    /// which is above any signal. The wait for a dispatch took it for completion and went
-    /// on to read back; it is the device's loss, never "fenced to completion".
-    #[test]
-    fn a_removed_devices_fence_value_is_not_completion() {
-        assert_eq!(fence_reached(0, 1), Ok(false), "not signalled yet");
-        assert_eq!(fence_reached(1, 1), Ok(true), "the signal's value");
-        assert_eq!(fence_reached(7, 1), Ok(true), "a later signal's value");
-        assert!(fence_reached(u64::MAX, 1).is_err(), "UINT64_MAX is the removed device's value");
-    }
-}
-
-#[cfg(test)]
-mod static_sampler_tests {
-    use windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_ALL;
-
-    use super::Host;
-    use crate::emit::{HostShader, StaticSampler};
-
-    /// A stage whose immediate sampler is anisotropic with a point mip
-    /// filter (filtering, minimum and maximum reduction) gets a root
-    /// signature on the software adapter, whether or not the device and the
-    /// runtime's serializer take that filter; the translated entry keeps
-    /// the console's filter.
-    #[test]
-    fn a_point_mip_anisotropic_static_sampler_makes_a_root_signature() {
-        let Ok(host) = Host::new(true) else {
-            eprintln!("no SM 6.6 software device; skipped");
-            return;
-        };
-        for reduction in 0..3u32 {
-            // Anisotropic magnification and minification, point mip filter.
-            let sampler = StaticSampler::from_words([reduction << 29, 0x00FF_F000, 1 << 26 | 0x00F0_0000, 0]);
-            let cs = HostShader {
-                stage: crate::HwStage::Cs,
-                dxil: Vec::new(),
-                user_data: Vec::new(),
-                samplers: Vec::new(),
-                static_samplers: vec![sampler],
-                root_cbvs: Vec::new(),
-                root_srvs: Vec::new(),
-                root_uavs: Vec::new(),
-                root_indexed_views: Vec::new(),
-            };
-            if let Err(e) = host.root_signature_for(&[(&cs, D3D12_SHADER_VISIBILITY_ALL)]) {
-                panic!("reduction {reduction}, filter {:#x}: {e}", sampler.filter);
-            }
-            assert_eq!(cs.static_samplers[0].filter & !0x180, 0x54, "the translation keeps the point mip");
-        }
-    }
-}
-
-#[cfg(test)]
-mod leg_tests {
-    use super::leg;
-    use crate::adapter::{Asked, Requirement, TEST_SOFTWARE, Verdict, software_for, verdict};
-
-    /// `VICTORY_WARP=1` puts a caller that asked for hardware on the software adapter and
-    /// keeps its request one for hardware (the requirement holds for it, the line names the
-    /// switch); a caller that asked for the software adapter stays its own request, which the
-    /// requirement does not touch, with the switch or without.
-    #[test]
-    fn the_switch_does_not_lose_the_callers_request() {
-        assert_eq!(leg(false, false), (Asked::Hardware, None));
-        assert_eq!(leg(false, true), (Asked::Hardware, Some("VICTORY_WARP=1")));
-        let (asked, switch) = leg(true, true);
-        assert_eq!(asked, Asked::Software);
-        assert_eq!(software_for(asked, switch), Some(TEST_SOFTWARE));
-        let warp = crate::adapter::Adapter {
-            description: "Microsoft Basic Render Driver".to_owned(),
-            vendor: 0x1414,
-            device: 0x8c,
-            luid: 3,
-            software: true,
-            dedicated: 0,
-            driver: None,
-        };
-        let required = Requirement::Hardware;
-        assert_eq!(verdict(asked, Some(&required), true, Ok(Some(&warp))), Verdict::Run);
-        let (asked, switch) = leg(false, true);
-        assert!(matches!(verdict(asked, Some(&required), switch.is_some(), Ok(Some(&warp))), Verdict::Fail(_)));
-        assert_eq!(verdict(asked, None, switch.is_some(), Ok(Some(&warp))), Verdict::Run);
     }
 }

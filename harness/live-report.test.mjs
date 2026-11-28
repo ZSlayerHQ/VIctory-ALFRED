@@ -162,7 +162,7 @@ test("the runtime's segment line is read with its three kinds left out, each wit
   );
   assert.equal(closed.inForce.LIVE_MARK, '0');
   assert.equal(closed.inForce.LIVE_SKIP_DRAW, '', 'an empty list stays empty');
-  assert.equal(Object.keys(closed.inForce).length, 14, 'every switch but the panel, off');
+  assert.equal(Object.keys(closed.inForce).length, 16, 'every switch but the panel, off');
   const open = parseLiveLine(SEGMENT_OPEN_LINE).openSegment;
   assert.equal(open.open, true);
   assert.equal(open.ended, null);

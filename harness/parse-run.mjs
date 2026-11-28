@@ -270,6 +270,17 @@ function parseCopystatLine(line) {
 
 // Both "host pipeline refused" (graphics/compute) and "host mesh pipeline refused".
 const REFUSED_RE = /host (?:mesh )?pipeline refused .*shaders=\[(.*?)\]/;
+// A shader the translator refuses: every draw and dispatch of its pipelines is dropped, so the picture loses what
+// it drew. A run of 2026-11-28 lost every character's body to 22 of these while the summary read "refused: 0",
+// because that line counts only pipelines the card refused.
+const NOT_TRANSLATED_RE = /shader does not translate; its pipelines' draws are dropped stage="(\w+)" hash=([0-9a-f]+) error=(.*)$/;
+// The reason alone: the converter's name, version and code offset say where, not why.
+function refusalReason(text) {
+  return text
+    .replace(/^.*?GFX10 code at 0x[0-9a-f]+: /, '')
+    .replace(/ is not supported\s*$/, '')
+    .trim();
+}
 const SLOW_RE = /slow host submission ms=(\d+) lists=(\d+) pipelines=\{(.*)\}/;
 const SLOW_LIST_RE = /slow host list ms=(\d+) commands=(\d+)/;
 const SLOW_CMD_RE = /slow list command, ([\d.]+) ms: (.*)/;
@@ -353,6 +364,7 @@ export function parseLogLines(lines, path, options = {}) {
   let unreadFrameLines = 0;
   const presented = [];
   const refused = [];
+  const notTranslated = new Map(); // hash -> { stage, reason }, each shader once however often it is said
   const slow = [];
   const slowLists = [];
   const slowCmds = [];
@@ -433,6 +445,8 @@ export function parseLogLines(lines, path, options = {}) {
       unreadFrameLines += 1;
     } else if ((r = line.match(PRESENT_RE))) {
       presented.push({ frame: num(r[1]), draws: num(r[2]), dispatches: num(r[4]) });
+    } else if ((r = line.match(NOT_TRANSLATED_RE))) {
+      if (!notTranslated.has(r[2])) notTranslated.set(r[2], { stage: r[1], reason: refusalReason(r[3]) });
     } else if ((r = line.match(REFUSED_RE))) {
       refused.push(r[1]);
     } else if ((r = line.match(SLOW_RE))) {
@@ -550,6 +564,14 @@ export function parseLogLines(lines, path, options = {}) {
     budget: joinBudgets(budgets),
     worstFrames: worst,
     refusedPipelines: { count: refused.length, hashes: refused.slice(0, 20) },
+    notTranslated: {
+      count: notTranslated.size,
+      // [reason, shaders], most shaders first
+      byReason: Object.entries(
+        [...notTranslated.values()].reduce((by, { reason }) => ({ ...by, [reason]: (by[reason] || 0) + 1 }), {}),
+      ).sort((a, b) => b[1] - a[1]),
+      programs: [...notTranslated].slice(0, 40).map(([hash, { stage }]) => `${stage} ${hash}`),
+    },
     slowSubmissions: slow,
     missingTextures: missingBy,
     translated,
@@ -614,6 +636,9 @@ export const HARNESS_ENDED_RE =
 export const HARNESS_SETTLED_RE = /^harness: settled at (\d+) s \(waiting (\d+|\?), ([\d.]+) fps\)(?:; waited: .*)?\s*$/;
 export const HARNESS_SETTLE_TIMEOUT_RE =
   /^harness: ended by --settled-timeout after ([\d.]+) s: the scene never settled\s*$/;
+/// The other cap: the run never reached the world, so it never had a heavy line (settled-watch's --world-timeout).
+export const HARNESS_WORLD_TIMEOUT_RE =
+  /^harness: ended by --world-timeout after ([\d.]+) s: the world never came \((?:last frame line: [\d.]+ fps, [\d.]+ draws\/frame|no frame line)\)\s*$/;
 /// The free-space guard's end line (run-world.sh's disk-guard watcher).
 export const HARNESS_DISK_RE = /^harness: ended: disk below ([\d.]+) GB\s*$/;
 /// The watchdog's stall line (run-world.sh's frozen-run watcher): the run was frozen, not finished.
@@ -831,9 +856,10 @@ export function parseExtras(lines, firstTs, lastTs) {
   const titleEnded = lines.map((line) => line.match(TITLE_ENDED_RE)).find(Boolean);
   const victoryExit = lines.map((line) => line.match(HARNESS_VICTORY_EXIT_RE)).find(Boolean);
   const settledTimeout = lines.some((line) => HARNESS_SETTLE_TIMEOUT_RE.test(line));
+  const worldTimeout = lines.some((line) => HARNESS_WORLD_TIMEOUT_RE.test(line));
   // The line the harness closes a log with. A log without one was cut short (a full drive, a killed shell), and
   // that is a different finding from a process that exited with no failure line.
-  const closingHarnessLine = Boolean(harnessEnded || diskEnded || victoryExit || settledTimeout);
+  const closingHarnessLine = Boolean(harnessEnded || diskEnded || victoryExit || settledTimeout || worldTimeout);
   const exitCode = victoryExit ? num(victoryExit[1]) : null;
   if (watchdogEnded) {
     ending = {
@@ -905,7 +931,7 @@ export function parseExtras(lines, firstTs, lastTs) {
   const settled = settledLine
     ? { seconds: num(settledLine[1]), waiting: settledLine[2] === '?' ? null : num(settledLine[2]), fps: num(settledLine[3]) }
     : null;
-  return { ending, hung, dred, settings: parseSettings(lines), settled, settledTimeout, watchdog };
+  return { ending, hung, dred, settings: parseSettings(lines), settled, settledTimeout, worldTimeout, watchdog };
 }
 
 export function parseRunFile(path) {

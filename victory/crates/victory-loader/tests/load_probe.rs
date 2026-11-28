@@ -126,7 +126,7 @@ fn loads_binds_and_calls_probe() {
     );
 
     let dir = tempfile::tempdir().unwrap();
-    let image = victory_loader::load(&prepared, dir.path(), None).unwrap();
+    let image = victory_loader::load(&prepared, dir.path()).unwrap();
 
     // The "title" ships victory-probe-title.dll: any real DLL will do.
     let title_dir = tempfile::tempdir().unwrap();

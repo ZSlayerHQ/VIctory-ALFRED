@@ -35,6 +35,8 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+import { endSelected } from './end-run.mjs';
+
 import { stripAnsi } from './parse-run.mjs';
 import { parsePipelineWait } from './run-lines.mjs';
 
@@ -43,6 +45,10 @@ export const DEFAULT_FLOOR_FPS = 1.5;
 export const DEFAULT_WAITING = null;
 export const SETTLED_LINES = 3;
 export const DEFAULT_TIMEOUT_S = 600;
+// A run that never reaches the world never has a heavy line, so the settled timeout above never starts. This
+// second limit runs from the watcher's start and stops applying at the first heavy line (2026-11-27: a run sat
+// on the game's first-boot screen for minutes).
+export const DEFAULT_WORLD_TIMEOUT_S = 600;
 // A scene on its first visit builds pipelines while it draws: the recording threads wait hundreds of ms a frame
 // for them, and the frame rate and texture queue can both look settled through it (the boat run, 09:12:56). A settle
 // also needs the pipeline work quiet: the last sample's wait under this, and none being made.
@@ -116,6 +122,7 @@ export function initialState() {
     metTexturesAt: null,
     settledDetail: null,
     lastFps: null,
+    lastDraws: null,
     lastWaiting: null,
     lastMaking: null,
     // The frame rates of the current run of lines meeting the other tests, newest last, at most SETTLED_LINES.
@@ -151,6 +158,7 @@ export function observe(state, raw, options = {}) {
   const frame = frameLine(raw);
   if (!frame) return next;
   next.lastFps = frame.fps;
+  next.lastDraws = frame.draws;
   next.lastWaiting = frame.waiting;
   if (frame.making !== null) {
     next.makingSeen = true;
@@ -192,6 +200,10 @@ export function observe(state, raw, options = {}) {
 /// keeps one pipeline being made, or never brings its pipeline wait under the threshold, would otherwise hold the
 /// settle off until the timeout with nothing in the log saying why.
 export function unmetText(state, options = {}) {
+  if (state.heavyAt === null && options.worldTimeout != null && options.startedAt != null && options.now != null) {
+    const left = Math.max(0, Math.round((options.worldTimeout * 1000 - (options.now - options.startedAt)) / 1000));
+    return `waiting for the first heavy frame line; ${left} s left of the ${options.worldTimeout} s world timeout`;
+  }
   const floorFps = options.floorFps ?? DEFAULT_FLOOR_FPS;
   const waiting = options.waiting ?? DEFAULT_WAITING;
   const quietMs = options.pipelineQuietMs ?? PIPELINE_QUIET_MS;
@@ -251,9 +263,14 @@ function detailFrom(state, quietMs, maxSpread) {
 
 /// What the watcher does now: end N seconds after the settle; time out when the scene has not settled within the
 /// cap after the first heavy line; otherwise wait.
-export function due(state, { now, seconds, timeout }) {
+export function due(state, { now, seconds, timeout, worldTimeout = null, startedAt = null }) {
   if (state.settledAt !== null) {
     return now - state.settledAt >= seconds * 1000 ? 'end' : 'wait';
+  }
+  // A run that never reaches the world never has a heavy line, so the settled timeout below never starts: this
+  // second limit runs from the watcher's start until the first heavy line is seen.
+  if (state.heavyAt === null && worldTimeout !== null && startedAt !== null && now - startedAt >= worldTimeout * 1000) {
+    return 'world-timeout';
   }
   if (state.heavyAt !== null && now - state.heavyAt >= timeout * 1000) return 'timeout';
   return 'wait';
@@ -266,6 +283,10 @@ export const settleEndMarker = (seconds) =>
   `harness: ended by --settled-seconds after ${seconds} s of settled scene`;
 export const timeoutMarker = (seconds) =>
   `harness: ended by --settled-timeout after ${seconds} s: the scene never settled`;
+export const worldTimeoutMarker = (seconds, last) =>
+  `harness: ended by --world-timeout after ${seconds} s: the world never came (` +
+  (last ? `last frame line: ${last.fps} fps, ${last.draws} draws/frame` : 'no frame line') +
+  ')';
 
 // run-process.ps1's strict selection, one pid per line. null means PowerShell failed, which is not evidence that
 // the game is gone. Exported so the watchdog ends a run by this route too, not a new one.
@@ -304,6 +325,8 @@ export function endPid(pid) {
 export function watch(logPath, seconds, options = {}) {
   const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
   const timeout = options.timeout ?? DEFAULT_TIMEOUT_S;
+  const worldTimeout = options.worldTimeout === null ? null : (options.worldTimeout ?? DEFAULT_WORLD_TIMEOUT_S);
+  const startedAt = Date.now();
   const floorFps = options.floorFps ?? DEFAULT_FLOOR_FPS;
   const waitingCeiling = options.waiting ?? DEFAULT_WAITING;
   const pipelineQuietMs = options.pipelineQuietMs ?? PIPELINE_QUIET_MS;
@@ -401,18 +424,16 @@ export function watch(logPath, seconds, options = {}) {
       }
     };
 
+    // A fresh selection at the moment of the kill, never the cached ids (end-run.mjs says why).
     const killThisRun = () => {
-      let alive = (pids || []).filter(isAlive);
-      if (!alive.length) {
-        refreshPids();
-        alive = (pids || []).filter(isAlive);
-      }
-      if (!alive.length) {
-        if (pids !== null) stop(0); // Already gone: it ended by itself.
+      lastSelection = Date.now();
+      const result = endSelected(() => selectionPids(psFile), endPid);
+      if (result.fresh) pids = result.fresh;
+      if (result.outcome === 'gone') {
+        stop(0); // Already gone: it ended by itself.
         return false;
       }
-      const ended = alive.filter(endPid);
-      return ended.length > 0;
+      return result.outcome === 'ended';
     };
 
     const tick = () => {
@@ -422,6 +443,22 @@ export function watch(logPath, seconds, options = {}) {
 
       if (state.heavyAt === null) {
         if (seenGame && !gameAlive()) stop(0);
+        const now = Date.now();
+        if (lastNoteAt === null) lastNoteAt = startedAt;
+        if (now - lastNoteAt >= UNSETTLED_NOTE_MS) {
+          append(unsettledMarker(Math.round((now - startedAt) / 1000), unmetText(state, { worldTimeout, startedAt, now })));
+          lastNoteAt = now;
+        }
+        if (due(state, { now, seconds, timeout, worldTimeout, startedAt }) === 'world-timeout') {
+          if (!killThisRun()) return; // Gone by itself (stop(0) inside), or taskkill failed: retry next poll.
+          append(
+            worldTimeoutMarker(
+              Math.round((now - startedAt) / 1000),
+              state.lastFps === null ? null : { fps: state.lastFps, draws: state.lastDraws },
+            ),
+          );
+          stop(0);
+        }
         return;
       }
       if (!gameAlive()) {
@@ -459,7 +496,7 @@ export function watch(logPath, seconds, options = {}) {
 
 function usage() {
   console.error(
-    'usage: node settled-watch.mjs <log> <seconds> [--timeout 600] [--floor-fps 1.5] [--waiting K] [--pipeline-quiet-ms 5] [--max-fps-spread 0.25|off] [--settle-after-s N] [--poll-ms 250] [--after-file <path>]',
+    'usage: node settled-watch.mjs <log> <seconds> [--timeout 600] [--world-timeout 600|off] [--floor-fps 1.5] [--waiting K] [--pipeline-quiet-ms 5] [--max-fps-spread 0.25|off] [--settle-after-s N] [--poll-ms 250] [--after-file <path>]',
   );
 }
 
@@ -467,6 +504,7 @@ async function main(argv) {
   const positional = [];
   let pollMs = DEFAULT_POLL_MS;
   let timeout = DEFAULT_TIMEOUT_S;
+  let worldTimeout = DEFAULT_WORLD_TIMEOUT_S;
   let floorFps = DEFAULT_FLOOR_FPS;
   let waiting = DEFAULT_WAITING;
   let pipelineQuietMs = PIPELINE_QUIET_MS;
@@ -477,6 +515,10 @@ async function main(argv) {
     const arg = argv[i];
     if (arg === '--poll-ms') pollMs = Number(argv[++i]);
     else if (arg === '--timeout') timeout = Number(argv[++i]);
+    else if (arg === '--world-timeout') {
+      const value = argv[++i];
+      worldTimeout = value === 'off' ? null : Number(value);
+    }
     else if (arg === '--floor-fps') floorFps = Number(argv[++i]);
     else if (arg === '--waiting') waiting = Number(argv[++i]);
     else if (arg === '--pipeline-quiet-ms') pipelineQuietMs = Number(argv[++i]);
@@ -509,6 +551,7 @@ async function main(argv) {
     !Number.isFinite(pipelineQuietMs) ||
     pipelineQuietMs <= 0 ||
     !(settleAfterS === null || (Number.isFinite(settleAfterS) && settleAfterS >= 0)) ||
+    !(worldTimeout === null || (Number.isFinite(worldTimeout) && worldTimeout > 0)) ||
     !(maxFpsSpread === null || (Number.isFinite(maxFpsSpread) && maxFpsSpread > 0));
   if (bad) {
     usage();
@@ -517,6 +560,7 @@ async function main(argv) {
   return watch(positional[0], seconds, {
     pollMs,
     timeout,
+    worldTimeout,
     floorFps,
     waiting,
     pipelineQuietMs,

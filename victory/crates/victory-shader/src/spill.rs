@@ -6,7 +6,9 @@
 //! address of a table in memory (`s0`, and `s1 & 0xff` as bits 32-39), and
 //! the parameter the layout declares at user-data index N (16 or above) is
 //! at byte `4 * (N - 16)` of that table. The code reads it with
-//! `s_load_dword*` through that pointer.
+//! `s_load_dword*` through that pointer. (Every compute program of the
+//! console's ray-tracing structure builder, `XboxBvhBuilder.dll`, is of this
+//! kind; measured there: 118 of 118 such loads land on a declared parameter.)
 //!
 //! [`user_data`] rewrites those loads away: each dword they read becomes the
 //! entry value of the SGPR its user-data index names, as if the parameter
@@ -26,16 +28,6 @@ const FIRST: u32 = 16;
 /// of a spilled user-data table rewritten ([`user_data`]).
 pub fn build(native: &NativeProgram) -> Result<Program, ShaderError> {
     let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-    user_data(&mut p, native);
-    Ok(p)
-}
-
-/// [`build`] with no lane-pair web ([`ir::build_without_webs`]): the same code
-/// and the same rewrite, each parked pair of shared lanes as two scalars, as
-/// on `world`. What the approximate forms of a program with webs take
-/// (`emit`'s selection).
-pub fn build_without_webs(native: &NativeProgram) -> Result<Program, ShaderError> {
-    let mut p = ir::build_without_webs(&native.patched_code(), native.wave64, native.vgprs)?;
     user_data(&mut p, native);
     Ok(p)
 }
@@ -63,7 +55,8 @@ fn spilled(native: &NativeProgram) -> Option<Vec<(u32, u32)>> {
 }
 
 /// Whether `native` reads its root parameters from a spilled user-data
-/// table.
+/// table. (In the title exactly the compute programs of the
+/// console's ray-tracing structure builder do.)
 pub fn is_spilled(native: &NativeProgram) -> bool {
     spilled(native).is_some()
 }

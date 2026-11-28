@@ -22,8 +22,6 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
-    /// Folder of load-time title patch files. `None` disables patching.
-    pub title_patches_dir: Option<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -41,7 +39,6 @@ struct FilePaths {
     game_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
-    title_patches_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
 }
@@ -49,7 +46,7 @@ struct FilePaths {
 impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
-        let explicit = std::env::var_os("VICTORY_CONFIG").map(PathBuf::from);
+        let explicit = explicit_config_path(|k| std::env::var_os(k));
         let path = explicit
             .clone()
             .unwrap_or_else(|| PathBuf::from("victory.toml"));
@@ -94,19 +91,11 @@ impl Config {
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
-        // An explicit `VICTORY_TITLE_PATCHES=0` wins over any configured
-        // folder, so the feature can be turned off without editing config.
-        let title_patches_dir = if env("VICTORY_TITLE_PATCHES").is_some_and(|v| v == "0") {
-            None
-        } else {
-            env_path("VICTORY_TITLE_PATCHES_DIR").or(file.title_patches_dir)
-        };
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
             test_titles,
-            title_patches_dir,
             source,
         })
     }
@@ -130,6 +119,14 @@ impl Config {
     }
 }
 
+/// The config file explicitly named by the environment, if any. An empty
+/// `VICTORY_CONFIG` means unset, like the other path variables.
+fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    env("VICTORY_CONFIG")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     let dir = root.join(sub);
     ensure_outside_repo(&dir)?;
@@ -137,8 +134,19 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache).
+/// The folder for everything of ours (settings, logs, caches, saves,
+/// downloads) when `VICTORY_HOME` names one: for a full C: drive, e.g.
+/// `setx VICTORY_HOME D:\victory`. Else `%LOCALAPPDATA%\victory`.
+pub fn home_override() -> Option<PathBuf> {
+    std::env::var_os("VICTORY_HOME").filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache), or
+/// `VICTORY_HOME/<name>`.
 fn default_dir(name: &str) -> Result<PathBuf> {
+    if let Some(home) = home_override() {
+        return Ok(home.join(name));
+    }
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
         .map(PathBuf::from)
@@ -163,45 +171,6 @@ mod tests {
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
-    }
-
-    #[test]
-    fn title_patches_dir_env_overrides_file() {
-        let file = FilePaths {
-            title_patches_dir: Some("from-file".into()),
-            ..Default::default()
-        };
-        let env = |k: &str| (k == "VICTORY_TITLE_PATCHES_DIR").then(|| OsString::from("from-env"));
-        let cfg = Config::resolve(file, None, env).unwrap();
-        assert_eq!(cfg.title_patches_dir.unwrap(), PathBuf::from("from-env"));
-    }
-
-    #[test]
-    fn title_patches_switch_turns_it_off() {
-        let file = FilePaths {
-            title_patches_dir: Some("from-file".into()),
-            ..Default::default()
-        };
-        let env = |k: &str| (k == "VICTORY_TITLE_PATCHES").then(|| OsString::from("0"));
-        let cfg = Config::resolve(file, None, env).unwrap();
-        assert_eq!(cfg.title_patches_dir, None);
-    }
-
-    #[test]
-    fn title_patches_switch_beats_the_folder_variable() {
-        let env = |k: &str| match k {
-            "VICTORY_TITLE_PATCHES" => Some(OsString::from("0")),
-            "VICTORY_TITLE_PATCHES_DIR" => Some(OsString::from("from-env")),
-            _ => None,
-        };
-        let cfg = Config::resolve(FilePaths::default(), None, env).unwrap();
-        assert_eq!(cfg.title_patches_dir, None);
-    }
-
-    #[test]
-    fn title_patches_dir_is_optional() {
-        let cfg = Config::resolve(FilePaths::default(), None, |_| None).unwrap();
-        assert_eq!(cfg.title_patches_dir, None);
     }
 
     #[test]
@@ -235,6 +204,17 @@ mod tests {
         assert_eq!(
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]
+        );
+    }
+
+    #[test]
+    fn empty_config_env_is_ignored() {
+        let empty = |k: &str| (k == "VICTORY_CONFIG").then(OsString::new);
+        assert_eq!(explicit_config_path(empty), None);
+        let set = |k: &str| (k == "VICTORY_CONFIG").then(|| OsString::from("custom.toml"));
+        assert_eq!(
+            explicit_config_path(set),
+            Some(PathBuf::from("custom.toml"))
         );
     }
 

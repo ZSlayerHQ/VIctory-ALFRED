@@ -1,14 +1,20 @@
 # Third-party code and credits
 
-One line per project this work draws on. "Licence not stated" means the project's checkout or the notes we hold
-carried no licence file; it is not a claim that no licence exists.
+The runtime in `victory/` is other people's work with ours on top. One line per project whose code is in this
+repository. Each project's own repository lists its contributors; they are not repeated here.
 
-| Project | What we took | Licence |
+| Project | What is here | Licence |
 |---|---|---|
-| [VIctory](https://github.com/Marvisak/VIctory) | the runtime: loader, console platform, Direct3D 12 host and shader translator | GPL-3.0-or-later |
-| [fxceless/victory-fork](https://github.com/fxceless/victory-fork) | the fork both of our branches start from; the frame-time changes we studied and ported | GPL-3.0-or-later |
-| [JoshuuDev/victory-amd](https://github.com/JoshuuDev/victory-amd) | the view guard and kernel-read fix, merged whole into the runtime | GPL-3.0-or-later |
-| [Trexies/victory-fork](https://github.com/Trexies/victory-fork) | blending on integer render targets; translation and speed changes ported one by one | GPL-3.0-or-later |
-| [Paradoxo321/rodrion-vi](https://github.com/Paradoxo321/rodrion-vi) | a hardware probe for tiled resources over CPU-mapped memory, ported (`victory-gpu/src/tiled_probe.rs`) | GPL-3.0 by its source header; the repository shows no licence file |
-| [XCL](https://github.com/ivall/xcl) | read as a reference only; fixes inspired by it were written anew | GPL-2.0-only |
-| [Leonida Continued](https://github.com/ubiquitarianism/leonida) | read as a reference only; no code copied | licence not stated |
+| [VIctory](https://github.com/Marvisak/VIctory) | the runtime itself: the loader, the console platform, the Direct3D 12 host and the shader translator | GPL-3.0-or-later |
+| [readmet3xt-lab/foxhound](https://github.com/readmet3xt-lab/foxhound) | the community line the base builds on: its work on submission, memory copies and translation | GPL-3.0-or-later |
+| [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) | the base this repository's runtime starts from since 2026-11-28, the fastest line we measured, with its settings menu | GPL-3.0-or-later |
+
+**Ours on top:** the top bar and its timing, the plain-language names and the panel of the settings menu (art and
+the script that makes it are in `scripts/overlay-art/`), translator fixes with their fixtures, and the test harness
+in `harness/`.
+
+**Left out of this copy on purpose:** the base's source files that change the title's own code (its 1440p output
+mode, DLSS and frame generation depend on them) and its scripts that download other vendors' libraries. Small
+stand-ins that do nothing keep the rest building.
+
+Before 2026-11-28 this repository carried an earlier runtime line; it remains in this repository's history.

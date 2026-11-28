@@ -37,9 +37,9 @@ pub const PROVIDER: Guid = Guid::new(
     0x4cc2,
     [0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2],
 );
-/// A later id of the same interface (2026): every slot implemented here
-/// takes the public API's arguments in the same order as under the
-/// provider's own id.
+/// As the title (2026) asks for it; every slot it calls takes
+/// the public API's arguments in the same order as under the provider's
+/// own id (older titles).
 pub const IID_2026: Guid = Guid::new(
     0x1bff_f3af,
     0xf14a,
@@ -67,17 +67,6 @@ const MAX_UPDATE: usize = 16 << 20;
 const MANIFEST: &str = "manifest";
 /// Readable part of a container's folder name, at most.
 const READABLE: usize = 100;
-
-/// [`trace_ask`] when the save trace is on ([`save_trace`]): its arguments
-/// are evaluated only then, so a run without the trace does none of its work
-/// (nor reads a handle for it).
-macro_rules! trace_ask {
-    ($($arg:expr),+ $(,)?) => {
-        if save_trace() {
-            trace_ask($($arg),+);
-        }
-    };
-}
 
 /// Every save operation, so none sees another's half-made version.
 static SAVES: Mutex<()> = Mutex::new(());
@@ -146,7 +135,9 @@ fn valid_container(name: &str) -> bool {
 /// A committed version of a container.
 struct Version {
     dir: PathBuf,
-    number: u64,
+    /// The highest version number any entry in the container's folder
+    /// carries, readable or not; the next commit goes above it.
+    highest: u64,
     name: String,
     display: String,
     /// Blob names; blob `i` is the file `i`.
@@ -188,38 +179,73 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
-/// The container's newest committed version, if any. Removes what a crash
-/// left: unfinished versions and older ones.
+/// The number of a version folder exactly as [`commit`] names it (`v1`,
+/// `v2`, ...); `None` for anything else, such as `v01`, `v+1` or `v0`.
+fn version_number(file: &str) -> Option<u64> {
+    let n = file.strip_prefix('v')?.parse::<u64>().ok()?;
+    (n > 0 && format!("v{n}") == file).then_some(n)
+}
+
+/// The names in version folder `dir`: container, display, blobs; `None` if
+/// its manifest is missing or does not parse.
+fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
+    let bytes = match std::fs::read(dir.join(MANIFEST)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let Some(mut names) = parse_manifest(&bytes) else {
+        return Ok(None);
+    };
+    let blobs = names.split_off(2);
+    let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
+    Ok(Some((name, display, blobs)))
+}
+
+/// The container's newest readable committed version, if any. Removes what
+/// a crash left: unfinished versions, and versions older than that one.
+/// An unreadable newer folder (a stray, or a broken manifest) is neither
+/// taken nor removed, and never costs the version below it.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
+    let mut highest = 0;
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
             std::fs::remove_dir_all(entry.path())?;
-        } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
-            committed.push(n);
+        } else if let Some(n) = version_number(&file) {
+            highest = highest.max(n);
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                committed.push(n);
+            }
         }
     }
-    committed.sort_unstable();
-    let Some(&number) = committed.last() else {
+    committed.sort_unstable_by(|a, b| b.cmp(a));
+    if committed.is_empty() {
         return Ok(None);
-    };
-    for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
     }
-    let version = dir.join(format!("v{number}"));
-    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
-    let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
-    let blobs = names.split_off(2);
-    let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
-    Ok(Some(Version {
-        dir: version,
-        number,
-        name,
-        display,
-        blobs,
-    }))
+    for (at, &number) in committed.iter().enumerate() {
+        let version = dir.join(format!("v{number}"));
+        let Some((name, display, blobs)) = load(&version)? else {
+            continue;
+        };
+        for old in &committed[at + 1..] {
+            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+        }
+        return Ok(Some(Version {
+            dir: version,
+            highest,
+            name,
+            display,
+            blobs,
+        }));
+    }
+    // Versions exist but none reads: keep them all, and refuse.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "no save version has a readable manifest",
+    ))
 }
 
 /// The version of container `name` in `dir`; none for a missing container
@@ -267,8 +293,9 @@ fn commit(
         match source {
             Source::Data(data) => write(path, data)?,
             // Files are never changed in place, so sharing one is safe.
-            Source::Kept(from) => std::fs::hard_link(from, &path)
-                .or_else(|_| std::fs::copy(from, &path).map(drop))?,
+            Source::Kept(from) => {
+                std::fs::hard_link(from, &path).or_else(|_| write(path, &std::fs::read(from)?))?
+            }
         }
         step();
     }
@@ -341,16 +368,13 @@ fn used_bytes(root: &Path) -> u64 {
         .sum()
 }
 
-#[derive(Default)]
 struct Provider {
     root: PathBuf,
 }
-#[derive(Default)]
 struct Container {
     name: String,
     dir: PathBuf,
 }
-#[derive(Default)]
 struct Update {
     name: String,
     dir: PathBuf,
@@ -367,19 +391,11 @@ fn get<'a, T>(handle: *const T) -> Option<&'a T> {
 fn give<T>(value: T) -> *mut T {
     Box::into_raw(Box::new(value))
 }
-fn take<T: Default>(handle: *mut T) {
-    if handle.is_null() {
-        return;
+fn take<T>(handle: *mut T) {
+    if !handle.is_null() {
+        // SAFETY: as in `get`; closing ends the handle.
+        drop(unsafe { Box::from_raw(handle) });
     }
-    // Tests keep a closed handle's memory, holding an empty value: a read
-    // after the close reads that, and a test sees it, where freed memory
-    // could still hold the old bytes.
-    #[cfg(test)]
-    // SAFETY: as in `get`; the box stays allocated for good.
-    drop(unsafe { handle.replace(T::default()) });
-    #[cfg(not(test))]
-    // SAFETY: as in `get`; closing ends the handle.
-    drop(unsafe { Box::from_raw(handle) });
 }
 
 impl Provider {
@@ -492,7 +508,7 @@ impl Update {
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.number + 1);
+        let number = current.as_ref().map_or(1, |v| v.highest + 1);
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
@@ -540,29 +556,6 @@ fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8
             Ok((name, data))
         })
         .collect()
-}
-
-/// What the trace of a read of `c` says, taken before the read (and only
-/// with the trace on): the container, and the blobs the title asked for.
-struct ReadAsked {
-    root: PathBuf,
-    name: String,
-    blobs: Option<Vec<String>>,
-}
-
-impl ReadAsked {
-    fn new(c: &Container, blobs: &Option<Vec<String>>) -> Option<ReadAsked> {
-        save_trace().then(|| ReadAsked {
-            root: c.dir.parent().unwrap_or(&c.dir).to_path_buf(),
-            name: c.name.clone(),
-            blobs: blobs.clone(),
-        })
-    }
-
-    /// The trace's line, with the result the title gets.
-    fn trace(self, result: HRESULT) {
-        trace_ask("read", &self.root, Some(&self.name), self.blobs.as_deref(), None, result);
-    }
 }
 
 /// One blob as the public API lays it out: name, size, data.
@@ -616,36 +609,28 @@ pub struct BlobInfo {
     pub size: u32,
 }
 
-/// A container's information as the callback gets it: name, display name,
-/// blob count, total size, last modified.
-type Found = (CString, CString, u32, u64, i64);
-
-/// The information of each container under `root` that passes `keep`, owned:
-/// the callbacks run after it, and one may close the provider.
-fn found(root: &Path, keep: impl Fn(&str) -> bool) -> Vec<Found> {
-    let _saves = saves_lock();
-    containers(root)
-        .into_iter()
-        .filter(|(name, _)| keep(name))
-        .filter_map(|(name, dir)| current_named(&dir, &name).ok().flatten())
-        .map(|v| {
-            let modified = std::fs::metadata(v.dir.join(MANIFEST))
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_secs() as i64);
-            let size = v.sizes().iter().map(|(_, s)| s).sum();
-            let count = v.blobs.len() as u32;
-            (cstring(&v.name), cstring(&v.display), count, size, modified)
-        })
-        .collect()
-}
-
-/// Calls `callback` with each of `infos` until it returns false; never under
-/// our lock (it may call us), and with nothing of the provider borrowed (it
-/// may close it).
-fn report(infos: &[Found], context: *mut c_void, callback: ContainerCallback) {
-    for (name, display, blob_count, total_size, last_modified) in infos {
+/// Calls `callback` with the information of each container that passes
+/// `keep` until it returns false; never under our lock (it may call us).
+fn report(root: &Path, keep: impl Fn(&str) -> bool, context: *mut c_void, callback: ContainerCallback) {
+    let infos: Vec<(CString, CString, u32, u64, i64)> = {
+        let _saves = saves_lock();
+        containers(root)
+            .into_iter()
+            .filter(|(name, _)| keep(name))
+            .filter_map(|(name, dir)| current_named(&dir, &name).ok().flatten())
+            .map(|v| {
+                let modified = std::fs::metadata(v.dir.join(MANIFEST))
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs() as i64);
+                let size = v.sizes().iter().map(|(_, s)| s).sum();
+                let count = v.blobs.len() as u32;
+                (cstring(&v.name), cstring(&v.display), count, size, modified)
+            })
+            .collect()
+    };
+    for (name, display, blob_count, total_size, last_modified) in &infos {
         let info = ContainerInfo {
             name: name.as_ptr(),
             display_name: display.as_ptr(),
@@ -664,77 +649,6 @@ fn cstring(s: &str) -> CString {
     CString::new(s.replace('\0', "")).unwrap_or_default()
 }
 
-/// Whether calls into the save service are traced ([`trace_ask`]): in a
-/// diagnostics build with `VICTORY_SAVE_TRACE=1`, and on a test's thread
-/// while it collects the lines. Asked before any of the trace's work.
-fn save_trace() -> bool {
-    #[cfg(test)]
-    if tests::TRACE.with_borrow(Option::is_some) {
-        return true;
-    }
-    #[cfg(feature = "diagnostics")]
-    {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_SAVE_TRACE").is_some_and(|v| v == "1"))
-    }
-    #[cfg(not(feature = "diagnostics"))]
-    false
-}
-
-/// One line per call the title makes into the save service, at `VICTORY_LOG=info`
-/// while [`save_trace`] is on (called through the `trace_ask!` macro, which asks
-/// it): the call, the provider's folder, the container and blob names asked for,
-/// and the result. `blobs` `None` is every blob, an empty list no blob; `prefix`
-/// is the blob-name filter of an enumeration.
-fn trace_ask(
-    call: &str,
-    provider: &Path,
-    container: Option<&str>,
-    blobs: Option<&[String]>,
-    prefix: Option<&str>,
-    result: HRESULT,
-) {
-    #[cfg(feature = "diagnostics")]
-    tracing::info!(
-        "game save call: {}",
-        ask_line(call, provider, container, blobs, prefix, result)
-    );
-    #[cfg(test)]
-    tests::TRACE.with_borrow_mut(|lines| {
-        if let Some(lines) = lines {
-            lines.push(ask_line(call, provider, container, blobs, prefix, result));
-        }
-    });
-    #[cfg(not(any(test, feature = "diagnostics")))]
-    let _ = (call, provider, container, blobs, prefix, result);
-}
-
-/// [`trace_ask`]'s line, kept pure for the test.
-#[cfg(any(test, feature = "diagnostics"))]
-fn ask_line(
-    call: &str,
-    provider: &Path,
-    container: Option<&str>,
-    blobs: Option<&[String]>,
-    prefix: Option<&str>,
-    result: HRESULT,
-) -> String {
-    let mut line = format!("call={call} provider={}", provider.display());
-    if let Some(container) = container {
-        line.push_str(&format!(" container={container}"));
-    }
-    match blobs {
-        None => line.push_str(" blobs=*"),
-        Some([]) => line.push_str(" blobs=-"),
-        Some(blobs) => line.push_str(&format!(" blobs={}", blobs.join(","))),
-    }
-    if let Some(prefix) = prefix {
-        line.push_str(&format!(" prefix={prefix}"));
-    }
-    line.push_str(&format!(" result={result:#010X}"));
-    line
-}
-
 static INIT: u8 = 0;
 static QUOTA_CALL: u8 = 0;
 static DELETE: u8 = 0;
@@ -748,19 +662,12 @@ extern "system" fn initialize_async(
     _sync_on_demand: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let saves = runtime::title().saves();
-    let opened = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+    let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
         Err(NO_ACCESS)
     } else {
-        Provider::open(&saves, text(config).as_deref())
+        Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
     };
-    let (root, hr) = match &opened {
-        Ok(provider) => (provider.root.clone(), S_OK),
-        Err(hr) => (saves.clone(), *hr),
-    };
-    trace_ask!("initialize", &root, None, Some(&[]), None, hr);
-    let result = opened.map(|p| xasync::bytes(give(p)));
     xasync::finished_with(block, (&raw const INIT).cast(), result)
 }
 extern "system" fn initialize_result(
@@ -768,11 +675,9 @@ extern "system" fn initialize_result(
     block: *mut AsyncBlock,
     out: *mut *mut Provider,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     xasync::result(block, (&raw const INIT).cast(), out)
 }
 extern "system" fn close_provider(_: This, provider: *mut Provider) {
-    let _entry = victory_gpu::hle_call();
     take(provider);
 }
 
@@ -781,23 +686,12 @@ extern "system" fn quota_async(
     provider: *const Provider,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
-    let result = match get(provider) {
-        Some(p) => Ok(xasync::bytes(p.remaining() as i64)),
-        None => Err(E_INVALIDARG),
-    };
-    trace_ask!(
-        "quota",
-        get(provider).map_or(Path::new("-"), |p| p.root.as_path()),
-        None,
-        Some(&[]),
-        None,
-        result.as_ref().map_or_else(|hr| *hr, |_| S_OK),
-    );
+    let result = get(provider)
+        .ok_or(E_INVALIDARG)
+        .map(|p| xasync::bytes(p.remaining() as i64));
     xasync::finished_with(block, (&raw const QUOTA_CALL).cast(), result)
 }
 extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
 }
 
@@ -807,21 +701,14 @@ extern "system" fn delete_async(
     name: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
-    let (hr, root, name) = match (get(provider), text(name)) {
-        (Some(p), Some(name)) if valid_container(&name) => {
-            let hr = delete(&p.root, &name);
-            (hr, Some(p.root.as_path()), Some(name))
-        }
-        (Some(p), Some(name)) => (INVALID_CONTAINER_NAME, Some(p.root.as_path()), Some(name)),
-        (Some(p), None) => (E_INVALIDARG, Some(p.root.as_path()), None),
-        (None, _) => (E_INVALIDARG, None, None),
+    let hr = match (get(provider), text(name)) {
+        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
+        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
+        _ => E_INVALIDARG,
     };
-    trace_ask!("delete", root.unwrap_or(Path::new("-")), name.as_deref(), Some(&[]), None, hr);
     xasync::finished(block, (&raw const DELETE).cast(), hr)
 }
 extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const DELETE).cast(), 0, none, none.cast())
 }
@@ -835,30 +722,13 @@ extern "system" fn container_info(
     context: *mut c_void,
     callback: Option<ContainerCallback>,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
-    let Some(p) = get(provider) else {
-        trace_ask!("container_info", Path::new("-"), None, Some(&[]), None, E_INVALIDARG);
-        return E_INVALIDARG;
-    };
-    let Some(name) = text(name) else {
-        trace_ask!("container_info", &p.root, None, Some(&[]), None, E_INVALIDARG);
-        return E_INVALIDARG;
-    };
-    let Some(callback) = callback else {
-        trace_ask!("container_info", &p.root, Some(&name), Some(&[]), None, E_INVALIDARG);
+    let (Some(p), Some(name), Some(callback)) = (get(provider), text(name), callback) else {
         return E_INVALIDARG;
     };
     if !valid_container(&name) {
-        trace_ask!("container_info", &p.root, Some(&name), Some(&[]), None, INVALID_CONTAINER_NAME);
         return INVALID_CONTAINER_NAME;
     }
-    let infos = found(&p.root, |n| n == name);
-    // The callback may close the provider: nothing of it is read after.
-    let traced = save_trace().then(|| p.root.clone());
-    report(&infos, context, callback);
-    if let Some(root) = traced {
-        trace_ask("container_info", &root, Some(&name), Some(&[]), None, S_OK);
-    }
+    report(&p.root, |n| n == name, context, callback);
     S_OK
 }
 
@@ -868,22 +738,10 @@ extern "system" fn enumerate_containers(
     context: *mut c_void,
     callback: Option<ContainerCallback>,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
-    let Some(p) = get(provider) else {
-        trace_ask!("enumerate_containers", Path::new("-"), None, Some(&[]), None, E_INVALIDARG);
+    let (Some(p), Some(callback)) = (get(provider), callback) else {
         return E_INVALIDARG;
     };
-    let Some(callback) = callback else {
-        trace_ask!("enumerate_containers", &p.root, None, Some(&[]), None, E_INVALIDARG);
-        return E_INVALIDARG;
-    };
-    let infos = found(&p.root, |_| true);
-    // The callback may close the provider: nothing of it is read after.
-    let traced = save_trace().then(|| p.root.clone());
-    report(&infos, context, callback);
-    if let Some(root) = traced {
-        trace_ask("enumerate_containers", &root, None, Some(&[]), None, S_OK);
-    }
+    report(&p.root, |_| true, context, callback);
     S_OK
 }
 
@@ -894,25 +752,15 @@ extern "system" fn create_container(
     name: *const c_char,
     out: *mut *mut Container,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
-    let Some(p) = get(provider) else {
-        trace_ask!("create_container", Path::new("-"), None, Some(&[]), None, E_INVALIDARG);
+    let (Some(p), Some(name)) = (get(provider), text(name)) else {
         return E_INVALIDARG;
     };
-    let Some(name) = text(name) else {
-        trace_ask!("create_container", &p.root, None, Some(&[]), None, E_INVALIDARG);
-        return E_INVALIDARG;
-    };
-    let hr = if valid_container(&name) {
-        put(out, give(p.container(&name)))
-    } else {
-        INVALID_CONTAINER_NAME
-    };
-    trace_ask!("create_container", &p.root, Some(&name), Some(&[]), None, hr);
-    hr
+    if !valid_container(&name) {
+        return INVALID_CONTAINER_NAME;
+    }
+    put(out, give(p.container(&name)))
 }
 extern "system" fn close_container(_: This, container: *mut Container) {
-    let _entry = victory_gpu::hle_call();
     take(container);
 }
 
@@ -923,9 +771,7 @@ extern "system" fn enumerate_blobs(
     context: *mut c_void,
     callback: Option<BlobCallback>,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let (Some(c), Some(callback)) = (get(container), callback) else {
-        trace_ask!("enumerate_blobs", Path::new("-"), None, Some(&[]), None, E_INVALIDARG);
         return E_INVALIDARG;
     };
     let prefix = text(prefix).unwrap_or_default();
@@ -934,11 +780,6 @@ extern "system" fn enumerate_blobs(
         let version = current_named(&c.dir, &c.name).ok().flatten();
         version.map(|v| v.sizes()).unwrap_or_default()
     };
-    // The callback may close the container: nothing of it is read after.
-    let traced = save_trace().then(|| {
-        let root = c.dir.parent().unwrap_or(&c.dir);
-        (root.to_path_buf(), c.name.clone())
-    });
     for (name, size) in blobs.into_iter().filter(|(n, _)| n.starts_with(&prefix)) {
         let name = cstring(&name);
         let info = BlobInfo {
@@ -948,9 +789,6 @@ extern "system" fn enumerate_blobs(
         if !callback(&info, context) {
             break;
         }
-    }
-    if let Some((root, name)) = traced {
-        trace_ask("enumerate_blobs", &root, Some(&name), Some(&[]), Some(&prefix), S_OK);
     }
     S_OK
 }
@@ -963,29 +801,22 @@ extern "system" fn read_blobs(
     size: usize,
     out: *mut u8,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
     // SAFETY: the title passes its count.
     let wanted = unsafe { count.as_ref() }.copied().unwrap_or(0);
-    let names = names(blob_names, wanted);
-    let asked = ReadAsked::new(c, &names);
-    let hr = (|| {
-        let blobs = read(c, names)?;
-        let bytes = layout(&blobs, out as usize);
-        if out.is_null() || size < bytes.len() {
-            return Err(BUFFER_TOO_SMALL);
-        }
-        // SAFETY: the buffer holds `size` bytes, checked above.
-        unsafe { out.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
-        Ok(put(count, blobs.len() as u32))
-    })()
-    .unwrap_or_else(|hr| hr);
-    if let Some(asked) = asked {
-        asked.trace(hr);
+    let blobs = match read(c, names(blob_names, wanted)) {
+        Ok(blobs) => blobs,
+        Err(hr) => return hr,
+    };
+    let bytes = layout(&blobs, out as usize);
+    if out.is_null() || size < bytes.len() {
+        return BUFFER_TOO_SMALL;
     }
-    hr
+    // SAFETY: the buffer holds `size` bytes, checked above.
+    unsafe { out.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
+    put(count, blobs.len() as u32)
 }
 
 /// Read at once; the result holds the layout with pointers relative to the
@@ -997,17 +828,8 @@ extern "system" fn read_async(
     count: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let result = match get(container) {
-        Some(c) => {
-            let names = names(blob_names, count);
-            let asked = ReadAsked::new(c, &names);
-            let result = read(c, names).map(|blobs| layout(&blobs, 0));
-            if let Some(asked) = asked {
-                asked.trace(result.as_ref().map_or_else(|hr| *hr, |_| S_OK));
-            }
-            result
-        }
+        Some(c) => read(c, names(blob_names, count)).map(|blobs| layout(&blobs, 0)),
         None => Err(E_INVALIDARG),
     };
     xasync::finished_with(block, (&raw const READ).cast(), result)
@@ -1019,7 +841,6 @@ extern "system" fn read_result(
     out: *mut u8,
     count: *mut u32,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let mut used = 0;
     let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
     // The documented error for a small buffer; the result stays for a
@@ -1055,7 +876,6 @@ extern "system" fn create_update(
     display: *const c_char,
     out: *mut *mut Update,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
@@ -1070,7 +890,6 @@ extern "system" fn create_update(
     )
 }
 extern "system" fn close_update(_: This, update: *mut Update) {
-    let _entry = victory_gpu::hle_call();
     take(update);
 }
 
@@ -1081,90 +900,42 @@ extern "system" fn write_blob(
     data: *const u8,
     size: usize,
 ) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     // SAFETY: a handle we gave out; the title does not use it concurrently.
     let (Some(update), Some(name)) = (unsafe { update.as_mut() }, text(name)) else {
-        trace_ask!("write_blob", Path::new("-"), None, Some(&[]), None, E_INVALIDARG);
         return E_INVALIDARG;
     };
-    let hr = if name.is_empty() || (data.is_null() && size > 0) {
-        E_INVALIDARG
-    } else if size > MAX_UPDATE {
-        UPDATE_TOO_BIG
+    if name.is_empty() || (data.is_null() && size > 0) {
+        return E_INVALIDARG;
+    }
+    if size > MAX_UPDATE {
+        return UPDATE_TOO_BIG;
+    }
+    let data = if size == 0 {
+        Vec::new()
     } else {
-        let data = if size == 0 {
-            Vec::new()
-        } else {
-            // SAFETY: the title passes `size` bytes.
-            unsafe { std::slice::from_raw_parts(data, size) }.to_vec()
-        };
-        update.changes.push((name.clone(), Some(data)));
-        S_OK
+        // SAFETY: the title passes `size` bytes.
+        unsafe { std::slice::from_raw_parts(data, size) }.to_vec()
     };
-    trace_ask!(
-        "write_blob",
-        update.dir.parent().unwrap_or(&update.dir),
-        Some(&update.name),
-        Some(std::slice::from_ref(&name)),
-        None,
-        hr,
-    );
-    hr
+    update.changes.push((name, Some(data)));
+    S_OK
 }
 
 extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     // SAFETY: as in `write_blob`.
     match (unsafe { update.as_mut() }, text(name)) {
         (Some(update), Some(name)) if !name.is_empty() => {
-            update.changes.push((name.clone(), None));
-            trace_ask!(
-                "delete_blob",
-                update.dir.parent().unwrap_or(&update.dir),
-                Some(&update.name),
-                Some(std::slice::from_ref(&name)),
-                None,
-                S_OK,
-            );
+            update.changes.push((name, None));
             S_OK
         }
-        (Some(update), name) => {
-            trace_ask!(
-                "delete_blob",
-                update.dir.parent().unwrap_or(&update.dir),
-                Some(&update.name),
-                name.as_ref().map(std::slice::from_ref),
-                None,
-                E_INVALIDARG,
-            );
-            E_INVALIDARG
-        }
-        (None, _) => {
-            trace_ask!("delete_blob", Path::new("-"), None, Some(&[]), None, E_INVALIDARG);
-            E_INVALIDARG
-        }
+        _ => E_INVALIDARG,
     }
 }
 
 extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
-    let update = get(update);
-    let hr = update.map_or(E_INVALIDARG, Update::submit);
-    match update {
-        Some(update) => trace_ask!(
-            "submit",
-            update.dir.parent().unwrap_or(&update.dir),
-            Some(&update.name),
-            Some(&update.changes.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>()),
-            None,
-            hr,
-        ),
-        None => trace_ask!("submit", Path::new("-"), None, Some(&[]), None, hr),
-    }
+    let hr = get(update).map_or(E_INVALIDARG, Update::submit);
     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
 }
 extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
-    let _entry = victory_gpu::hle_call();
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const SUBMIT).cast(), 0, none, none.cast())
 }
@@ -1221,19 +992,6 @@ mod tests {
 
     static STEPS: AtomicU32 = AtomicU32::new(0);
 
-    thread_local! {
-        /// The save trace's lines on this thread, while [`traced`] runs.
-        pub(super) static TRACE: std::cell::RefCell<Option<Vec<String>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    /// The save trace's lines of what `f` calls on this thread.
-    fn traced(f: impl FnOnce()) -> Vec<String> {
-        TRACE.set(Some(Vec::new()));
-        f();
-        TRACE.take().unwrap_or_default()
-    }
-
     /// In a child process of the crash test, stops for good at the step
     /// `VICTORY_SAVE_STOP` names and says so.
     pub(super) fn crash_point() {
@@ -1258,30 +1016,6 @@ mod tests {
         // Replacing a blob of the same size fits a full quota.
         assert_eq!(no_room(mb, mb, QUOTA, 100 * mb), None);
         assert_eq!(no_room(mb, 0, 0, mb), None);
-    }
-
-    /// Each call's line says what was asked for: the provider, the container, the blobs (every, none, or names)
-    /// and the result.
-    #[test]
-    fn a_save_call_line_names_what_the_title_asked_for() {
-        let provider = Path::new("data/0A1B2C3D/saves/0000000000000001/default");
-        assert_eq!(
-            ask_line("initialize", provider, None, Some(&[]), None, S_OK),
-            "call=initialize provider=data/0A1B2C3D/saves/0000000000000001/default blobs=- result=0x00000000"
-        );
-        let blobs = ["Slot/Piece".to_string(), "meta".to_string()];
-        assert_eq!(
-            ask_line("read", provider, Some("Slot/1"), Some(&blobs), None, BLOB_NOT_FOUND),
-            "call=read provider=data/0A1B2C3D/saves/0000000000000001/default container=Slot/1 blobs=Slot/Piece,meta result=0x80830008"
-        );
-        assert_eq!(
-            ask_line("read", provider, Some("Slot/1"), None, None, S_OK),
-            "call=read provider=data/0A1B2C3D/saves/0000000000000001/default container=Slot/1 blobs=* result=0x00000000"
-        );
-        assert_eq!(
-            ask_line("enumerate_blobs", provider, Some("Slot/1"), Some(&[]), Some("Slot/"), S_OK),
-            "call=enumerate_blobs provider=data/0A1B2C3D/saves/0000000000000001/default container=Slot/1 blobs=- prefix=Slot/ result=0x00000000"
-        );
     }
 
     fn update(root: &Path, display: &str, changes: &[(&str, Option<&str>)]) -> HRESULT {
@@ -1373,6 +1107,37 @@ mod tests {
         }
     }
 
+    /// A kept blob that cannot be hard-linked (NTFS allows 1024 links to a
+    /// file) is copied into the new version with its exact bytes.
+    #[cfg(windows)]
+    #[test]
+    fn a_kept_blob_past_the_link_limit_is_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        const NTFS: &str = "the temp folder must be on NTFS, which allows 1024 links to a file";
+        let old_b = container_dir(root, "Slot").join("v1").join("1");
+        for i in 0..1023 {
+            std::fs::hard_link(&old_b, links.path().join(i.to_string())).expect(NTFS);
+        }
+        let full = std::fs::hard_link(&old_b, links.path().join("full")).expect_err(NTFS);
+        assert_eq!(full.kind(), std::io::ErrorKind::TooManyLinks, "{NTFS}");
+
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+
+        let new = (
+            "two".into(),
+            vec![("a".into(), "new a".into()), ("b".into(), "old b".into())],
+        );
+        assert_eq!(state(root), Some(new));
+        assert!(!old_b.exists());
+        assert_eq!(std::fs::read(links.path().join("0")).unwrap(), b"old b");
+    }
+
     #[test]
     fn names_are_exact() {
         for name in ["Save_1", "slot/2", "a.b c%", "\u{e9}t\u{e9}"] {
@@ -1444,7 +1209,7 @@ mod tests {
             ]
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
-        assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+        assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
     }
 
     /// An empty configuration id names none. As a folder name it would be
@@ -1657,92 +1422,71 @@ mod tests {
         close_provider(this, provider);
     }
 
-    /// A provider holding container `Slot_1` with blob `world`, and the
-    /// trace's name for its folder.
-    fn one_container() -> (tempfile::TempDir, *mut Provider, String) {
-        let saves = tempfile::tempdir().unwrap();
-        let provider = Provider::open(saves.path(), Some("scid")).unwrap();
-        let c = provider.container("Slot_1");
-        let blobs = [("world", Source::Data(b"hello"))];
-        commit(&c.dir, 1, "Slot_1", "Chapter 1", &blobs).unwrap();
-        let root = provider.root.display().to_string();
-        (saves, give(provider), root)
+    /// Only `v<N>` as `commit` writes it is a version: `v01` and the like
+    /// are neither read, counted nor removed (#870).
+    #[test]
+    fn a_noncanonical_folder_does_not_remove_a_committed_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        for stray in ["v01", "v001", "v+1", "v0", "v02"] {
+            std::fs::create_dir(slot.join(stray)).unwrap();
+        }
+        assert_eq!(state(root), old_state());
+        assert!(slot.join("v1").is_dir());
+        for stray in ["v01", "v001", "v+1", "v0", "v02"] {
+            assert!(slot.join(stray).exists(), "{stray} was removed");
+        }
     }
 
-    /// A title callback may close the handle it enumerates and stop: the
-    /// call's trace names what the title asked about, read before the
-    /// callback ran.
+    /// A newer version folder that does not read (an empty folder, a file,
+    /// a broken manifest) neither hides the committed save, nor removes it,
+    /// nor blocks the next update, which goes above it.
     #[test]
-    fn a_callback_may_close_the_handle_it_enumerates() {
-        let this: This = &OBJECT;
-        extern "system" fn close_provider_stop(_: *const ContainerInfo, p: *mut c_void) -> bool {
-            close_provider(&OBJECT, p.cast());
-            false
+    fn an_unreadable_newer_version_does_not_cost_the_save() {
+        type Make = fn(&Path);
+        let strays: [(&str, Make); 3] = [
+            ("empty folder", |p| std::fs::create_dir(p).unwrap()),
+            ("file", |p| std::fs::write(p, b"not a version").unwrap()),
+            ("broken manifest", |p| {
+                std::fs::create_dir(p).unwrap();
+                std::fs::write(p.join(MANIFEST), [9, 0, 0, 0, b'x']).unwrap();
+            }),
+        ];
+        for (what, make) in strays {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+            let slot = container_dir(root, "Slot");
+            make(&slot.join("v2"));
+
+            assert_eq!(state(root), old_state(), "{what}: read");
+            assert!(slot.join("v1").is_dir(), "{what}: v1 was removed");
+
+            assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK, "{what}: update");
+            let blobs = vec![("a".into(), "new a".into()), ("b".into(), "old b".into())];
+            let after = Some(("two".into(), blobs));
+            assert_eq!(state(root), after, "{what}: after the update");
+            assert!(slot.join("v3").is_dir(), "{what}: the update did not go above v2");
+            // Read again: the new version stays the container.
+            assert_eq!(state(root), after, "{what}: second read");
         }
-        extern "system" fn close_container_stop(_: *const BlobInfo, c: *mut c_void) -> bool {
-            close_container(&OBJECT, c.cast());
-            false
-        }
-        let ok = |call: &str, root: &str, rest: &str| {
-            format!("call={call} provider={root} {rest}blobs=- result=0x00000000")
-        };
-
-        let (_saves, provider, root) = one_container();
-        let close = Some(close_provider_stop as ContainerCallback);
-        let lines = traced(|| {
-            assert_eq!(enumerate_containers(this, provider, provider.cast(), close), S_OK);
-        });
-        assert_eq!(lines, [ok("enumerate_containers", &root, "")]);
-
-        let (_saves, provider, root) = one_container();
-        let lines = traced(|| {
-            let hr = container_info(this, provider, c"Slot_1".as_ptr(), provider.cast(), close);
-            assert_eq!(hr, S_OK);
-        });
-        assert_eq!(lines, [ok("container_info", &root, "container=Slot_1 ")]);
-
-        let (_saves, provider, root) = one_container();
-        let mut container = std::ptr::null_mut();
-        assert_eq!(create_container(this, provider, c"Slot_1".as_ptr(), &mut container), S_OK);
-        let close = Some(close_container_stop as BlobCallback);
-        let lines = traced(|| {
-            let hr = enumerate_blobs(this, container, c"w".as_ptr(), container.cast(), close);
-            assert_eq!(hr, S_OK);
-        });
-        let line = format!(
-            "call=enumerate_blobs provider={root} container=Slot_1 blobs=- prefix=w result=0x00000000"
-        );
-        assert_eq!(lines, [line]);
-        close_provider(this, provider);
     }
 
-    /// A read the title's buffer cannot hold is traced with the error the
-    /// title gets, not as the successful read inside it.
+    /// With no readable version at all, reads and updates fail and nothing
+    /// is removed.
     #[test]
-    fn a_read_is_traced_with_the_result_the_title_gets() {
-        let this: This = &OBJECT;
-        let (_saves, provider, root) = one_container();
-        let mut container = std::ptr::null_mut();
-        assert_eq!(create_container(this, provider, c"Slot_1".as_ptr(), &mut container), S_OK);
-        let wanted = [c"world".as_ptr()];
-        let line = |hr: HRESULT| {
-            format!("call=read provider={root} container=Slot_1 blobs=world result={hr:#010X}")
-        };
-        let mut small = [0u8; 8];
-        let lines = traced(|| {
-            let hr = read_blobs(this, container, wanted.as_ptr(), &mut 1, 8, small.as_mut_ptr());
-            assert_eq!(hr, BUFFER_TOO_SMALL);
-        });
-        assert_eq!(lines, [line(BUFFER_TOO_SMALL)]);
-
-        let mut big = [0u64; 8];
-        let lines = traced(|| {
-            let out = big.as_mut_ptr().cast();
-            let hr = read_blobs(this, container, wanted.as_ptr(), &mut 1, 64, out);
-            assert_eq!(hr, S_OK);
-        });
-        assert_eq!(lines, [line(S_OK)]);
-        close_container(this, container);
-        close_provider(this, provider);
+    fn no_readable_version_is_refused_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        std::fs::write(slot.join("v1").join(MANIFEST), [1, 2, 3]).unwrap();
+        let c = Provider { root: root.into() }.container("Slot");
+        assert_eq!(read(&c, None).err(), Some(NO_ACCESS));
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
+        assert!(slot.join("v1").join("0").is_file());
+        assert!(!slot.join("v2").exists());
     }
 }

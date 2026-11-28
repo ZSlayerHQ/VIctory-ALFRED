@@ -10,6 +10,7 @@ static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 /// `GetModuleHandle(NULL)` and friends to return this, not our own exe.
 pub fn set_main_image(base: usize) {
     MAIN_IMAGE_BASE.store(base, Ordering::Release);
+    crate::image_watch::start(base);
 }
 
 pub fn main_image() -> Option<usize> {
@@ -53,6 +54,18 @@ pub fn image_named(file: &str) -> Option<usize> {
         .iter()
         .find(|(_, p)| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(file)))
         .map(|(b, _)| *b)
+}
+
+static TITLE_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The arguments the title's `main` gets (those after `--`). Set once, before
+/// the title starts; later calls are ignored.
+pub fn set_title_args(args: Vec<String>) {
+    let _ = TITLE_ARGS.set(args);
+}
+
+pub fn title_args() -> &'static [String] {
+    TITLE_ARGS.get().map_or(&[], Vec::as_slice)
 }
 
 /// Maps a title DLL the title loads itself (`LoadLibrary`) and returns its
@@ -112,6 +125,32 @@ impl Title {
     }
 }
 
+/// The trimmed text of one element: comments inside it are skipped, not
+/// treated as the end of its value. A manifest generator can write
+/// `<TitleId><!-- generated -->1A2B3C4D</TitleId>` (an invented id), which must still give
+/// the title's id rather than an empty field.
+fn field_text(rest: &str) -> String {
+    let mut out = String::new();
+    let mut rest = rest;
+    loop {
+        let Some(open) = rest.find('<') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..open]);
+        if rest[open..].starts_with("<!--") {
+            let Some(end) = rest[open..].find("-->") else {
+                break;
+            };
+            rest = &rest[open + end + 3..];
+        } else {
+            // A child element, a closing tag or anything else ends the text.
+            break;
+        }
+    }
+    out.trim().to_owned()
+}
+
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
 /// and its trimmed text up to the first child, the predefined entities
 /// decoded; comments, CDATA sections, declarations and attributes are
@@ -127,7 +166,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
         } else if rest.starts_with("<![CDATA[") {
             rest.find("]]>").map(|e| e + 3)
         } else {
-            rest.find('>').map(|e| e + 1)
+            tag_end(rest)
         };
         let Some(end) = end else { break };
         let tag = &rest[1..end - 1];
@@ -148,16 +187,31 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
+        let body = field_text(rest);
         let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
             .iter()
-            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
+            .fold(body, |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();
         }
     }
     out
+}
+
+/// Where the tag that starts `text` ends, past its `>`; a `>` in a quoted
+/// attribute value is part of the value (XML allows it there unescaped).
+fn tag_end(text: &str) -> Option<usize> {
+    let mut quote = None;
+    for (at, c) in text.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(open), _) if c == open => quote = None,
+            (None, '>') => return Some(at + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 static TITLE: Mutex<Option<Title>> = Mutex::new(None);
@@ -175,65 +229,9 @@ pub fn title() -> Title {
         .unwrap_or_default()
 }
 
-/// Gives the loader's emulation of the console's instructions what only the
-/// runtime can decide: the write tracking's opener, so that a `clzero` into
-/// a page the tracking holds read-only is noted as a title write would be,
-/// and whether `rdpru` may run and what it reads on a processor without it
-/// ([`rdpru_register`]).
-/// Once, after `victory_loader::report_crashes` and before title code.
-#[cfg(windows)]
-pub fn hook_console_instructions() {
-    victory_loader::set_console_insn_hooks(victory_loader::ConsoleInsnHooks {
-        open_tracked: victory_gpu::kernel_will_write,
-        rdpru_enabled: victory_loader::time_stamp_counter_readable,
-        rdpru_register,
-    });
-}
-
-/// What `rdpru` reads here when the processor lacks it (every Intel one, and
-/// AMD's before Zen 2), where the loader emulates it. User code on a PC can
-/// read neither register, so both are the time-stamp counter, read at the
-/// call:
-///
-/// - MPERF counts at the P0 frequency while the core runs (PPR 55803 p. 97);
-///   on the console's Zen 2 the TSC counts at that same rate in every P- and
-///   C-state (pp. 43, 96). So the TSC keeps MPERF's rate, as the title's own
-///   RDTSC sees it, though it also counts while a core sleeps.
-/// - APERF counts the clocks the core actually ran (p. 97), which nothing
-///   here can see: the TSC again, as if the core always ran at P0.
-///
-/// A title that divides one by the other, as AMD's effective frequency does
-/// (APERF's count over MPERF's, times the P0 frequency: p. 39), divides two
-/// spans of one constant-rate counter that cover nearly the same time: close
-/// to one, and so P0. The divisor is never zero, since two readings are two
-/// exceptions apart (microseconds) and the TSC rises in between, and on one
-/// core the TSC never goes back, so neither span is negative. What is lost
-/// is the change in frequency the real pair would show. Where this PC denies
-/// user code the TSC as well (CR4.TSD, which the loader's start-up probe
-/// finds), the `rdpru_enabled` hook (that probe's answer) says no and the
-/// loader refuses the instruction for every ECX, as the console's CPU would
-/// under CR4.TSD (#UD, APM3 p. 308); this hook then gives nothing either.
-#[cfg(windows)]
-fn rdpru_register(register: victory_loader::RdpruRegister) -> Option<u64> {
-    rdpru_stand_in(register, victory_loader::time_stamp_counter_readable(), || {
-        // SAFETY: RDTSC runs in user code here: the loader's probe said so.
-        unsafe { std::arch::x86_64::_rdtsc() }
-    })
-}
-
-/// [`rdpru_register`]'s choice, given whether user code may read the TSC
-/// and the reading.
-#[cfg(windows)]
-fn rdpru_stand_in(register: victory_loader::RdpruRegister, readable: bool, tsc: impl FnOnce() -> u64) -> Option<u64> {
-    use victory_loader::RdpruRegister::{Aperf, Mperf};
-    match register {
-        Mperf | Aperf => readable.then(tsc),
-    }
-}
-
 /// Gives the process the console's millisecond timers. Titles pace
-/// themselves with short waits (an audio mixer sleeping a few
-/// milliseconds per block, say) and cannot tune the timer on the console;
+/// themselves with short waits (the title's audio mixer sleeps
+/// about 4 ms per 5.3 ms block) and cannot tune the timer on the console;
 /// a desktop process waits in 15.6 ms ticks unless it asks for finer ones,
 /// and Windows 11 drops that request while the window is hidden unless the
 /// process opts out. Process-wide, for the whole run.
@@ -241,13 +239,23 @@ fn rdpru_stand_in(register: victory_loader::RdpruRegister, readable: bool, tsc: 
 pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
         ProcessPowerThrottling, SetProcessInformation,
     };
+    // Also: the system does not run this process at reduced speed (its
+    // "efficiency mode": lower clock, the slow cores of a hybrid processor)
+    // when its window is not the one in front, as while its owner works in
+    // another window or streams. The console has eight cores alike and no
+    // such mode. `VICTORY_EFFICIENCY_MODE=1` leaves the system its choice.
+    let execution = if std::env::var_os("VICTORY_EFFICIENCY_MODE").is_some_and(|v| v == "1") {
+        0
+    } else {
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    };
     let keep = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | execution,
         StateMask: 0,
     };
     // SAFETY: plain process settings; `keep` outlives the call.
@@ -260,46 +268,66 @@ pub fn use_console_timers() {
         );
         timeBeginPeriod(1);
     }
+    ahead_of_other_programs();
+}
+
+/// The title's streaming thread runs below normal priority (on the console
+/// nobody else wants its core) and does all of the title's loading: a
+/// program that keeps the processors busy at normal priority (a build, a
+/// virus scan) starved it, loading took 40 to 60 s instead of 28 to 33, and
+/// the opening ran without the models that were to be there (runs cpu-1,
+/// play-1125-0203). The process runs above normal, as long as it runs.
+/// `VICTORY_PROCESS_PRIORITY=normal`: as it was started.
+#[cfg(windows)]
+fn ahead_of_other_programs() {
+    use windows_sys::Win32::System::Threading::{ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass};
+    if std::env::var_os("VICTORY_PROCESS_PRIORITY").is_some_and(|v| v == "normal" || v == "0") {
+        return;
+    }
+    // SAFETY: a plain process setting.
+    let set = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
+    tracing::info!(set, "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=normal: not)");
 }
 
 #[cfg(test)]
 mod tests {
+    //! The manifests here are made up: `1A2B3C4D` is an invented title id, not
+    //! any real title's.
     use super::*;
+
+    #[test]
+    fn a_quoted_angle_bracket_does_not_end_its_tag() {
+        let text = "<Game><ShellVisuals DefaultDisplayName=\"A > B\" Description='x>y'/>\
+                    <TitleId>1A2B3C4D</TitleId>\
+                    <PersistentLocalStorage><SizeMB>64</SizeMB></PersistentLocalStorage></Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!((t.id, t.storage_bytes), (0x1A2B_3C4D, 64 << 20));
+    }
 
     #[test]
     fn reads_title_id_store_id_and_storage_quota() {
         let text = "\u{feff}<?xml version=\"1.0\"?>\n<Game configVersion=\"1\">\
                     <!-- <TitleId>00000000</TitleId> -->\
-                    <Identity Name=\"x\"/>\n  <TitleId>0A1B2C3D</TitleId>\n\
+                    <Identity Name=\"x\"/>\n  <TitleId>1A2B3C4D</TitleId>\n\
                     <![CDATA[ <TitleId>1</TitleId> ]]>                    <StoreId>9&amp;C</StoreId><Other><SizeMB>7</SizeMB></Other>\
                     <PersistentLocalStorage>\n  <SizeMB>1024</SizeMB> <!-- c -->\n\
                     </PersistentLocalStorage></Game>";
         let t = Title::from_manifest(text);
-        assert_eq!((t.id, t.storage_bytes), (0x0A1B_2C3D, 1024 << 20));
+        assert_eq!((t.id, t.storage_bytes), (0x1A2B_3C4D, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn rdpru_reads_the_time_stamp_counter_for_both_registers_or_nothing() {
-        use victory_loader::RdpruRegister::{Aperf, Mperf};
-        // SAFETY: Windows lets user code run RDTSC on the machines these
-        // tests run on (the loader's probe tests show it).
-        let tsc = || unsafe { std::arch::x86_64::_rdtsc() };
-        // Two readings of each, as a title takes them for the effective
-        // frequency: both spans grow, and their ratio is near one.
-        let read = |register| rdpru_stand_in(register, true, tsc).expect("readable");
-        let (m1, a1) = (read(Mperf), read(Aperf));
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let (m2, a2) = (read(Mperf), read(Aperf));
-        assert!(m2 > m1 && a2 > a1 && a1 >= m1 && m2 > a1);
-        let ratio = (a2 - a1) as f64 / (m2 - m1) as f64;
-        assert!((0.9..1.1).contains(&ratio), "{ratio}");
-        // Where the probe found the TSC denied to user code (CR4.TSD), no
-        // reading at all: the loader then refuses the instruction.
-        for register in [Mperf, Aperf] {
-            assert_eq!(rdpru_stand_in(register, false, || unreachable!("not read")), None);
-        }
+    fn inline_comments_do_not_truncate_a_field() {
+        let text = "<Game>\
+            <TitleId><!-- generated -->1A2B3C4D</TitleId>\
+            <StoreId>9&amp;<!-- keep -->C</StoreId>\
+            <PersistentLocalStorage><SizeMB><!-- n -->1024</SizeMB></PersistentLocalStorage>\
+            </Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!(t.id, 0x1A2B_3C4D);
+        assert_eq!(t.store_id, "9&C");
+        assert_eq!(t.storage_bytes, 1024 << 20);
     }
 }

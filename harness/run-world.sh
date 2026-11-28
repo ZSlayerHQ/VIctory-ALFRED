@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # One VIctory world run, with the diagnostics that matter, condensed at exit.
 # usage: run-world.sh [--timing] [--volume N|off] [--no-record] [--no-presentmon] [--aftermath] [--warm] [--live] [--frames 2400,2600] [--keys '55:Enter,...']
-#                     [--route <name>] [--dump-targets] [--print-env] [--settled-seconds N] [--settled-after-s N]
-#                     [--settled-timeout N]
+#                     [--route <name>] [--protocol team-270] [--dump-targets] [--print-env] [--settled-seconds N] [--settled-after-s N]
+#                     [--settled-timeout N] [--world-timeout N]
 #                     [--settled-fps F] [--settled-waiting K]
 #                     [--console series-x|series-s] [--profile diag|release]
 #                     [--copy-mode plain|none] [--heavy-seconds N] [--tag name] [--require-quiet] [--quiet-wait N]
@@ -12,7 +12,7 @@
 # one. There is no machine default: GAME_EXE is required, and the capture root falls back to a relative
 # `victory-captures` folder in the working directory.
 # VICTORY_WARM_GENTLE=1 or 0 forces the --warm warm-up gentle or raised; unset, it is gentle while OBS is running (obs.sh).
-# VICTORY_RUN_LOCK names the run lock (default harness/run.lock), which a --save restore must find clear.
+# VICTORY_RUN_LOCK names the run lock (default harness/run.lock); a --save restore checks it carries this run's token.
 # The frozen-run watchdog. A timed run (--heavy-seconds or --settled-seconds: a hold that ends on the harness's own
 # timer) defaults to WATCHDOG=1, and a counter standing still there ends the run. An open, untimed session defaults
 # to WATCHDOG=warn: its counter can stand still while the window is minimised or covered, during a long load after a
@@ -29,10 +29,10 @@
 # this file during a run cannot change the rest of that run (world-run.sh runs a copy of it, too).
 usage() {
   printf '%s\n' "usage: run-world.sh [--timing] [--volume N|off] [--no-record] [--no-presentmon] [--aftermath] [--warm] [--live] [--require-quiet] [--quiet-wait N]" \
-    "                     [--frames 2400,2600] [--keys '55:Enter,...'] [--route <name>] [--dump-targets]" \
-    "                     [--print-env] [--settled-seconds N] [--settled-after-s N] [--settled-timeout N]" \
+    "                     [--frames 2400,2600] [--keys '55:Enter,...'] [--route <name>] [--protocol team-270] [--dump-targets]" \
+    "                     [--print-env] [--settled-seconds N] [--settled-after-s N] [--settled-timeout N] [--world-timeout N]" \
     "                     [--settled-fps F] [--settled-waiting K] [--console series-x|series-s]" \
-    "                     [--profile diag|release] [--copy-mode plain|none] [--heavy-seconds N] [--tag name]" \
+    "                     [--profile diag|release] [--settings noone|none|<name>] [--menu-file <file>] [--boot-video <file>] [--boot-volume N] [--copy-mode plain|none] [--heavy-seconds N] [--tag name]" \
     "                     [--require-quiet] [--quiet-wait N]" \
     | public_line
 }
@@ -57,10 +57,24 @@ heartbeat_loop() {
 quiet_sample() {
   local out rc
   QUIET_LINE=
-  out=$(node "$TOOLS/load-line.mjs" wait --quiet-wait "$QUIET_WAIT" 2>>"$LOG")
+  # The waiting lines are said as they come, through the public filter, and go into the log: a wait can last many
+  # minutes, and a silent one looks like a hang (2026-11-28: a run waited 20 minutes for another session's test
+  # suite without a word, because the lines came out only when the wait returned).
+  exec 3>&1
+  out=$(
+    node "$TOOLS/load-line.mjs" wait --quiet-wait "$QUIET_WAIT" 2>>"$LOG" | while IFS= read -r line; do
+      printf '%s\n' "$line"
+      case "$line" in
+        'harness: waiting for quiet:'*)
+          printf '%s\n' "$line" | public_line >&3
+          printf '%s\n' "$line" >>"$LOG"
+          ;;
+      esac
+    done
+    exit "${PIPESTATUS[0]}"
+  )
   rc=$?
-  printf '%s\n' "$out" | grep '^harness: waiting for quiet:' | public_line
-  printf '%s\n' "$out" | grep '^harness: waiting for quiet:' >>"$LOG"
+  exec 3>&-
   if [ "$rc" = 3 ]; then
     QUIET_REASON=$(printf '%s\n' "$out" | tail -1)
     say_err "refused: ${QUIET_REASON:-the start load is not quiet}"
@@ -98,7 +112,9 @@ LIVE_HISTORY=""
 FRAMES=""
 KEYS=""
 ROUTE=""
+PROTOCOL=""
 CONSOLE=series-x
+CONSOLE_GIVEN=""
 COPY_MODE=""
 LOOP_LIMIT=""
 SKIP=""
@@ -108,17 +124,26 @@ HEAVY_SECONDS=""
 SETTLED_SECONDS=""
 SETTLED_AFTER=""
 SETTLED_TIMEOUT=""
+WORLD_TIMEOUT=""
 SETTLED_FPS=""
 SETTLED_WAITING=""
 TAG="run"
 RECORD=1
 DRED=1
-VOLUME=4
+VOLUME=0
 REQUIRE_QUIET=0
 # With --require-quiet, how long to keep sampling for a quiet machine before refusing; 0 refuses at once.
 QUIET_WAIT=600
 SAVE=""
 SAVE_AS=""
+# --settings: the named set of runtime switches the run starts with (harness/settings/<name>.env); none applies nothing.
+SETTINGS=${HARNESS_SETTINGS:-noone}
+# --menu-file: the file the F1 settings menu saves to and the run starts from (below); none unless asked.
+MENU_FILE=${HARNESS_MENU_FILE:-}
+# --boot-video: a video shown over the screen from the start until the world is on it (the loading cover, below);
+# none unless asked. --boot-volume: the game's volume while it shows; --volume applies again when it ends.
+BOOT_VIDEO=${HARNESS_BOOT_VIDEO:-}
+BOOT_VOLUME=""
 GPU_TRACE=0
 TRACE_AFTER_MS=""
 TRACE_FRAMES=1
@@ -146,8 +171,13 @@ while [ $# -gt 0 ]; do
     --frames) FRAMES=$2; shift 2 ;;
     --keys) KEYS=$2; shift 2 ;;
     --route) ROUTE=$2; shift 2 ;;
-    --console) CONSOLE=$2; shift 2 ;;
+    --protocol) PROTOCOL=$2; shift 2 ;;
+    --console) CONSOLE=$2; CONSOLE_GIVEN=1; shift 2 ;;
     --profile) PROFILE=$2; shift 2 ;;
+    --settings) SETTINGS=$2; shift 2 ;;
+    --menu-file) MENU_FILE=$2; shift 2 ;;
+    --boot-video) BOOT_VIDEO=$2; shift 2 ;;
+    --boot-volume) BOOT_VOLUME=$2; shift 2 ;;
     --copy-mode) COPY_MODE=$2; shift 2 ;;
     --loop-limit) LOOP_LIMIT=$2; shift 2 ;;
     --skip) SKIP=$2; shift 2 ;;
@@ -157,6 +187,7 @@ while [ $# -gt 0 ]; do
     --settled-seconds) SETTLED_SECONDS=$2; shift 2 ;;
     --settled-after-s) SETTLED_AFTER=$2; shift 2 ;;
     --settled-timeout) SETTLED_TIMEOUT=$2; shift 2 ;;
+    --world-timeout) WORLD_TIMEOUT=$2; shift 2 ;;
     --settled-fps) SETTLED_FPS=$2; shift 2 ;;
     --settled-waiting) SETTLED_WAITING=$2; shift 2 ;;
     --tag) TAG=$2; shift 2 ;;
@@ -180,6 +211,23 @@ done
 if [ "$HELP" = 1 ]; then
   usage
   exit 0
+fi
+
+# --protocol: a named protocol from the team's rules, as a preset over the flags it sets — team-270 is their 270 s
+# test: the route team-270, and a settled window of 275 s, unless given — 5 s past the protocol's last window, so
+# PresentMon's last row (a second or two short of the game's end) still covers it. The summary reports their two
+# windows from the `harness env: protocol=` line below.
+if [ -n "$PROTOCOL" ]; then
+  case "$PROTOCOL" in
+    team-270)
+      [ -z "$ROUTE" ] && ROUTE=team-270
+      [ -z "$SETTLED_SECONDS" ] && SETTLED_SECONDS=275
+      ;;
+    *)
+      say_err "--protocol: unknown protocol '$PROTOCOL' (team-270)"
+      exit 2
+      ;;
+  esac
 fi
 
 # --route: a named key route from harness/routes/<name>.keys, and its default --heavy-seconds or --settled-seconds
@@ -296,7 +344,7 @@ if [ -n "$HEAVY_SECONDS" ] && ! [[ "$HEAVY_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; 
   say_err "--heavy-seconds needs a number, not '$HEAVY_SECONDS'"
   exit 2
 fi
-for PAIR in "settled-seconds:$SETTLED_SECONDS" "settled-after-s:$SETTLED_AFTER" "settled-timeout:$SETTLED_TIMEOUT" "settled-fps:$SETTLED_FPS" "settled-waiting:$SETTLED_WAITING"; do
+for PAIR in "settled-seconds:$SETTLED_SECONDS" "settled-after-s:$SETTLED_AFTER" "settled-timeout:$SETTLED_TIMEOUT" "world-timeout:$WORLD_TIMEOUT" "settled-fps:$SETTLED_FPS" "settled-waiting:$SETTLED_WAITING"; do
   NAME=${PAIR%%:*}
   VALUE=${PAIR#*:}
   if [ -n "$VALUE" ] && ! [[ "$VALUE" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
@@ -325,6 +373,31 @@ if ! node -e 'const n = Number(process.argv[1]); process.exit(Number.isFinite(n)
   say_err "WATCHDOG_STALL_S needs a positive number of seconds, not '$WATCHDOG_STALL_S'"
   exit 2
 fi
+
+if [ -n "$BOOT_VIDEO" ]; then
+  if [ ! -f "$BOOT_VIDEO" ]; then
+    say_err "--boot-video: no such file"
+    exit 2
+  fi
+  # --print-env starts no player, so a machine without one can still be asked what a run would get.
+  if [ -z "$PRINT_ENV" ] && ! command -v ffplay >/dev/null 2>&1; then
+    say_err "--boot-video: ffplay is not on the path (it comes with ffmpeg)"
+    exit 2
+  fi
+fi
+case "$BOOT_VOLUME" in
+  '') ;;
+  *[!0-9]*)
+    say_err "--boot-volume needs a whole number from 0 to 100, not '$BOOT_VOLUME'"
+    exit 2
+    ;;
+  *)
+    if [ -z "$BOOT_VIDEO" ]; then
+      say_err "--boot-volume goes with --boot-video: it is the game's volume while the video shows"
+      exit 2
+    fi
+    ;;
+esac
 
 ENV_ARGS=(VICTORY_LOG=info "VICTORY_WAVE64_EMULATE=emulate" "VICTORY_CONFIG=$SAVE_CONFIG")
 # DRED (the card's crash breadcrumbs) is on unless --no-dred, a timing diagnostic: a hang in such a run leaves no
@@ -357,6 +430,141 @@ if [ "$AFTERMATH" = 1 ]; then
     "VICTORY_AFTERMATH_DLL=${VICTORY_AFTERMATH_DLL:-$ROOT/tools/nsight-aftermath-sdk-2026.3/lib/x64}")
 fi
 
+# --menu-file: the file the F1 settings menu saves to. The build's own launcher (`play`) hands the menu that file
+# and turns it into switches at the next start; the harness starts `run`, which does neither, so without this the
+# menu cannot save and a saved choice is never applied. Each VICTORY_NAME=value line goes over the settings set (an
+# empty value leaves that switch out), and the launcher choices `run` understands become their switches as `play`
+# makes them: the picture size, the console and the frame rate limit. DLSS and frame generation are not applied:
+# their files are not installed here. The command line and the flags above win over the file.
+MENU_COUNT=0
+MENU_SKIPPED=0
+MENU_UNSET=" "
+MENU_FG_TYPE=auto
+MENU_NAME=""
+if [ -n "$MENU_FILE" ]; then
+  case "$MENU_FILE" in /*|[A-Za-z]:[\\/]*) ;; *) MENU_FILE=$PWD/$MENU_FILE ;; esac
+  MENU_NAME=${MENU_FILE##*[\\/]}
+  MENU_BY_FLAGS=" "
+  for E in "${ENV_ARGS[@]}"; do MENU_BY_FLAGS+="${E%%=*} "; done
+  menu_put() { # NAME VALUE: one switch from the menu, unless the command line or a flag already set it
+    [ -n "${!1+x}" ] && return 0
+    case "$MENU_BY_FLAGS" in *" $1 "*) return 0 ;; esac
+    if [ -n "$2" ]; then ENV_ARGS+=("$1=$2"); else MENU_UNSET+="$1 "; fi
+    MENU_COUNT=$((MENU_COUNT + 1))
+  }
+  MENU_RES=""
+  MENU_FPS=""
+  MENU_CONSOLE=""
+  if [ -f "$MENU_FILE" ]; then
+    while IFS= read -r PAIR || [ -n "$PAIR" ]; do
+      PAIR=${PAIR%$'\r'}
+      case "$PAIR" in ''|'#'*) continue ;; esac
+      NAME=${PAIR%%=*}
+      VALUE=${PAIR#*=}
+      case "$NAME" in
+        "$PAIR"|VICTORY_*[!A-Z0-9_]*) MENU_SKIPPED=$((MENU_SKIPPED + 1)) ;;
+        VICTORY_MENU_RES) MENU_RES=$VALUE ;;
+        VICTORY_MENU_FPS) MENU_FPS=$VALUE ;;
+        VICTORY_MENU_CONSOLE) MENU_CONSOLE=$VALUE ;;
+        VICTORY_MENU_FG_TYPE) MENU_FG_TYPE=$VALUE ;;
+        VICTORY_MENU_*) ;;
+        VICTORY_*) menu_put "$NAME" "$VALUE" ;;
+        *) MENU_SKIPPED=$((MENU_SKIPPED + 1)) ;;
+      esac
+    done < "$MENU_FILE"
+  fi
+  case "$MENU_CONSOLE" in
+    series-x|series-s) [ -z "$CONSOLE_GIVEN" ] && CONSOLE=$MENU_CONSOLE ;;
+  esac
+  if [ "$CONSOLE" != series-s ]; then
+    case "$MENU_RES" in
+      1440) menu_put VICTORY_NATIVE_1440P 1 ;;
+      1080to1440) menu_put VICTORY_RENDER_1080P 1 ;;
+    esac
+  fi
+  case "$MENU_FPS" in
+    ''|*[!0-9]*) ;;
+    *)
+      MENU_FPS=$((10#$MENU_FPS))
+      if [ "$MENU_FPS" -ge 1 ] && [ "$MENU_FPS" -le 1000 ]; then
+        menu_put VICTORY_FRAME_INTERVAL_US "$(((1000000 + MENU_FPS / 2) / MENU_FPS))"
+      fi
+      ;;
+  esac
+  case "$MENU_FG_TYPE" in auto|dlss|fsr) ;; *) MENU_FG_TYPE=auto ;; esac
+fi
+
+# --settings: a named set of runtime switches, one NAME=value a line in harness/settings/<name>.env, added to every
+# run. The default is the base build's own launcher profile: the harness starts `run`, which applies none, and a night
+# of runs was measured at bare defaults before anyone saw it (2026-11-27). A switch already given on the command
+# line or by a flag above wins over the file; `--settings none` applies nothing. Every switch is in the log header
+# with the rest of the environment, under one `harness env: settings=` line naming the set.
+SETTINGS_COUNT=0
+SETTINGS_PAIRS=()
+case "$SETTINGS" in
+  none) ;;
+  *[!a-z0-9-]*|'')
+    say_err "--settings: a name of small letters, digits and dashes, or none (not '$SETTINGS')"
+    exit 2
+    ;;
+  *)
+    SETTINGS_FILE=$TOOLS/settings/$SETTINGS.env
+    if [ ! -f "$SETTINGS_FILE" ]; then
+      say_err "--settings: no harness/settings/$SETTINGS.env (none applies nothing)"
+      exit 2
+    fi
+    SET_BY_FLAGS=" "
+    for E in "${ENV_ARGS[@]}"; do SET_BY_FLAGS+="${E%%=*} "; done
+    while IFS= read -r PAIR || [ -n "$PAIR" ]; do
+      PAIR=${PAIR%$'\r'}
+      case "$PAIR" in ''|'#'*) continue ;; esac
+      NAME=${PAIR%%=*}
+      case "$NAME" in
+        VICTORY_*[!A-Z0-9_]*|"$PAIR")
+          say_err "--settings: $SETTINGS.env has a line that is not VICTORY_NAME=value"
+          exit 2
+          ;;
+        VICTORY_*) ;;
+        *)
+          say_err "--settings: $SETTINGS.env has a line that is not VICTORY_NAME=value"
+          exit 2
+          ;;
+      esac
+      [ -n "${!NAME+x}" ] && continue
+      case "$SET_BY_FLAGS" in *" $NAME "*) continue ;; esac
+      case "$MENU_UNSET" in *" $NAME "*) continue ;; esac
+      ENV_ARGS+=("$PAIR")
+      SETTINGS_PAIRS+=("$PAIR")
+      SETTINGS_COUNT=$((SETTINGS_COUNT + 1))
+    done < "$SETTINGS_FILE"
+    ;;
+esac
+
+# With a menu file the menu is told what this run really has, so it shows the true choices and can save: the file,
+# the console, the picture size and the frame rate limit as the run's switches give them, DLSS and frame generation
+# off. No VICTORY_MENU_PLAY is given, so its "Save and restart" saves and asks for the restart by hand.
+if [ -n "$MENU_FILE" ]; then
+  menu_final() { # NAME: its value in the run's environment (the command line, else what the harness passes)
+    if [ -n "${!1+x}" ]; then printf '%s' "${!1}"; return 0; fi
+    local ENTRY FOUND=""
+    for ENTRY in "${ENV_ARGS[@]}"; do [ "${ENTRY%%=*}" = "$1" ] && FOUND=${ENTRY#*=}; done
+    printf '%s' "$FOUND"
+  }
+  MENU_SHOWN_RES=4k
+  [ "$(menu_final VICTORY_NATIVE_1440P)" = 1 ] && MENU_SHOWN_RES=1440
+  [ "$(menu_final VICTORY_RENDER_1080P)" = 1 ] && MENU_SHOWN_RES=1080to1440
+  ENV_ARGS+=("VICTORY_MENU_FILE=$MENU_FILE" "VICTORY_MENU_CONSOLE=$CONSOLE" "VICTORY_MENU_RES=$MENU_SHOWN_RES"
+    "VICTORY_MENU_DLSS=off" "VICTORY_MENU_FRAMEGEN=0" "VICTORY_MENU_FG_TYPE=$MENU_FG_TYPE")
+  MENU_INTERVAL=$(menu_final VICTORY_FRAME_INTERVAL_US)
+  case "$MENU_INTERVAL" in
+    ''|*[!0-9]*) ;;
+    *)
+      MENU_INTERVAL=$((10#$MENU_INTERVAL))
+      [ "$MENU_INTERVAL" -gt 0 ] && ENV_ARGS+=("VICTORY_MENU_FPS=$(((1000000 + MENU_INTERVAL / 2) / MENU_INTERVAL))")
+      ;;
+  esac
+fi
+
 say "log:     $LOG"
 say "capture: $CAPTURE"
 [ "$LIVE" = 1 ] && say "live:      $(basename "$LIVE_FILE")"
@@ -372,6 +580,11 @@ elif [ "$PRESENTMON" != 0 ]; then
   PRESENTMON=1
 fi
 say "profile: $PROFILE  console: $CONSOLE  timing: $TIMING  presentmon: $PRESENTMON"
+say "settings: $SETTINGS ($SETTINGS_COUNT switches)"
+if [ -n "$MENU_FILE" ]; then
+  say "menu file: $MENU_NAME ($MENU_COUNT values applied; DLSS and frame generation are not)"
+  [ "$MENU_SKIPPED" -gt 0 ] && say "menu file: $MENU_SKIPPED lines skipped (not VICTORY_NAME=value)"
+fi
 say ""
 
 # --print-env: what the run would get, then stop before anything is started. The tests use it to pin the env, and
@@ -379,6 +592,16 @@ say ""
 if [ -n "$PRINT_ENV" ]; then
   # The harness's own watchdog choice, so a test and an operator can see the default the run would use.
   printf 'watchdog=%s\n' "$WATCHDOG"
+  printf 'harness env: settings=%s (%s switches)\n' "$SETTINGS" "$SETTINGS_COUNT"
+  [ -n "$MENU_FILE" ] && printf 'harness env: menu-file=%s (%s values)\n' "$MENU_NAME" "$MENU_COUNT"
+  [ -n "$BOOT_VIDEO" ] && printf 'harness env: boot-video=%s%s\n' "${BOOT_VIDEO##*[\\/]}" "${BOOT_VOLUME:+ (the game at $BOOT_VOLUME while it shows)}"
+  [ -n "$WORLD_TIMEOUT" ] && printf 'harness env: world-timeout=%s\n' "$WORLD_TIMEOUT"
+  # Only under --protocol: an ordinary run's --print-env is unchanged.
+  if [ -n "$PROTOCOL" ]; then
+    printf 'harness env: protocol=%s\n' "$PROTOCOL"
+    printf 'harness env: route=%s\n' "$ROUTE"
+    printf 'harness env: settled-seconds=%s\n' "$SETTLED_SECONDS"
+  fi
   printf '%s\n' "${ENV_ARGS[@]}"
   printf '%s\n' run "$GAME_EXE" --execute --console "$CONSOLE" > "$CAPTURE/game-args.txt"
   printf '%s\n' "${ENV_ARGS[@]}" > "$CAPTURE/env.txt"
@@ -428,6 +651,9 @@ fi
   done
   echo "capture: $(harness_public_path "$CAPTURE")"
   echo "harness env: cwd=$(harness_public_path "$RUN_CWD")"
+  echo "harness env: settings=$SETTINGS ($SETTINGS_COUNT switches)"
+  if [ -n "$MENU_FILE" ]; then echo "harness env: menu-file=$MENU_NAME ($MENU_COUNT values)"; fi
+  if [ -n "$BOOT_VIDEO" ]; then echo "harness env: boot-video=${BOOT_VIDEO##*[\\/]}${BOOT_VOLUME:+ (the game at $BOOT_VOLUME while it shows)}"; fi
   # The volumes the run reads and writes, once: the game's, and the cache's and data's when on other drives.
   # Each helper's exit is recorded in the log; a failure is a line to read, not a silence to blame on the game.
   node "$TOOLS/disk-usage.mjs" --config "$SAVE_CONFIG" "game=$(dirname "$GAME_EXE")" 2>&1
@@ -435,8 +661,10 @@ fi
   [ "$LIVE" = 1 ] && echo "harness env: live=$(basename "$LIVE_FILE")"
   [ "$LIVE" = 1 ] && echo "harness env: live-stats=$(basename "$LIVE_STATS")"
   [ -n "$ROUTE" ] && echo "harness env: route=$ROUTE"
+  [ -n "$PROTOCOL" ] && echo "harness env: protocol=$PROTOCOL"
   [ -n "$SETTLED_SECONDS" ] && echo "harness env: settled-seconds=$SETTLED_SECONDS"
   [ -n "$SETTLED_TIMEOUT" ] && echo "harness env: settled-timeout=$SETTLED_TIMEOUT"
+  [ -n "$WORLD_TIMEOUT" ] && echo "harness env: world-timeout=$WORLD_TIMEOUT"
   [ -n "$SETTLED_FPS" ] && echo "harness env: settled-fps=$SETTLED_FPS"
   [ -n "$SETTLED_WAITING" ] && echo "harness env: settled-waiting=$SETTLED_WAITING"
   [ "$GPU_TRACE" = 1 ] && echo "harness env: gpu-trace=after ${TRACE_AFTER_MS} ms, ${TRACE_FRAMES} frames, output $(harness_public_path "$CAPTURE")/gputrace"
@@ -464,14 +692,21 @@ fi
 
 # --save: the title's save folder is made to hold exactly the named snapshot before the game starts. The current
 # folder is copied to <VICTORY_SAVE_BACKUPS, default $HOME/victory-save-backups>/before-runs/<stamp>-<name> and verified
-# first; save-snapshot.mjs
-# refuses while a run holds the harness lock, and removes nothing it has not just copied and verified.
+# first, the snapshot is staged and verified beside the live folder, and only then swapped in by renames, with the old
+# folder put back if that fails (save-snapshot.mjs restore() says how). Exit 1: the save is as it was; exit 3: a
+# rollback failed, and the verified backup holds the previous save.
 if [ -n "$SAVE" ]; then
   say "restore: $SAVE"
-  if ! node "$TOOLS/save-snapshot.mjs" restore "$SAVE" --config "$SAVE_CONFIG" --lock "$LOCK" ${WORLD_RUN_HOLDS_LOCK:+--caller-holds-lock} >>"$LOG" 2>&1; then
-    say_err "save restore failed; the saves were left as they were; see the log"
-    exit 2
-  fi
+  node "$TOOLS/save-snapshot.mjs" restore "$SAVE" --config "$SAVE_CONFIG" --lock "$LOCK" ${WORLD_RUN_HOLDS_LOCK:+--caller-holds-lock} >>"$LOG" 2>&1
+  RESTORE_RC=$?
+  case "$RESTORE_RC" in
+    0) ;;
+    1) say_err "save restore failed; the save is as it was; see the log"; exit 2 ;;
+    3) say_err "save restore failed AND its rollback failed: the save may be changed; the old folder and the verified backup the log names both hold the previous save"; exit 2 ;;
+    4) say "save restored; its old folder could not be removed (the log names it): remove it before the next restore" ;;
+    2) say_err "save restore did not run (exit 2: its arguments); see the log"; exit 2 ;;
+    *) say_err "save restore ended unexpectedly (exit $RESTORE_RC): check the save folder against the backup the log names"; exit 2 ;;
+  esac
 fi
 
 # One pipeline library per build (pipeline-library.sh says why and how). This build's own is put in place now, whatever
@@ -481,7 +716,14 @@ PIPE_TOOLS=$TOOLS
 . "$HERE/pipeline-library.sh"
 PIPE_LOG=$LOG
 pipeline_library_enter "$(pipeline_library_cache_dir "$SAVE_CONFIG")" "$(pipeline_library_key "$BIN")" || exit 2
-trap pipeline_library_leave EXIT
+# The loading cover's player (--boot-video, below) is ended with the run, however the run ends.
+COVER_PID=""
+cover_end() {
+  [ -n "$COVER_PID" ] && taskkill //PID "$COVER_PID" //T //F >/dev/null 2>&1
+  COVER_PID=""
+  return 0
+}
+trap 'cover_end; pipeline_library_leave' EXIT
 trap 'exit 130' INT TERM
 
 # --warm: run the title's own pre-compile (`victory warm`) so every shader is in the cache this run reads and its
@@ -494,6 +736,13 @@ if [ "$WARM" = 1 ]; then
   rm -f "$REPORT_TSV"
   WARM_ENV=(VICTORY_LOG=info "VICTORY_WAVE64_EMULATE=emulate" "VICTORY_TRANSLATE_REPORT=$REPORT_TSV" "VICTORY_CONFIG=$SAVE_CONFIG")
   [ -n "$LOOP_LIMIT" ] && WARM_ENV+=("VICTORY_SHADER_LOOP_LIMIT=$LOOP_LIMIT")
+  # The settings set's switches go to the warm-up too: a translation made with other switches is not found by the run
+  # (switches given on the command line reach it through the environment, as they reach the game).
+  WARM_ENV+=(${SETTINGS_PAIRS[@]+"${SETTINGS_PAIRS[@]}"})
+  # The command that translates a folder into the shader cache: `shaders` where the build has it (the base: its
+  # `warm` makes pipelines from its book and takes no folder), else `warm` (the two older builds).
+  WARM_CMD=warm
+  "$BIN" shaders --help >/dev/null 2>&1 && WARM_CMD=shaders
   WARM_T0=$(date +%s)
   PRECOMPILE_JSON=${VICTORY_PRECOMPILE_JSON:-$HOME/.config/victory-harness/stream/precompile.json}
   say "warm-up: warm (see the log)"
@@ -520,7 +769,7 @@ if [ "$WARM" = 1 ]; then
   ( sleep 4; RUN_WORLD_WARM_STARTED_EPOCH="$WARM_T0" \
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$TOOLS/raise-priority.ps1" $WARM_PS_FLAGS >&2 ) > >(public_line) 2>&1 &
   WARM_RAISER=$!
-  (cd "$VICTORY_DIR" && env "${WARM_ENV[@]}" "$BIN" warm ${WARM_ARGS[@]+"${WARM_ARGS[@]}"} "$(dirname "$GAME_EXE")") >"$LOG.warm" 2>&1
+  (cd "$VICTORY_DIR" && env "${WARM_ENV[@]}" "$BIN" "$WARM_CMD" ${WARM_ARGS[@]+"${WARM_ARGS[@]}"} "$(dirname "$GAME_EXE")") >"$LOG.warm" 2>&1
   WARM_RC=$?
   wait "$WARM_RAISER" 2>/dev/null
   kill -0 "$PRE_PID" 2>/dev/null && kill "$PRE_PID" 2>/dev/null
@@ -576,10 +825,43 @@ RUN_STARTED=$(date +%s)
   printf '%s\n' "$PRIORITY_LINE" >>"$LOG"
   printf '%s\n' "$PRIORITY_LINE" >&2 ) > >(public_line) 2>&1 &
 
-# The game plays at 4% in Windows' mixer unless told otherwise (--volume N, or --volume off to leave it alone):
+# The game is muted (0 in Windows' mixer, the maintainer, 2026-11-27) unless told otherwise (--volume N, or --volume off to leave it alone):
 # the title is loud. set-volume.ps1 touches only this run's game, each audio session once.
-if [ "$VOLUME" != off ]; then
+BOOT_VOLUME_PID=""
+if [ -n "$BOOT_VOLUME" ]; then
+  # While the loading cover shows, the game is heard at --boot-volume; the cover's end stops this setter and starts
+  # the usual one (a setter sets each audio session once, so two at once would each win some sessions).
+  ( sleep 4; RUN_WORLD_GAME_EXE="$GAME_EXE" RUN_WORLD_STARTED_EPOCH="$RUN_STARTED" exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$TOOLS/set-volume.ps1" -Percent "$BOOT_VOLUME" >>"$LOG" 2>&1 ) &
+  BOOT_VOLUME_PID=$!
+elif [ "$VOLUME" != off ]; then
   ( sleep 4; RUN_WORLD_GAME_EXE="$GAME_EXE" RUN_WORLD_STARTED_EPOCH="$RUN_STARTED"       powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$TOOLS/set-volume.ps1" -Percent "$VOLUME" >>"$LOG" 2>&1 ) &
+fi
+
+# --boot-video: the loading cover. A player (ffplay: full screen, always on top, silent, looping) covers the screen
+# before the game starts, so the game's window opens under it and keeps the keyboard. boot-cover.mjs follows this
+# run's log and ends the player when the world is on screen, after ten minutes, or with the run. It is a window and
+# not a pass in the runtime: while the world loads the title presents about three frames a second, and a video
+# drawn in its frames would stutter. The video's own sound is never played.
+if [ -n "$BOOT_VIDEO" ]; then
+  SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS=0 ffplay -loglevel quiet -an -loop 0 -fs -alwaysontop -window_title loading \
+    "$BOOT_VIDEO" >/dev/null 2>&1 &
+  COVER_MSYS=$!
+  sleep 1
+  COVER_PID=$(cat "/proc/$COVER_MSYS/winpid" 2>/dev/null)
+  if [ -z "$COVER_PID" ]; then
+    say "loading cover: the player did not start; the run goes on without it"
+  else
+    say "loading cover: ${BOOT_VIDEO##*[\\/]} until the world is on screen"
+    (
+      node "$TOOLS/boot-cover.mjs" watch "$LOG" "$COVER_PID" --ceiling-seconds 600 >>"$LOG" 2>&1
+      if [ -n "$BOOT_VOLUME_PID" ]; then
+        kill "$BOOT_VOLUME_PID" 2>/dev/null
+        if [ "$VOLUME" != off ]; then
+          RUN_WORLD_GAME_EXE="$GAME_EXE" RUN_WORLD_STARTED_EPOCH="$RUN_STARTED" powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$TOOLS/set-volume.ps1" -Percent "$VOLUME" >>"$LOG" 2>&1
+        fi
+      fi
+    ) &
+  fi
 fi
 
 # Every run records its own window at two frames a second, into its capture folder; --no-record turns it off.
@@ -603,6 +885,7 @@ SETTLE_PID=""
 if [ -n "$SETTLED_SECONDS" ]; then
   SETTLE_ARGS=(--after-file "$AFTER")
   [ -n "$SETTLED_TIMEOUT" ] && SETTLE_ARGS+=(--timeout "$SETTLED_TIMEOUT")
+  [ -n "$WORLD_TIMEOUT" ] && SETTLE_ARGS+=(--world-timeout "$WORLD_TIMEOUT")
   [ -n "$SETTLED_FPS" ] && SETTLE_ARGS+=(--floor-fps "$SETTLED_FPS")
   [ -n "$SETTLED_WAITING" ] && SETTLE_ARGS+=(--waiting "$SETTLED_WAITING")
   [ -n "$SETTLED_AFTER" ] && SETTLE_ARGS+=(--settle-after-s "$SETTLED_AFTER")
@@ -673,6 +956,7 @@ else
   RC=$?  # victory.exe's own exit code
 fi
 
+cover_end
 # The game has ended: its library is stored under its build's name before the slow part below (the EXIT trap is the
 # same call, for a run that never gets here). The end load is taken first, while the leg's own processes are gone.
 node "$TOOLS/load-line.mjs" end >>"$LOG" 2>&1

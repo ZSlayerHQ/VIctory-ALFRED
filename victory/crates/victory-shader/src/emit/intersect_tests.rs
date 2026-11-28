@@ -6,8 +6,8 @@
 //!
 //! The nodes are in a raw buffer. Two ways to name it are run: the
 //! buffer's descriptor from the program's table (a resource of the host,
-//! [`crate::resource::BvhNodes::Resource`]), and a descriptor the code
-//! makes of numbers over title memory, with the structure's address in
+//! [`crate::resource::BvhNodes::Resource`]), and the title's way, a
+//! descriptor of numbers over title memory with the structure's address in
 //! the node pointer or in the descriptor. These tests have no host that
 //! keeps copies of title memory and their directory, so for the second
 //! they put a stand-in under the node reader
@@ -40,22 +40,14 @@ const BEFORE: [u32; 4] = [1, 2, 3, 4];
 enum Descriptor {
     /// The buffer's descriptor from the table.
     Table,
-    /// Numbers the code makes: dwords 0 and 1 (the base address in 256-byte
-    /// units and the box sorting bit, [`bvh::BOX_SORT`]). Dwords 2 and 3
-    /// are this file's [`SIZE`] and [`FLAGS`].
+    /// Numbers, as the title builds it: dwords 0 and 1 (the base address
+    /// in 256-byte units and the box sorting bit); the size and the rest of
+    /// the flags as the title sets them.
     Numbers(u32, u32),
 }
 
-/// Dword 2 of a descriptor of numbers: a size chosen for these tests.
-/// Nothing in the translation reads it.
-const SIZE: u32 = 0x0060_0000;
-/// Dword 3 of a descriptor of numbers, from the format's named fields and
-/// nothing else: the type of a ray-tracing structure, and triangles that
-/// return barycentrics.
-const FLAGS: u32 = bvh::DESCRIPTOR_TYPE << 28 | bvh::RETURN_BARYCENTRICS;
-
-/// A descriptor over the whole address space (base 0) with sorted boxes,
-/// for the 64-bit form.
+/// The descriptor the title builds for the 64-bit form: the whole address
+/// space, sorted boxes, barycentrics returned.
 const WHOLE: Descriptor = Descriptor::Numbers(0, bvh::BOX_SORT);
 
 /// The program: per thread, the record's twelve operand dwords in v1-v12,
@@ -85,22 +77,20 @@ fn program(wide: bool, descriptor: Descriptor) -> Vec<u32> {
     let rsrc = match descriptor {
         Descriptor::Table => 8,
         Descriptor::Numbers(word0, word1) => {
-            // Dwords 0 and 1 are made as literals in s[44:45] and copied as
-            // a pair into s[32:33], in both address modes: the tracker has
-            // to follow each dword (the sorting bit among them) through the
-            // 64-bit move back to its literal.
+            // s_mov_b32 s24, word0
+            w.extend([0xBE98_03FF, word0]);
+            if word1 == bvh::BOX_SORT {
+                // As the title makes it.
+                w.push(0xBE99_0B81); // s_brev_b32 s25, 1
+            } else {
+                w.extend([0xBE99_03FF, word1]); // s_mov_b32 s25, word1
+            }
             w.extend([
-                0xBEAC_03FF,
-                word0, // s_mov_b32 s44, word0
-                0xBEAD_03FF,
-                word1,       // s_mov_b32 s45, word1
-                0xBEA0_042C, // s_mov_b64 s[32:33], s[44:45]
-                0xBEA2_03FF,
-                SIZE, // s_mov_b32 s34, SIZE
-                0xBEA3_03FF,
-                FLAGS, // s_mov_b32 s35, FLAGS
+                0xBE9A_03C1, // s_mov_b32 s26, -1
+                0xBE9B_03FF,
+                0x8900_03FF, // s_mov_b32 s27, 0x890003ff
             ]);
-            32
+            24
         }
     };
     w.extend([
@@ -172,13 +162,19 @@ fn build(
     wide: bool,
     descriptor: Descriptor,
 ) -> Result<(HostShader, resource::Resources), ShaderError> {
-    let native = native(&program(wide, descriptor));
+    build_compute_shader(&native(&program(wide, descriptor)))
+}
+
+/// `native`, a compute program, translated (the tests' own way: no container).
+pub(super) fn build_compute_shader(
+    native: &NativeProgram,
+) -> Result<(HostShader, resource::Resources), ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -305,6 +301,12 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
     let ids2 = [8, bvh::NONE, 24, 0x1fff_fffc];
     box_nodes.push((s.add(nodes::box32(ids2, around), 32), 5));
     box_nodes.push((s.add(nodes::box16(ids2, around), 16), 4));
+    // A child that is not there with inverted infinite bounds (the title's
+    // builder leaves such slots): every ray "enters" it at minus infinity.
+    let mut empty = lined;
+    empty[1] = [f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+    let ids3 = [0x105, bvh::NONE, 0x304, 0x400];
+    box_nodes.push((s.add(nodes::box32(ids3, empty), 32), 5));
     // Random boxes.
     for n in 0..6 {
         let boxes: [[f32; 6]; 4] = std::array::from_fn(|_| {
@@ -318,20 +320,16 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
             box_nodes.push((s.add(nodes::box16(ids, boxes), 16), 4));
         }
     }
-    // Triangles: one of the reference's tests, a pair of the test's own
-    // that shares the edge between node vertices 1 and 2, all four
-    // triangles of a full node with turned ids, random ones.
+    // Triangles: one of the reference's tests, a pair as the title's
+    // builder stores it, all four triangles of a full node with turned
+    // ids, random ones.
     let mut triangle_nodes = Vec::new();
     let front = [[0.0, 2.0, 5.0], [2.0, -2.0, 5.0], [-2.0, -2.0, 5.0]];
     triangle_nodes.push((s.add(nodes::triangles(&front, 9), 16), 0));
-    // Triangle 0 is (front 0, front 2, front 1) with I on its vertex 2 and
-    // J on its vertex 0; triangle 1 is node vertices (1, 3, 2), the shared
-    // edge and a vertex below it, with I on its vertex 0 and J on its
-    // vertex 2 and the bit above J set (one that changes nothing).
     let pair = s.add(
         nodes::triangles(
-            &[front[0], front[2], front[1], [0.0, -5.0, 5.0]],
-            2 | (8 | 0x10) << 8,
+            &[front[0], front[1], front[2], [2.0, 2.0, 5.0]],
+            9 | 0x80 | 6 << 8,
         ),
         16,
     );
@@ -619,7 +617,7 @@ const BASE: u64 = 0x12_3456_7800;
 
 #[test]
 fn the_64_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
-    // One way: one descriptor for all of memory, the structure's
+    // The title's way: one descriptor for all of memory, the structure's
     // address folded into a 64-bit pointer.
     let _memory = Memory::at(BASE);
     run(true, WHOLE, BASE + u64::from(NODES), true);
@@ -627,7 +625,7 @@ fn the_64_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
 
 #[test]
 fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
-    // The other way: the structure's address in the descriptor
+    // The title's other way: the structure's address in the descriptor
     // (in 256-byte units, 40 bits), a 32-bit pointer from there. Here with
     // an address past 2^40 bytes, and without box sorting.
     let base = 0x312_3456_7800u64;
@@ -650,21 +648,20 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
         let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
         let st = structure::structure(&p).expect("structure");
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("tracked");
-        // The descriptor's flags as the tracker keeps them: sorted boxes
-        // in dword 1, and this file's dword 3 (a ray-tracing structure that
-        // returns barycentrics). No resource is taken for it: the buffer
+        // The flags the title sets: sorted boxes, barycentrics, a
+        // ray-tracing structure. No resource is taken for it: the buffer
         // loads' and the store's descriptors are all there is.
         assert_eq!(res.bvh.len(), 1);
         assert_eq!(
             res.bvh[0].1,
             BvhNodes::Memory {
-                word1: bvh::BOX_SORT,
-                word3: FLAGS
+                word1: 0x8000_0000,
+                word3: 0x8900_03ff
             }
         );
         assert_eq!(res.descriptors.len(), 5);
-        // Without the tests' stand-in the nodes are read as a running
-        // program reads them: through the host's directory of title
+        // Without the tests' stand-in the nodes are read as the title's
+        // programs will read them: through the host's directory of title
         // memory. The program lowers and validates, and asks the host for
         // the directory and for the list of pages it found no copy of.
         let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
@@ -675,12 +672,11 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
 
 #[test]
 fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
-    // Triangle return mode 0 ([`bvh::RETURN_BARYCENTRICS`] clear in dword
-    // 3): the last two result dwords would be a triangle id and a hit status.
+    // Triangle return mode 0 (bit 24 of dword 3 clear): the last two
+    // result dwords would be a triangle id and a hit status.
     let mut words = program(true, WHOLE);
-    assert_eq!(words.iter().filter(|&&w| w == FLAGS).count(), 1);
-    let flags = words.iter().position(|&w| w == FLAGS).unwrap();
-    words[flags] = FLAGS & !bvh::RETURN_BARYCENTRICS;
+    let flags = words.iter().position(|&w| w == 0x8900_03FF).unwrap();
+    words[flags] = 0x8800_03FF;
     let native = native(&words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");

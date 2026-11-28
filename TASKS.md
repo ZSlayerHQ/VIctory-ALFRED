@@ -1,5 +1,10 @@
 # Tasks and the check-in protocol
 
+> **The runtime's base changed on 2026-11-28** (`THIRD-PARTY.md`). The tasks under `issues/` were written against
+> the earlier base and are being re-checked against the new one, one by one. Before you claim one, confirm that the
+> files it names still exist under `victory/` and that its fault still shows; if not, say so on the issue instead
+> of working it. `KNOWN-FAULTS.md` is current.
+
 A task is one GitHub issue, labelled `task`, its area and its cards. The files under `issues/` carry the same text as the GitHub
 issues, one per number. Anyone with a GitHub account can take one, work it on their own fork, and send it back as a
 pull request.

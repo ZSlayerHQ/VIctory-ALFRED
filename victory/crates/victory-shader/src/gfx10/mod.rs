@@ -56,12 +56,21 @@ pub struct Instruction {
     pub opcode: u16,
     /// Every dword of the instruction, including literals and extra dwords.
     pub words: Vec<u32>,
+    /// [`name`] of `encoding` and `opcode`, resolved once at decode time.
+    /// The translator asks about every instruction eight times; the table is
+    /// a binary search.
+    name: Option<&'static str>,
 }
 
 impl Instruction {
+    /// An instruction of these words, its name resolved.
+    pub fn new(offset: usize, encoding: Encoding, opcode: u16, words: Vec<u32>) -> Self {
+        Self { offset, encoding, opcode, words, name: name(encoding, opcode) }
+    }
+
     /// AMD's name for the opcode, if it is in our table.
     pub fn name(&self) -> Option<&'static str> {
-        name(self.encoding, self.opcode)
+        self.name
     }
 }
 
@@ -196,8 +205,7 @@ fn far_jump<'a>(
     Ok(None)
 }
 
-/// The one instruction at `offset` (the oracle's fetch, which follows jumps the decode does not).
-pub(crate) fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
+fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
     let word = |i: usize| {
         code.get(offset + 4 * i..offset + 4 * i + 4)
             .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
@@ -209,17 +217,7 @@ pub(crate) fn instruction(code: &[u8], offset: usize) -> Result<Instruction, Sha
         // Literal constant, SDWA, DPP16, DPP8, DPP8 with fetch-inactive.
         let extra = usize::from(matches!(src0, 0xFF | 0xF9 | 0xFA | 0xE9 | 0xEA));
         match w >> 25 {
-            0x3F => {
-                let opcode = (w >> 9) & 0xFF;
-                // These VOP1s take no source, so the field is not a literal
-                // (the console compiler stores a shader hash there).
-                let no_source = matches!(opcode, 0x000 | 0x01B | 0x041);
-                (
-                    Encoding::Vop1,
-                    opcode,
-                    if no_source { 1 } else { 1 + extra },
-                )
-            }
+            0x3F => (Encoding::Vop1, (w >> 9) & 0xFF, 1 + extra),
             0x3E => (Encoding::Vopc, (w >> 17) & 0xFF, 1 + extra),
             op => {
                 let mk_ak = name(Encoding::Vop2, op as u16).is_some_and(|n| {
@@ -293,11 +291,13 @@ pub(crate) fn instruction(code: &[u8], offset: usize) -> Result<Instruction, Sha
             _ => return Err(isa(offset, "unknown encoding")),
         }
     };
+    let opcode = opcode as u16;
     Ok(Instruction {
         offset,
         encoding,
-        opcode: opcode as u16,
+        opcode,
         words: (0..len).map(word).collect::<Result<_, _>>()?,
+        name: name(encoding, opcode),
     })
 }
 
@@ -364,50 +364,18 @@ mod tests {
     }
 
     #[test]
-    fn vop3_cmpx_writes_exec() {
-        let code = bytes(&[0xD411_0005, 0x0001_E501, S_ENDPGM]);
-        let inst = &decode(&code).unwrap()[0];
-        assert_eq!(inst.name(), Some("v_cmpx_lt_f32"));
-        let Fields::Valu(v) = inst.fields(false) else {
-            panic!("not a VALU");
+    fn flat_offsets_ignore_bit_eleven() {
+        let offset = |word0: u32| {
+            let code = bytes(&[word0, 0x0000_0001, S_ENDPGM]);
+            match decode(&code).unwrap()[0].fields(false) {
+                Fields::Flat { offset, .. } => offset,
+                fields => panic!("{fields:?}"),
+            }
         };
-        assert_eq!(
-            v.dst,
-            Some(Operand::Scalar {
-                code: 126,
-                dwords: 1
-            })
-        );
-    }
-
-    #[test]
-    fn vop1_without_operands_has_no_extension_word() {
-        assert_eq!(
-            summary(&[0x7E00_00FF, S_ENDPGM]),
-            [(0, 1, "v_nop"), (4, 1, "s_endpgm")]
-        );
-        assert_eq!(
-            summary(&[0x7E00_36FF, S_ENDPGM]),
-            [(0, 1, "v_pipeflush"), (4, 1, "s_endpgm")]
-        );
-    }
-
-    #[test]
-    fn a_vopc_or_vop2_word_that_looks_like_a_no_source_vop1_keeps_its_literal() {
-        // The no-source test belongs to the VOP1 arm alone. With bits 16:9 colliding with v_nop,
-        // v_pipeflush or v_clrexcp (0x1B here) and a literal src0, a VOPC or VOP2 word must still take its
-        // extension dword; the first version of this fix dropped it for every encoding and decoded the
-        // literal as the next instruction.
-        // v_cmp_f_f32 (VOPC, opcode 0), bits 16:9 = 0x1B, src0 = 0xFF (literal).
-        assert_eq!(
-            summary(&[0x7C00_36FF, 0x1234_5678, S_ENDPGM]),
-            [(0, 2, "v_cmp_f_f32"), (8, 1, "s_endpgm")]
-        );
-        // v_add_f32 (VOP2, opcode 3), bits 16:9 = 0x1B, src0 = 0xFF (literal).
-        assert_eq!(
-            summary(&[0x0600_36FF, 0x1234_5678, S_ENDPGM]),
-            [(0, 2, "v_add_f32"), (8, 1, "s_endpgm")]
-        );
+        // flat_load_dword v0, v[1:2]: the FLAT offset is 11-bit and
+        // unsigned, so bit 11 is ignored (0x800 -> 0, 0xfff -> 0x7ff).
+        assert_eq!(offset(0xDC30_0800), 0);
+        assert_eq!(offset(0xDC30_0FFF), 0x7FF);
     }
 
     #[test]

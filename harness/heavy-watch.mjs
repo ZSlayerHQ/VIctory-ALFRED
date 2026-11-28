@@ -15,6 +15,8 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+import { endSelected } from './end-run.mjs';
+
 import { findTrigger } from './presentmon.mjs';
 import { stripAnsi } from './parse-run.mjs';
 
@@ -176,18 +178,15 @@ export function watch(logPath, seconds, options = {}) {
       }
       if (decision.action !== 'end') return;
 
-      let alive = (pids || []).filter(isAlive);
-      if (!alive.length) {
-        refreshPids();
-        alive = (pids || []).filter(isAlive);
-      }
-      if (!alive.length) {
+      // A fresh selection at the moment of the kill, never the cached ids (end-run.mjs says why).
+      const result = endSelected(() => selectionPids(psFile), endPid);
+      if (result.fresh) pids = result.fresh;
+      if (result.outcome === 'gone') {
         // Nothing of this run is left: it ended by itself at the same moment.
-        if (pids !== null) stop(0);
-        return; // Otherwise PowerShell failed; try again next poll.
+        stop(0);
+        return;
       }
-      const ended = alive.filter(endPid);
-      if (!ended.length) return; // taskkill failed while the process lives; retry next poll.
+      if (result.outcome !== 'ended') return; // PowerShell failed, or taskkill did: retry next poll.
       try {
         fs.appendFileSync(logPath, endedMarker(seconds) + '\n');
       } catch {

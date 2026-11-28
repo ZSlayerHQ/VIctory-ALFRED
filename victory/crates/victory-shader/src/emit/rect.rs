@@ -431,10 +431,6 @@ mod tests {
     #[cfg(windows)]
     fn rectangles_are_drawn_whole() {
         use super::super::host::{Draw, Host};
-        // One GPU test at a time, as every other GPU test of the crate.
-        let _one = super::super::valu_tests::ONE_AT_A_TIME
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let Ok(host) = Host::new(false) else {
             eprintln!("no SM 6.6 device; skipped");
             return;

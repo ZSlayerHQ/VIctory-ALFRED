@@ -3,6 +3,9 @@
 # Only the game's own audio sessions are touched: by process id, never by name, on every active playback device.
 # It keeps looking until the game exits, because the title opens its audio some time after its window, and sets
 # each session once: a level changed by hand in the mixer afterwards stays as the person set it.
+# It acts only while the process it picked still holds that id: the process's start time is read when it is
+# picked and checked before every pass. A game that ends leaves its id free, and Windows gives ids out again, so
+# without the check another program's sound (OBS, say) could be changed.
 # -ProcessId names the process; without it the process is this run's game, by run-process.ps1's strict rule
 # (created after this run began; no fallback, G-016). -List prints the sessions and changes nothing.
 param([int]$Percent = 4, [int]$ProcessId = 0, [switch]$List, [switch]$Once)
@@ -136,6 +139,14 @@ while ($ProcessId -eq 0 -and (Get-Date) -lt $deadline) {
   if ($picked.Count -gt 0) { $ProcessId = [int]$picked[0] } else { Start-Sleep -Seconds 2 }
 }
 if ($ProcessId -eq 0) { "volume: this run's game was not found; nothing changed"; exit 0 }
+$picked = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+if (-not $picked) { "volume: pid $ProcessId is gone; nothing changed"; exit 0 }
+$pickedStart = $picked.StartTime
+# Whether the process holding the id is still the one picked (same start time).
+function Test-SameProcess {
+  $now = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+  return [bool]($now -and $now.StartTime -eq $pickedStart)
+}
 
 $level = [single]($Percent / 100.0)
 if ($List) {
@@ -147,11 +158,12 @@ if ($List) {
 
 $said = $false
 do {
+  if (-not (Test-SameProcess)) { break }
   foreach ($line in [RunVolume.Mixer]::Sessions([uint32]$ProcessId, $level, $true)) {
     "volume: pid $ProcessId, $line"
     $said = $true
   }
   if ($Once) { break }
   Start-Sleep -Seconds 3
-} while (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+} while (Test-SameProcess)
 if (-not $said) { "volume: pid $ProcessId opened no audio session; nothing changed" }

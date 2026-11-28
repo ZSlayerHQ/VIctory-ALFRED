@@ -40,9 +40,13 @@
 //!
 //! Five vertices of three 32-bit floats at bytes 0-59 and a dword at byte
 //! 60 with one byte per triangle: bits 1:0 name the triangle's vertex that
-//! barycentric I weighs, bits 3:2 the one J weighs; the higher bits of the
-//! byte are not read. Triangle `k` of the node uses the node's vertices
-//! [`TRIANGLE_VERTICES`]`[k]`.
+//! barycentric I weighs, bits 3:2 the one J weighs (the builder stores an
+//! input triangle's second vertex at the former, its third at the latter
+//! and its first at the remaining one, so I and J are the weights of the
+//! input triangle's second and third vertices). Triangle `k` of the node
+//! uses the node's vertices [`TRIANGLE_VERTICES`]`[k]`. A program that
+//! keeps fewer triangles in a node uses the bytes of the unused vertices
+//! for its own data.
 //!
 //! With the descriptor's triangle return mode set (bit 120) the result is
 //! the hit distance's numerator, its denominator, and the numerators of I
@@ -57,10 +61,12 @@
 //! public software emulation of this instruction in the open-source Vulkan
 //! driver for this GPU family (box test and sorting network as there; the
 //! triangle test is the watertight one it uses, Woop, Benthin and Wald,
-//! JCGT 2013). Not known from there: how the console rounds, which of two
-//! boxes entered at the same distance it returns first, and what it returns
-//! for a ray exactly through an edge (here: a hit in both triangles of the
-//! edge) or for kinds 6 and 7 (here: a triangle miss).
+//! JCGT 2013), and agree with what the title's own structure
+//! builder writes and its trace programs read. Not known from either: how
+//! the console rounds, which of two boxes entered at the same distance it
+//! returns first, and what it returns for a ray exactly through an edge
+//! (here: a hit in both triangles of the edge) or for kinds 6 and 7 (here:
+//! a triangle miss; the title's programs do not read it).
 
 /// The result dword for a box the ray misses, or a child that is not there.
 pub const NONE: u32 = 0xffff_ffff;
@@ -190,8 +196,11 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         }
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
-        // A box whose minimum x is NaN is switched off.
-        if !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
+        // A box whose minimum x is NaN is switched off. A child that is not
+        // there may have inverted infinite bounds, which every ray enters at
+        // minus infinity: it would be first of the sorted children and end
+        // the walk before them (DexNom/VIctory bc3cd4b0).
+        if children[n] != NONE && !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
             ids[n] = children[n];
             distances[n] = enter;
         }
@@ -281,6 +290,17 @@ pub fn half_to_f32(h: u16) -> f32 {
 pub(crate) mod tests {
     use super::*;
 
+    /// An empty slot's inverted infinite bounds do not come before the
+    /// children a ray enters (after DexNom/VIctory bc3cd4b0).
+    #[test]
+    fn an_empty_slot_is_never_entered() {
+        let inside = |x: f32| [x - 1.0, -1.0, -1.0, x + 1.0, 1.0, 1.0];
+        let (up, down) = (f32::INFINITY, f32::NEG_INFINITY);
+        let bounds = [inside(30.0), [up, up, up, down, down, down], inside(10.0), [up, up, up, down, down, down]];
+        let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
+        assert_eq!(boxes(&[8, NONE, 16, NONE], &bounds, &ray, true), [16, 8, NONE, NONE]);
+    }
+
     /// The smallest 16-bit float not below `x` (`up`) or not above it.
     pub(crate) fn f32_to_half(x: f32, up: bool) -> u16 {
         let mut best: Option<u16> = None;
@@ -349,7 +369,7 @@ pub(crate) mod tests {
 
     #[test]
     fn node_pointers_name_64_byte_nodes_past_the_descriptors_base() {
-        // The 64-bit form with a descriptor of base 0: the structure's
+        // The 64-bit form as the title uses it: base 0, the structure's
         // address folded into the pointer.
         let structure = 0x12_3456_7800u64;
         let pointer = (structure >> 8 << 5) + (0x40 >> 3 | 5);
@@ -597,8 +617,9 @@ pub(crate) mod tests {
 
     #[test]
     fn the_id_dword_says_which_vertices_the_weights_belong_to() {
-        // A triangle (a, b, c) stored in each of the six ways an id byte can
-        // name: a at the vertex neither field names, b at I's, c at J's.
+        // What the title's builder does with an input triangle (a, b, c)
+        // and an id byte: a at the vertex neither field names, b at I's,
+        // c at J's.
         let [a, b, c] = TRIANGLE;
         let ray = Ray::new([0.5, -0.25, 0.0], [0.0, 0.0, 1.0], 100.0);
         let plain = intersect(&triangles(&[a, b, c], 9), 0, &ray, true);
@@ -632,9 +653,10 @@ pub(crate) mod tests {
             let node = triangles(&vertices, 9 << (8 * k));
             assert_eq!(intersect(&node, k, &ray, true), plain, "triangle {k}");
         }
-        // Two triangles of one node that share an edge: triangle 1's own
-        // vertex at node vertex 3, named by its byte's I.
+        // A pair as the title's builder stores it: the second triangle's
+        // own vertex at node vertex 3, named by I.
         let d = [2.0, 2.0, 5.0];
+        // Input triangles (a, b, c) and (a, d, b): they share a and b.
         let node = triangles(&[a, b, c, d], 9 | (1 | 2 << 2) << 8);
         // Triangle 1 = node vertices (1, 3, 2) = (b, d, c) as vertices 0, 1, 2.
         let got = triangle_vertices(&node, 1);

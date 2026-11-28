@@ -360,6 +360,13 @@ test('a settled run carries its settle time and ends on the settled clock', () =
   const timeout = parseExtras(timedOut, firstTs, lastTs);
   assert.equal(timeout.settled, null);
   assert.equal(timeout.settledTimeout, true);
+
+  const noWorld = ['harness: ended by --world-timeout after 600 s: the world never came (no frame line)'];
+  assert.equal(parseExtras(noWorld, firstTs, lastTs).worldTimeout, true);
+  const lastFrame = [
+    'harness: ended by --world-timeout after 300 s: the world never came (last frame line: 30 fps, 12 draws/frame)',
+  ];
+  assert.equal(parseExtras(lastFrame, firstTs, lastTs).worldTimeout, true);
 });
 
 test('host mesh pipeline refused counts as a refused pipeline too', () => {
@@ -374,6 +381,31 @@ test('host mesh pipeline refused counts as a refused pipeline too', () => {
     'compute aaaaaaaaaaaaaaaa',
     'mesh 1111222233334444, pixel 5555666677778888',
   ]);
+});
+
+test('a shader that does not translate is counted once, with its reason, apart from pipelines the card refused', () => {
+  const said = (hash, at, why) =>
+    `${TS}  WARN victory_gpu::pipeline: shader does not translate; its pipelines' draws are dropped stage="compute" hash=${hash} error=converter shader.dxil v1: GFX10 code at ${at}: ${why} is not supported`;
+  // Invented hashes and code offsets: the shape of the runtime's line, no real program's.
+  const lines = [
+    said('aaaaaaaaaaaaaaaa', '0x0', 'no wave32 lowering for this wave64 program'),
+    said('aaaaaaaaaaaaaaaa', '0x0', 'no wave32 lowering for this wave64 program'),
+    said('bbbbbbbbbbbbbbbb', '0x10', 'a first-lane read where not every thread of the group runs'),
+    said('cccccccccccccccc', '0x20', 'a first-lane read where not every thread of the group runs'),
+    `${TS}  INFO victory_gpu::host: dropped 24.5/frame without a host pipeline: compute aaaaaaaaaaaaaaaa`,
+  ];
+  const { summary } = parseLogLines(lines, 'synthetic.log');
+  assert.equal(summary.notTranslated.count, 3, 'a shader said twice is one shader');
+  assert.deepEqual(summary.notTranslated.byReason, [
+    ['a first-lane read where not every thread of the group runs', 2],
+    ['no wave32 lowering for this wave64 program', 1],
+  ]);
+  assert.deepEqual(summary.notTranslated.programs, [
+    'compute aaaaaaaaaaaaaaaa',
+    'compute bbbbbbbbbbbbbbbb',
+    'compute cccccccccccccccc',
+  ]);
+  assert.equal(summary.refusedPipelines.count, 0, 'the card refused nothing: that count is a different one');
 });
 
 test('a title-chosen exit is its own ending and a failure when the code is not 0', () => {

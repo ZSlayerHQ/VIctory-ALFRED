@@ -13,6 +13,7 @@ import {
   settleEndMarker,
   settledMarker,
   timeoutMarker,
+  worldTimeoutMarker,
   UNSETTLED_NOTE_MS,
   unmetText,
   unsettledMarker,
@@ -96,6 +97,48 @@ test('the marker says what the settle saw, and the clock ends or times out as as
   assert.equal(due(state, { now: settled + 75_000, seconds: 75, timeout: 600 }), 'end');
   assert.equal(settleEndMarker(75), 'harness: ended by --settled-seconds after 75 s of settled scene');
   assert.equal(settledMarker(5, null, 3), 'harness: settled at 5 s (waiting ?, 3 fps)');
+});
+
+test('a run that never reaches the world ends at --world-timeout, counted from the watcher start', () => {
+  const start = Date.parse('2026-11-20T10:00:00.000000Z');
+  let state = initialState();
+  assert.equal(
+    due(state, { now: start + 299_000, seconds: 75, timeout: 600, worldTimeout: 300, startedAt: start }),
+    'wait',
+  );
+  assert.equal(
+    due(state, { now: start + 300_000, seconds: 75, timeout: 600, worldTimeout: 300, startedAt: start }),
+    'world-timeout',
+  );
+  assert.equal(due(state, { now: start + 3_600_000, seconds: 75, timeout: 600 }), 'wait', 'without the flag nothing changes');
+
+  state = observe(state, later(EARLY, '00:05'));
+  assert.equal(state.heavyAt, null, 'menu-level draws are not a heavy line');
+  assert.match(
+    unmetText(state, { worldTimeout: 300, startedAt: start, now: start + 60_000 }),
+    /first heavy frame line; 240 s left/,
+  );
+  assert.equal(
+    due(state, { now: start + 300_000, seconds: 75, timeout: 600, worldTimeout: 300, startedAt: start }),
+    'world-timeout',
+  );
+
+  state = observe(state, later(PLAYING, '00:10'));
+  assert.notEqual(state.heavyAt, null);
+  assert.equal(
+    due(state, { now: start + 3_600_000, seconds: 75, timeout: 600, worldTimeout: 300, startedAt: start }),
+    'timeout',
+    'once a heavy line is seen the world timeout never fires; the old rule holds',
+  );
+
+  assert.equal(
+    worldTimeoutMarker(300, { fps: 30, draws: 12 }),
+    'harness: ended by --world-timeout after 300 s: the world never came (last frame line: 30 fps, 12 draws/frame)',
+  );
+  assert.equal(
+    worldTimeoutMarker(600, null),
+    'harness: ended by --world-timeout after 600 s: the world never came (no frame line)',
+  );
 });
 
 // Shapes seen in a run, with made-up values: heavy frames drawing fine while the recording threads wait hundreds

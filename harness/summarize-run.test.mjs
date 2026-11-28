@@ -524,3 +524,219 @@ test('a log line holding a web address never reaches the summary, in text or --j
   assert.ok(parsed.withheldLines >= 1);
   assert.ok(parsed.failures.some((line) => /DXGI_ERROR_DEVICE_HUNG/.test(line)));
 });
+
+
+// Their protocol (--protocol team-270): their two windows after the settle, from PresentMon's own frames of the
+// game's process, and their results template filled where the log has a source.
+function protocolFixture(t, { rows, logLines, extraEnv = [] }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'summarize-run-team-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const capture = path.join(dir, 'capture');
+  fs.mkdirSync(capture);
+  fs.writeFileSync(path.join(capture, 'presentmon.csv'), rows);
+  const log = path.join(dir, 'run.log');
+  fs.writeFileSync(
+    log,
+    ['harness build: test profile=diag console=series-x branch=HEAD', `capture: ${capture}`, 'harness env: VICTORY_LOG=info', ...extraEnv, ...logLines].join('\n') + '\n',
+  );
+  return log;
+}
+
+const med = (xs) => {
+  const s = [...xs].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
+const pct = (xs, p) => {
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.min(Math.max(0, Math.ceil(p * s.length) - 1), s.length - 1)];
+};
+function windowNumbers(values) {
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  const slow = [...values].sort((a, b) => b - a).slice(0, Math.max(1, Math.round(values.length * 0.01)));
+  return {
+    frames: values.length,
+    fps: (1000 / mean).toFixed(1),
+    median: med(values).toFixed(1),
+    p90: pct(values, 0.9).toFixed(1),
+    p99: pct(values, 0.99).toFixed(1),
+    low1: (1000 / (slow.reduce((a, b) => a + b, 0) / slow.length)).toFixed(1),
+    worst: Math.max(...values).toFixed(1),
+    gpu: ((100 * 50 * values.length) / values.reduce((a, b) => a + b, 0)).toFixed(1),
+  };
+}
+
+test('--protocol team-270 prints their two windows and their results template', (t) => {
+  // Frames of varying length, a second process's rows, and one 900 ms frame inside the walking window.
+  const rows = [];
+  let at = 0;
+  let i = 0;
+  let slow = false;
+  while (at < 400000) {
+    const pid = i % 7 === 6 ? 9999 : 4242;
+    let ms = [100, 50, 150, 100, 200][i % 5];
+    if (pid === 4242 && !slow && at >= 300000) {
+      ms = 900;
+      slow = true;
+    }
+    rows.push({ pid, at, ms });
+    at += ms;
+    i += 1;
+  }
+  const csv =
+    'Application,ProcessID,TimeInMs,MsBetweenPresents,MsGPUBusy\r\n' +
+    rows.map((r) => `${r.pid === 4242 ? 'victory.exe' : 'other.exe'},${r.pid},${r.at},${r.ms},50`).join('\r\n') + '\r\n';
+  const frameAt = (ts, draws) => frame({ draws }).replace('2026-11-25T00:00:00.000000Z', ts);
+  const log = protocolFixture(t, {
+    rows: csv,
+    logLines: [
+      'harness env: protocol=team-270',
+      'harness env: route=manual-1',
+      'volume: pid 4242, device 1: 100% -> 0%',
+      frameAt('2026-11-26T09:59:59.000000Z', 1111),
+      'harness: settled at 75 s (waiting 40, 4.0 fps)',
+      frameAt('2026-11-26T10:01:30.000000Z', 5000),
+      frameAt('2026-11-26T10:03:20.000000Z', 7000),
+      'harness: victory exit=0',
+    ],
+  });
+  const result = spawnSync(process.execPath, [script, log], { encoding: 'utf8', env: isolatedEnv() });
+  assert.equal(result.status, 0, result.stderr);
+  const values = (a, b) => rows.filter((r) => r.pid === 4242 && r.at >= a * 1000 && r.at < b * 1000).map((r) => r.ms);
+  const standing = windowNumbers(values(155, 225));
+  const walking = windowNumbers(values(225, 345));
+  const line = (label, w, draws) =>
+    `- ${label}: ${w.frames} frames, ${w.fps} fps, median ${w.median} ms, p90 ${w.p90} ms, p99 ${w.p99} ms, 1% low ${w.low1} fps, worst ${w.worst} ms, ${draws} draws/frame, GPU busy ${w.gpu}%`;
+  assert.match(result.stdout, /^## Protocol team-270 \(their 270 s test: stand to \+150, walk and turn to \+270, both after the settle\)$/m);
+  // The draws anchor is the frame line before the settle marker: the standing window holds 5000, the walking 7000.
+  assert.ok(result.stdout.includes(line('standing (+80..+150)', standing, '5000.0')), result.stdout);
+  assert.ok(result.stdout.includes(line('walking (+150..+270)', walking, '7000.0')), result.stdout);
+  assert.ok(result.stdout.includes("1% low: 1000 over the mean of the slowest 1% of frames; the windows' clock is within about 1 to 2 s of the settle"));
+  // Their template: the route from the log, GPU busy as a percentage, no memory source in this log.
+  const trow = (name, a, b) => `${name.padEnd(20)}${a.padEnd(24)}${b}`;
+  assert.match(result.stdout, /^## Their results template$/m);
+  assert.ok(result.stdout.includes('Standing (80-150 s)     Walking (150-270 s)'), result.stdout);
+  assert.ok(result.stdout.includes(trow('FPS (average):', standing.fps, walking.fps)));
+  assert.ok(result.stdout.includes(trow('Worst frame:', standing.worst, walking.worst)));
+  assert.ok(result.stdout.includes(trow('GPU busy:', `${standing.gpu}%`, `${walking.gpu}%`)));
+  assert.ok(result.stdout.includes('Scene:              route manual-1'), result.stdout);
+  assert.ok(result.stdout.includes('Peak RAM (private): n/a  Peak VRAM: n/a  (this process, sampled about every 5 s, diagnostics builds only)'));
+});
+
+test('a run that ends before a window is spanned refuses that window with its reason', (t) => {
+  const rows = [];
+  let at = 0;
+  while (at < 235000) {
+    rows.push(`victory.exe,4242,${at},100,50`);
+    at += 100;
+  }
+  const csv = 'Application,ProcessID,TimeInMs,MsBetweenPresents,MsGPUBusy\r\n' + rows.join('\r\n') + '\r\n';
+  const log = protocolFixture(t, {
+    rows: csv,
+    logLines: [
+      'harness env: protocol=team-270',
+      'volume: pid 4242, device 1: 100% -> 0%',
+      'harness: settled at 75 s (waiting 40, 4.0 fps)',
+      'harness: victory exit=0',
+    ],
+  });
+  const result = spawnSync(process.execPath, [script, log], { encoding: 'utf8', env: isolatedEnv() });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^- standing \(\+80\.\.\+150\): \d+ frames,/m);
+  assert.match(result.stdout, /^- walking \(\+150\.\.\+270\): n\/a \(the run ended \d+ s short of it\)$/m);
+});
+
+test('rows of another process are not pooled, and the running clock is the game process own', (t) => {
+  // No time column: the clock is the running sum of the game process's own frame times. Another process's interval
+  // is its own, not the game's, so its rows must not advance the clock.
+  const rows = [];
+  for (let i = 0; i < 3200; i += 1) {
+    const pid = i % 14 === 13 ? 9999 : 4242;
+    rows.push({ pid, ms: pid === 9999 ? 1000 : 100 });
+  }
+  const csv =
+    'Application,ProcessID,MsBetweenPresents,MsGPUBusy\r\n' +
+    rows.map((r) => `${r.pid === 4242 ? 'victory.exe' : 'other.exe'},${r.pid},${r.ms},50`).join('\r\n') + '\r\n';
+  let clock = 0;
+  const game = [];
+  for (const r of rows) {
+    if (r.pid !== 4242) continue;
+    clock += r.ms;
+    game.push(clock);
+  }
+  const log = protocolFixture(t, {
+    rows: csv,
+    logLines: [
+      'harness env: protocol=team-270',
+      'volume: pid 4242, device 1: 100% -> 0%',
+      'harness: settled at 75 s (waiting 40, 4.0 fps)',
+      'harness: victory exit=0',
+    ],
+  });
+  const result = spawnSync(process.execPath, [script, log], { encoding: 'utf8', env: isolatedEnv() });
+  assert.equal(result.status, 0, result.stderr);
+  const count = game.filter((t) => t >= 155000 && t < 225000).length;
+  // With the other process's 1 s rows added to the clock the frames land elsewhere and this count changes.
+  assert.ok(result.stdout.includes(`- standing (+80..+150): ${count} frames`), result.stdout);
+});
+
+// Peak RAM and VRAM come from the log's own lines: `memory: <n> MB private` for the process's private bytes, and
+// the card's in-use figure in either build's wording.
+test('the template takes peak RAM and peak VRAM from the log lines, in either wording', (t) => {
+  const run = (lines) => {
+    const log = fixture(t, ['harness env: protocol=team-270', 'harness: settled at 75 s (waiting 40, 4.0 fps)', ...lines, 'harness: victory exit=0']);
+    const result = spawnSync(process.execPath, [script, log], { encoding: 'utf8', env: isolatedEnv() });
+    assert.equal(result.status, 0, result.stderr);
+    return result;
+  };
+  const note = '(this process, sampled about every 5 s, diagnostics builds only)';
+  const ours = run([
+    `${TS}memory: 8114 MB private (7900 MB of it in memory; the PC has 16708 MB free and 35963 MB left to commit)`,
+    `${TS}the card: 1546 MB in use of a budget of 31419 MB, 0 MB of the PC's memory shared with it in use`,
+    `${TS}memory: 9000 MB private (8800 MB of it in memory; the PC has 16000 MB free and 35000 MB left to commit)`,
+    `${TS}the card: 2615 MB in use of a budget of 31419 MB`,
+  ]);
+  assert.ok(ours.stdout.includes(`Peak RAM (private): 9000 MB  Peak VRAM: 2615 MB  ${note}`), ours.stdout);
+  const theirs = run([
+    `${TS}memory: 10092 MB private (9800 MB of it in memory; the PC has 16708 MB free and 35963 MB left to commit)`,
+    `${TS}video memory as the system counts it, with the memory line: the card's own: budget 31419 MB, in use 2908 MB, 15837 MB could still be reserved, 0 MB reserved`,
+  ]);
+  assert.ok(theirs.stdout.includes(`Peak RAM (private): 10092 MB  Peak VRAM: 2908 MB  ${note}`), theirs.stdout);
+  const neither = run([`${TS}30.0 fps, 33.3 ms/frame (0.4 preparing: copies 0.2 ms 0.3 MB, textures 0.0 ms 0.0 MB; 0.0 on the GPU; 0.0 copying back 0.0 MB), 5000 draws/frame, dropped 0 without a host pipeline (0 being made) and 0 indirect`]);
+  assert.ok(neither.stdout.includes(`Peak RAM (private): n/a  Peak VRAM: n/a  ${note}`), neither.stdout);
+});
+
+test('a capture that ends 2 s after the walking window is accepted', (t) => {
+  const rows = [];
+  let at = 0;
+  while (at < 347000) {
+    rows.push(`victory.exe,4242,${at},100,50`);
+    at += 100;
+  }
+  const csv = 'Application,ProcessID,TimeInMs,MsBetweenPresents,MsGPUBusy\r\n' + rows.join('\r\n') + '\r\n';
+  const log = protocolFixture(t, {
+    rows: csv,
+    logLines: [
+      'harness env: protocol=team-270',
+      'volume: pid 4242, device 1: 100% -> 0%',
+      'harness: settled at 75 s (waiting 40, 4.0 fps)',
+      'harness: victory exit=0',
+    ],
+  });
+  const result = spawnSync(process.execPath, [script, log], { encoding: 'utf8', env: isolatedEnv() });
+  assert.equal(result.status, 0, result.stderr);
+  // The settle is 75 s, so the walking window ends at 345 s; the last row is at 346.9 s, inside the 1 s slack.
+  assert.match(result.stdout, /^- walking \(\+150\.\.\+270\): \d+ frames,/m);
+});
+
+test('a start-up video-memory line alone is not a peak VRAM', (t) => {
+  const log = fixture(t, [
+    'harness env: protocol=team-270',
+    'harness: settled at 75 s (waiting 40, 4.0 fps)',
+    `${TS}video memory as the system counts it, right before the swap chain is made: the card's own: budget 31419 MB, in use 188 MB, 15837 MB could still be reserved, 0 MB reserved`,
+    'harness: victory exit=0',
+  ]);
+  const result = spawnSync(process.execPath, [script, log], { encoding: 'utf8', env: isolatedEnv() });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes('Peak RAM (private): n/a  Peak VRAM: n/a  (this process, sampled about every 5 s, diagnostics builds only)'), result.stdout);
+});

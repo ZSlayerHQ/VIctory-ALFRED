@@ -131,7 +131,6 @@ pub extern "system" fn create(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    let _entry = crate::budget::entry(crate::budget::Phase::ObjectCalls);
     if parameters.is_null() || iid.is_null() {
         return E_INVALIDARG;
     }
@@ -171,7 +170,6 @@ pub(crate) fn newer() -> bool {
 
 /// The device, or its DXGI side.
 extern "system" fn query_interface(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    let _entry = crate::budget::entry(crate::budget::Phase::ObjectCalls);
     let found = if is_device(iid) {
         Some(this)
     } else if object::is(iid, &dxgi::DEVICE_IIDS) {
@@ -232,7 +230,6 @@ fn user_space() -> (u64, u64) {
 }
 
 extern "system" fn node_count(_: This) -> u32 {
-    let _entry = crate::budget::entry(crate::budget::Phase::ObjectCalls);
     1
 }
 
@@ -271,7 +268,6 @@ extern "system" fn check_feature_support(
     data: *mut c_void,
     size: u32,
 ) -> HRESULT {
-    let _entry = crate::budget::entry(crate::budget::Phase::ObjectCalls);
     const OPTIONS_QUERY: u32 = 0;
     const ARCHITECTURE: u32 = 1;
     const FEATURE_LEVELS: u32 = 2;
@@ -350,9 +346,12 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`), both stubbed: called as
-/// `(this, description, interface id, out)` for an `ID3D12PipelineState`,
-/// they fail with `out` null, and the first calls log the
+/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
+/// (two routines of the title's) as `(this, description, interface
+/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
+/// object `out` names and draws with it; on failure it goes without that
+/// pipeline, silently. What the descriptions hold is not known: the calls
+/// fail as they always did, with `out` null, and the first ones log the
 /// description's words and what its first word points at, so that the two
 /// methods can be written.
 /// shortcut: not implemented. Answering `S_OK` here without making the
@@ -363,7 +362,6 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     _iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    let _entry = crate::budget::entry(crate::budget::Phase::ObjectCalls);
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
@@ -401,6 +399,19 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     E_NOTIMPL
 }
 
+/// The host device's state: the console's device is removed when the host's is
+/// (VIctory 13185f5: the default answer, E_NOTIMPL, reads as a lost device).
+extern "system" fn removed_reason(_: This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        // SAFETY: a plain query.
+        if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
+            return e.code().0;
+        }
+    }
+    S_OK
+}
+
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
 /// methods `ID3D12Device1` to `ID3D12Device8` add, in order: 3, 1, 3, 6, 9,
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
@@ -433,6 +444,7 @@ static FUNCTIONS: Table<160> = {
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
     f[36] = fence::create as *const (); // 0x120
+    f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
@@ -478,7 +490,7 @@ mod tests {
         let (hr, device) = create_as(&IID);
         assert_eq!(hr, S_OK);
         assert_eq!(device, super::device());
-        // A caller tests this byte of the device before it inlines a device call.
+        // The title tests byte 0x18 before inlining a device call.
         // SAFETY: the device is 0x58 bytes.
         assert_ne!(unsafe { device.cast::<u8>().add(0x18).read() }, 0);
         assert_eq!(create_as(&[0; 16]).0, E_NOINTERFACE);
@@ -492,7 +504,7 @@ mod tests {
 
     #[test]
     fn newer_device_levels_are_the_same_device() {
-        // ID3D12Device11, the device level under test.
+        // ID3D12Device11, as the title asks for it.
         let (hr, device) = create_as(&LEVEL_IIDS[8]);
         assert_eq!((hr, device), (S_OK, super::device()));
         let mut same = std::ptr::null();
@@ -539,7 +551,7 @@ mod tests {
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_FENCE_FLAG_NONE, ID3D12Device5, ID3D12Fence,
         };
-        let Some(host) = crate::host::test_host() else {
+        let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
         // SAFETY: plain calls on the host device and its fence.

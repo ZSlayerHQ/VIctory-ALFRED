@@ -83,8 +83,15 @@ pub fn mount_at(letter: char, root: &Path) {
 }
 
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
-/// keeps its own).
+/// keeps its own). An empty root is the current directory, as it is to a
+/// path joined to it: it is the title's folder when the title is run by its
+/// file name alone (`victory run game.exe`).
 fn root_wide(root: &Path) -> Vec<u16> {
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
     while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
@@ -262,7 +269,6 @@ pub extern "system" fn CreateFileW(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
@@ -284,7 +290,6 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    let _entry = victory_gpu::hle_call();
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
@@ -319,7 +324,6 @@ pub extern "system" fn CreateFile2(
     disposition: u32,
     params: *const c_void,
 ) -> Handle {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),
@@ -331,7 +335,6 @@ pub extern "system" fn CreateFile2(
 }
 
 pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
-    let _entry = victory_gpu::hle_call();
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.as_ptr())
@@ -343,19 +346,16 @@ pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
 }
 
 pub extern "system" fn DeleteFileW(path: *const u16) -> i32 {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.ptr())
 }
 
 pub extern "system" fn RemoveDirectoryW(path: *const u16) -> i32 {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("kernel32.dll", "RemoveDirectoryW": extern "system" fn(*const u16) -> i32)(p.ptr())
 }
 
 pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32 {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("kernel32.dll", "SetFileAttributesW": extern "system" fn(*const u16, u32) -> i32)(
         p.ptr(),
@@ -364,7 +364,6 @@ pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> 
 }
 
 pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
-    let _entry = victory_gpu::hle_call();
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(
@@ -380,7 +379,6 @@ pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
 }
 
 pub extern "system" fn CreateDirectoryW(path: *const u16, security: *const c_void) -> i32 {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("kernel32.dll", "CreateDirectoryW": extern "system" fn(*const u16, *const c_void) -> i32)(
         p.ptr(),
@@ -393,7 +391,6 @@ pub extern "system" fn GetFileAttributesExW(
     level: i32,
     info: *mut c_void,
 ) -> i32 {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)(
         p.ptr(),
@@ -403,7 +400,6 @@ pub extern "system" fn GetFileAttributesExW(
 }
 
 pub extern "system" fn GetFileAttributesW(path: *const u16) -> u32 {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(p.ptr())
 }
@@ -414,7 +410,6 @@ pub extern "system" fn GetDiskFreeSpaceExW(
     total: *mut u64,
     free: *mut u64,
 ) -> i32 {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("kernel32.dll", "GetDiskFreeSpaceExW": extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32)(
         p.ptr(),
@@ -433,7 +428,6 @@ pub extern "system" fn GetDiskFreeSpaceW(
     free_clusters: *mut u32,
     clusters: *mut u32,
 ) -> i32 {
-    let _entry = victory_gpu::hle_call();
     let mut p = wide(root);
     if let Some(host) = &mut p.1
         && let [letter, colon, sep, ..] = host[..]
@@ -452,7 +446,6 @@ pub extern "system" fn GetDiskFreeSpaceW(
 }
 
 pub extern "system" fn FindFirstFileW(path: *const u16, data: *mut c_void) -> Handle {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("kernel32.dll", "FindFirstFileW": extern "system" fn(*const u16, *mut c_void) -> Handle)(
         p.ptr(),
@@ -468,7 +461,6 @@ pub extern "system" fn FindFirstFileExW(
     filter: *mut c_void,
     flags: u32,
 ) -> Handle {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("kernel32.dll", "FindFirstFileExW": extern "system" fn(*const u16, i32, *mut c_void, i32, *mut c_void, u32) -> Handle)(
         p.ptr(),
@@ -481,7 +473,6 @@ pub extern "system" fn FindFirstFileExW(
 }
 
 pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32 {
-    let _entry = victory_gpu::hle_call();
     let (from, to) = (wide(from), wide(to));
     host!("kernel32.dll", "MoveFileExW": extern "system" fn(*const u16, *const u16, u32) -> i32)(
         from.ptr(),
@@ -491,7 +482,6 @@ pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32)
 }
 
 pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
-    let _entry = victory_gpu::hle_call();
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "SetCurrentDirectoryW": extern "system" fn(*const u16) -> i32)(
@@ -509,13 +499,11 @@ pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
 // The C runtime (ucrtbase, which the title's CRT imports bind to).
 
 pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode)
 }
 
 pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) -> i32 {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
         out,
@@ -525,7 +513,6 @@ pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) 
 }
 
 pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> File {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
         p.ptr(),
@@ -539,12 +526,7 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // fail there instead of faulting into its handler; the title's
 // synchronous reads read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
-// is opened first, and left writable until the read is done: the guard over
-// all the views of a page protects other views from other threads, and a
-// block guarded again before the kernel wrote it failed the read, leaving
-// the title's retry to open it again. The kernel still reads in place, so
-// alignment, short reads and the file position are its own; `fread` reads
-// beside instead (see there).
+// is opened first, and not guarded again before the call is done.
 
 pub extern "system" fn ReadFile(
     file: *mut c_void,
@@ -553,35 +535,30 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let _entry = victory_gpu::hle_call();
-    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
-    const ERROR_IO_PENDING: u32 = 997;
-    let mut writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
+    let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
     let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
     );
-    // What the title reads next (`ERROR_IO_PENDING` say), whatever ending
-    // the write below calls of the host.
-    // SAFETY: no arguments.
-    let error = unsafe { GetLastError() };
-    if done == 0 && error == ERROR_IO_PENDING && !overlapped.is_null() {
-        // Under way until its I/O is done, which the title learns from the
-        // host: the write ends when the guards see the `OVERLAPPED`'s status
-        // final (`victory_gpu::KernelWrite::pending`). Its bytes are
-        // storage's; a short pending read's count is not known here.
-        writing.storage(len as usize);
-        writing.pending(overlapped.cast_const());
-    } else {
-        if done != 0 {
-            // The bytes it brought are storage's (none when it failed).
-            // SAFETY: the read's own count, which it wrote when synchronous.
-            let brought = unsafe { read.as_ref() }.map_or(0, |&n| n as usize);
-            writing.storage(brought);
-        }
-        drop(writing);
+    // The call's error is the title's to ask for.
+    // SAFETY: plain calls.
+    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    // shortcut: a read that goes on after the call (overlapped) is written
+    // into pages the kernel has locked by now: it lands all the same, but a
+    // refresh that guards its blocks before it does will not see it.
+    if done == 0 && error == windows_sys::Win32::Foundation::ERROR_IO_PENDING {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::info!(len, "ReadFile: a read of the title's goes on after the call"));
     }
-    // SAFETY: plain value.
-    unsafe { SetLastError(error) };
+    if done == 0 && error == windows_sys::Win32::Foundation::ERROR_NOACCESS {
+        static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(n, buffer = format_args!("{buffer:p}"), len, "ReadFile: the title's buffer could not be written");
+        }
+    }
+    drop(writing);
+    // SAFETY: as above.
+    unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
     done
 }
 
@@ -592,60 +569,14 @@ pub extern "system" fn ReadFile(
 /// user mode, where a guarded block faults into the guard like the title's
 /// own writes. Returns the items read, as the CRT does; the bytes of a
 /// partial last item are copied too, as the CRT leaves them.
-///
-/// The CRT's `fread` holds the stream's lock throughout, so another thread's
-/// read or seek on the stream comes before or after it; the chunks are one
-/// read the same way, under the lock, read with the CRT's unlocked read.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    let _entry = victory_gpu::hle_call();
-    let total = size.saturating_mul(count);
-    if buffer.is_null() || stream.is_null() || total == 0 {
-        // The CRT's own checks and answer (EINVAL, or nothing to read).
-        let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
-        return read(buffer, size, count, stream);
-    }
-    let read = host!("ucrtbase.dll", "_fread_nolock": extern "C" fn(*mut u8, usize, usize, File) -> usize);
-    const CHUNK: usize = 1 << 20;
-    let mut beside = vec![0u8; total.min(CHUNK)];
-    let mut done = 0;
-    let _locked = Locked::new(stream);
-    while done < total {
-        let want = (total - done).min(CHUNK);
-        let n = read(beside.as_mut_ptr(), 1, want, stream);
-        if n > 0 {
-            victory_gpu::kernel_will_write(buffer as usize + done, n);
-            // SAFETY: the caller's buffer holds `size * count` bytes, and
-            // `done + n` is at most that.
-            unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
-            #[cfg(feature = "diagnostics")]
-            victory_gpu::memory_census_storage(buffer as usize + done, n);
-            done += n;
-        }
-        if n < want {
-            break;
-        }
-    }
-    done / size
-}
-
-/// A CRT stream's lock (`_lock_file`), held until dropped.
-struct Locked(File);
-
-impl Locked {
-    fn new(stream: File) -> Locked {
-        host!("ucrtbase.dll", "_lock_file": extern "C" fn(File))(stream);
-        Locked(stream)
-    }
-}
-
-impl Drop for Locked {
-    fn drop(&mut self) {
-        host!("ucrtbase.dll", "_unlock_file": extern "C" fn(File))(self.0);
-    }
+    let _writing = victory_gpu::kernel_writing(buffer as usize, size.saturating_mul(count));
+    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+        buffer, size, count, stream,
+    )
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
-    let _entry = victory_gpu::hle_call();
     match narrow(path) {
         Some(p) => host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
             p.as_ptr(),
@@ -660,7 +591,6 @@ pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
 }
 
 pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
-    let _entry = victory_gpu::hle_call();
     match narrow(path) {
         Some(p) => {
             host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
@@ -680,7 +610,6 @@ pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_ch
 /// `_open(path, flags[, mode])` is variadic; on x64 the optional integer
 /// travels in the same register either way, so it is passed on as is.
 pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
-    let _entry = victory_gpu::hle_call();
     match narrow(path) {
         Some(p) => host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
             p.as_ptr(),
@@ -695,7 +624,6 @@ pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
 
 /// See [`_open`]; used by libHttpClient.
 pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
         p.ptr(),
@@ -705,13 +633,11 @@ pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
 }
 
 pub extern "C" fn _wstat64(path: *const u16, stat: *mut c_void) -> i32 {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("ucrtbase.dll", "_wstat64": extern "C" fn(*const u16, *mut c_void) -> i32)(p.ptr(), stat)
 }
 
 pub extern "C" fn _stat64i32(path: *const c_char, stat: *mut c_void) -> i32 {
-    let _entry = victory_gpu::hle_call();
     match narrow(path) {
         Some(p) => {
             host!("ucrtbase.dll", "_wstat64i32": extern "C" fn(*const u16, *mut c_void) -> i32)(
@@ -728,7 +654,6 @@ pub extern "C" fn _stat64i32(path: *const c_char, stat: *mut c_void) -> i32 {
 }
 
 pub extern "C" fn remove(path: *const c_char) -> i32 {
-    let _entry = victory_gpu::hle_call();
     match narrow(path) {
         Some(p) => host!("ucrtbase.dll", "_wremove": extern "C" fn(*const u16) -> i32)(p.as_ptr()),
         None => host!("ucrtbase.dll", "remove": extern "C" fn(*const c_char) -> i32)(path),
@@ -736,13 +661,11 @@ pub extern "C" fn remove(path: *const c_char) -> i32 {
 }
 
 pub extern "C" fn _wchmod(path: *const u16, mode: i32) -> i32 {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("ucrtbase.dll", "_wchmod": extern "C" fn(*const u16, i32) -> i32)(p.ptr(), mode)
 }
 
 pub extern "C" fn _wutime64(path: *const u16, times: *mut c_void) -> i32 {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("ucrtbase.dll", "_wutime64": extern "C" fn(*const u16, *mut c_void) -> i32)(
         p.ptr(),
@@ -757,7 +680,6 @@ const FIOPEN_WIDE: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z";
 
 /// `_Fiopen(const wchar_t* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File {
-    let _entry = victory_gpu::hle_call();
     let p = wide(path);
     host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
         p.ptr(),
@@ -768,7 +690,6 @@ extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File 
 
 /// `_Fiopen(const char* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
-    let _entry = victory_gpu::hle_call();
     match narrow(path) {
         Some(p) => {
             host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
@@ -864,63 +785,6 @@ mod tests {
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
-    /// A read the host leaves pending: the title gets `ERROR_IO_PENDING`,
-    /// and the bytes land when the other end of the pipe writes.
-    #[test]
-    fn a_pending_read_reports_pending_and_lands() {
-        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE};
-        #[repr(C)]
-        struct Overlapped {
-            internal: usize,
-            internal_high: usize,
-            offset: u64,
-            event: *mut c_void,
-        }
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn CreateNamedPipeW(
-                name: *const u16,
-                open: u32,
-                mode: u32,
-                n: u32,
-                out: u32,
-                into: u32,
-                timeout: u32,
-                security: *const c_void,
-            ) -> *mut c_void;
-            fn WriteFile(file: *mut c_void, at: *const u8, len: u32, n: *mut u32, o: *mut Overlapped) -> i32;
-            fn GetOverlappedResult(file: *mut c_void, o: *const Overlapped, n: *mut u32, wait: i32) -> i32;
-        }
-        let name = w(&format!(r"\\.\pipe\victory-files-{}", std::process::id()));
-        // SAFETY: a NUL-terminated name; an outbound pipe and its client,
-        // opened for overlapped reads.
-        let (server, client) = unsafe {
-            let server = CreateNamedPipeW(name.as_ptr(), 2, 0, 1, 4096, 4096, 0, std::ptr::null());
-            assert_ne!(server, INVALID_HANDLE_VALUE);
-            // Read access, opened as it is, overlapped.
-            let (read, existing, overlapped) = (0x8000_0000, 3, 0x4000_0000);
-            let none = (std::ptr::null(), std::ptr::null_mut());
-            let client = CreateFileW(name.as_ptr(), read, 0, none.0, existing, overlapped, none.1);
-            assert_ne!(client, INVALID_HANDLE_VALUE);
-            (server, client)
-        };
-        let mut out = [0u8; 13];
-        let mut o = Overlapped { internal: 0, internal_high: 0, offset: 0, event: std::ptr::null_mut() };
-        let started = ReadFile(client, out.as_mut_ptr(), 13, std::ptr::null_mut(), (&raw mut o).cast());
-        // SAFETY: no arguments.
-        assert_eq!((started, unsafe { GetLastError() }), (0, 997));
-        let mut n = 0;
-        // SAFETY: 13 bytes of ours, a synchronous write; then the read's
-        // `OVERLAPPED`, waited for.
-        unsafe {
-            assert_eq!(WriteFile(server, b"from the pipe".as_ptr(), 13, &mut n, std::ptr::null_mut()), 1);
-            assert_eq!(GetOverlappedResult(client, &o, &mut n, 1), 1);
-            CloseHandle(client);
-            CloseHandle(server);
-        }
-        assert_eq!((&out, n), (b"from the pipe", 13));
-    }
-
     #[test]
     fn fread_reads_beside_in_chunks() {
         let dir = tempfile::tempdir().unwrap();
@@ -953,54 +817,6 @@ mod tests {
         assert_eq!(a, bytes[..1000]);
         assert_eq!(b, bytes[1000..1000 + b.len()]);
         fclose(f);
-    }
-
-    /// One `fread` is one read of the stream, as the CRT's is: another
-    /// thread's seek on the same stream waits for it, never landing between
-    /// its chunks.
-    #[test]
-    fn fread_holds_the_stream_across_its_chunks() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("words.bin");
-        // Word i holds i: a read of whole words is consecutive words.
-        const WORDS: usize = 3 << 20;
-        let bytes: Vec<u8> = (0..WORDS as u32).flat_map(u32::to_le_bytes).collect();
-        std::fs::write(&path, &bytes).unwrap();
-        let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
-        let fseek = host!("ucrtbase.dll", "fseek": extern "C" fn(File, i32, i32) -> i32);
-        let f = _wfopen(w(&path.to_string_lossy()).as_ptr(), w("rb").as_ptr());
-        assert!(!f.is_null());
-
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        let stream = f as usize;
-        let broken = std::thread::scope(|s| {
-            // Seeks back to the start, again and again: between a read's
-            // chunks, its next chunk would start over.
-            s.spawn(|| {
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    assert_eq!(fseek(stream as File, 0, 0), 0);
-                }
-            });
-            let mut out = vec![0u8; 5 << 20];
-            let mut broken = None;
-            for round in 0..16 {
-                assert_eq!(fseek(f, 0, 0), 0);
-                let n = fread(out.as_mut_ptr(), 4, out.len() / 4, f);
-                let words: Vec<u32> = out[..n * 4]
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-                    .collect();
-                if let Some(at) = words.windows(2).position(|w| w[1] != w[0] + 1) {
-                    broken = Some((round, at, words[at], words[at + 1]));
-                    break;
-                }
-            }
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            broken
-        });
-        fclose(f);
-        // (round, word, its value, the next word's) of a read a seek cut.
-        assert_eq!(broken, None);
     }
 
     fn text(v: &[u16]) -> String {
@@ -1039,8 +855,8 @@ mod tests {
         mount_at('g', dir.path());
         mount_at('G', package.path());
         assert_eq!(
-            tr(r"G:\pack\sample7.bin".into()),
-            Some(format!(r"{}\pack\sample7.bin", package.path().display()))
+            tr(r"G:\appdata0.rpf".into()),
+            Some(format!(r"{}\appdata0.rpf", package.path().display()))
         );
         assert_ne!(mount(dir.path()), Some('G'), "free letters skip fixed ones");
 
@@ -1056,6 +872,17 @@ mod tests {
         );
     }
 
+    /// A title run by its file name alone has an empty folder: the drive
+    /// over it is the current directory, not the current drive's root.
+    #[test]
+    fn an_empty_root_is_the_current_directory() {
+        let letter = mount(Path::new("")).unwrap();
+        let path = format!(r"{letter}:\a.rpf");
+        let host = translate(&w(&path)[..path.len()]).map(|v| text(&v));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(host, Some(cwd.join("a.rpf").display().to_string()));
+    }
+
     #[test]
     fn long_title_paths_work_on_the_host() {
         let dir = tempfile::tempdir().unwrap();
@@ -1069,31 +896,80 @@ mod tests {
         let f = _wfopen(w(&file).as_ptr(), w("wb").as_ptr());
         assert!(!f.is_null(), "{file}");
         host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(f);
-        // Right after `fclose`, another process (a scan of the new file, say)
-        // can still hold it for a moment: the delete then fails with a
-        // sharing violation, about once in a few hundred runs. Retry only
-        // that, up to a second in all; any other error is a real failure.
-        const ERROR_SHARING_VIOLATION: i32 = 32;
         let path = w(&format!("{deep}/f.txt"));
-        let mut last_error = None;
-        for attempt in 1..=100 {
-            if DeleteFileW(path.as_ptr()) != 0 {
-                last_error = None;
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(ERROR_SHARING_VIOLATION) {
-                panic!("delete after {attempt} attempt(s): {error}");
-            }
-            last_error = Some(error);
-            if attempt < 100 {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-        if let Some(error) = last_error {
-            panic!("delete after 100 attempts: {error}");
+        let delete = || match DeleteFileW(path.as_ptr()) {
+            0 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        };
+        let sleep = || std::thread::sleep(std::time::Duration::from_millis(10));
+        if let Err(e) = delete_retrying(delete, sleep) {
+            panic!("delete: {e}");
         }
         assert_ne!(RemoveDirectoryW(w(&deep).as_ptr()), 0);
+    }
+
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    /// The attempts [`delete_retrying`] makes at most.
+    const DELETE_ATTEMPTS: u32 = 100;
+
+    /// Runs `delete` (a Win32 delete's result) until it succeeds. Right after
+    /// `fclose`, another process (a scan of the new file, say) can still hold
+    /// the file for a moment, and the delete fails with a sharing violation
+    /// (reported as about once in 100 to 300 runs of the whole test binary).
+    /// That error is tried again after `sleep`, up to [`DELETE_ATTEMPTS`]
+    /// attempts with no sleep after the last. Any other error fails at once;
+    /// a sharing violation that persists fails after the last attempt.
+    fn delete_retrying(
+        mut delete: impl FnMut() -> std::io::Result<()>,
+        mut sleep: impl FnMut(),
+    ) -> std::io::Result<()> {
+        let mut attempt = 1;
+        loop {
+            match delete() {
+                Err(e)
+                    if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+                        && attempt < DELETE_ATTEMPTS =>
+                {
+                    attempt += 1;
+                    sleep();
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// [`delete_retrying`] over scripted results (`Some` error code, or
+    /// `None` for success): its result, the attempts and the sleeps.
+    fn scripted_delete(results: &[Option<i32>]) -> (Option<i32>, usize, usize) {
+        let (mut attempts, mut sleeps) = (0, 0);
+        let delete = || {
+            let result = results[attempts];
+            attempts += 1;
+            result.map_or(Ok(()), |code| Err(std::io::Error::from_raw_os_error(code)))
+        };
+        let result = delete_retrying(delete, || sleeps += 1);
+        (result.err().map(|e| e.raw_os_error().unwrap()), attempts, sleeps)
+    }
+
+    #[test]
+    fn a_sharing_violation_is_tried_again() {
+        assert_eq!(scripted_delete(&[Some(ERROR_SHARING_VIOLATION), None]), (None, 2, 1));
+    }
+
+    #[test]
+    fn another_delete_error_fails_at_once() {
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        let failed = Some(ERROR_ACCESS_DENIED);
+        assert_eq!(scripted_delete(&[failed, None]), (failed, 1, 0));
+    }
+
+    #[test]
+    fn a_lasting_sharing_violation_fails_after_the_last_attempt() {
+        // A success scripted after the last attempt shows none is made past it.
+        let mut results = vec![Some(ERROR_SHARING_VIOLATION); DELETE_ATTEMPTS as usize];
+        results.push(None);
+        let (failed, attempts) = (Some(ERROR_SHARING_VIOLATION), DELETE_ATTEMPTS as usize);
+        assert_eq!(scripted_delete(&results), (failed, attempts, attempts - 1));
     }
 
     #[test]

@@ -14,6 +14,8 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+import { endSelected } from './end-run.mjs';
+
 import { driveOf, space } from './disk-usage.mjs';
 
 export const GB = 1 << 30;
@@ -129,13 +131,10 @@ export function watch(logPath, target, options = {}) {
       if (!seenGame) return;
       if (decide(freeGb(target, spaceOf), belowGb) !== 'end') return;
 
-      let alive = (pids || []).filter(isAlive);
-      if (!alive.length) {
-        refreshPids();
-        alive = (pids || []).filter(isAlive);
-      }
-      if (!alive.length) return; // Gone by itself, or PowerShell failed: try again next poll.
-      if (!alive.filter(endPid).length) return; // taskkill failed while the process lives; retry next poll.
+      // A fresh selection at the moment of the kill, never the cached ids (end-run.mjs says why).
+      const result = endSelected(() => selectionPids(psFile), endPid);
+      if (result.fresh) pids = result.fresh;
+      if (result.outcome !== 'ended') return; // Gone by itself, PowerShell failed or taskkill did: next poll.
       const marker = endedMarker(belowGb);
       try {
         fs.appendFileSync(logPath, `${marker}\n`);

@@ -6,9 +6,7 @@
 //! a mask (`s_cbranch_execz`, `vccz`, SCC of a mask operation) becomes a
 //! branch on the lane's own bit: compiled code only skips work that lanes
 //! outside the mask would not change, or tests a value that is the same in
-//! every lane, so either way each lane can decide alone (`vccz` and `vccnz`
-//! are kept as the wave's decision with `VICTORY_WAVE_VCC=1`, [`structure_wide`]).
-//! A path-sensitive
+//! every lane, so either way each lane can decide alone. A path-sensitive
 //! pass then proves, for each vector instruction, that EXEC holds in every
 //! lane that reaches it; what it cannot prove stays as the instruction's
 //! guard, a per-lane `if` around it.
@@ -445,11 +443,6 @@ pub struct Structured {
     /// SCC values a mask operation sets when some lane's bit of its result is set, with that
     /// lane bit: as data such an SCC is "some lane of the wave has it".
     pub scc_some: HashMap<Value, Bool>,
-    /// Mask dwords with no bit set for a lane the wave does not have ([`bounded_masks`]): a
-    /// ballot of the lanes there gives them whole, in a partial wave too. Empty, and not
-    /// read, without `VICTORY_WAVE_GUARDS=1` or `VICTORY_WAVE_WEBS=1`
-    /// ([`crate::emit::mask_bounds_on`]).
-    pub bounded: HashSet<Value>,
 }
 
 impl Structured {
@@ -475,18 +468,9 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// stays a guard on every vector instruction, as it is on the console. For a console wave
 /// run as two host waves, which exchange that decision and can then meet (a group barrier)
 /// inside the branch.
-///
-/// With `VICTORY_WAVE_VCC=1` every `s_cbranch_vccz`/`vccnz` is kept so too: the console's VCCZ
-/// is one test of all 64 bits of VCC ([`crate::emit::wave_vcc_on`]). Off by default.
 pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
     l.wide = wide.clone();
-    if crate::emit::wave_vcc_on() {
-        let vcc = |b: &crate::ir::Block| {
-            b.insts.last().is_some_and(|i| matches!(i.name(), "s_cbranch_vccz" | "s_cbranch_vccnz"))
-        };
-        l.wide.extend((0..program.blocks.len()).filter(|&b| vcc(&program.blocks[b])));
-    }
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -500,109 +484,6 @@ pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Struct
         l.unresolved.extend(wrong);
         l.derived_phis.extend(new_derived);
         l.reset();
-    }
-}
-
-/// The scalar dwords (by value) that hold no bit for a lane the wave does not have: EXEC on
-/// entry, what a vector compare or carry writes (masked by EXEC there), and what moves,
-/// selects, ANDs (with one such operand), ANDN2s (of such a first operand), ORs and XORs (of
-/// such operands only) and the EXEC-saving forms of those make of them, through phis whose
-/// every argument is one; a constant operand only where it is 0. The greatest such set. Not a
-/// complement (`s_not`, `s_orn2`, `s_nand`, `s_nor`, `s_xnor`), another constant, a load or a
-/// lane read: their bits above a partial wave's threads can be set on the console, where a
-/// ballot of the lanes gives 0 (Sol's third review, item 3).
-fn bounded_masks(p: &Program) -> HashSet<Value> {
-    enum Rule {
-        All(Vec<Value>),
-        Any(Vec<Vec<Value>>),
-    }
-    let exec = |r: Reg| matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1);
-    let mut rules: Vec<(Value, Rule)> = Vec::new();
-    let mut set: HashSet<Value> = p.inputs.iter().filter(|i| exec(i.0)).map(|i| i.1).collect();
-    for block in &p.blocks {
-        for phi in block.phis.iter().filter(|phi| matches!(phi.reg, Reg::S(_))) {
-            rules.push((phi.value, Rule::All(phi.args.clone())));
-        }
-        for inst in &block.insts {
-            let name = inst.name();
-            let outs = || inst.writes.iter().filter(|w| matches!(w.0, Reg::S(_)));
-            match &inst.fields {
-                Fields::Valu(_) if name.starts_with("v_cmp") || name.contains("_co_") => {
-                    set.extend(outs().map(|w| w.1));
-                }
-                Fields::Sop { src, .. } => {
-                    // each source's dwords; None for a constant other than 0
-                    let source = |op: &Operand| -> Option<Vec<Value>> {
-                        match *op {
-                            Operand::Scalar { code, dwords } => {
-                                Some((0..dwords).filter_map(|k| inst.read(Reg::S(code + k))).collect())
-                            }
-                            Operand::Const(128) | Operand::Literal(0) => Some(Vec::new()),
-                            _ => None,
-                        }
-                    };
-                    let old_exec: Vec<Value> = inst.reads.iter().filter(|r| exec(r.0)).map(|r| r.1).collect();
-                    let base = name.trim_end_matches("_b32").trim_end_matches("_b64");
-                    let (op, saves) = match base.strip_suffix("_saveexec") {
-                        Some(op) => (op, true),
-                        None => (base, false),
-                    };
-                    // the operands of the result: the sources, then EXEC for a saving form
-                    let mut ops: Vec<Option<Vec<Value>>> = src.iter().map(source).collect();
-                    if saves {
-                        ops.push(Some(old_exec.clone()));
-                    }
-                    let all = |ops: &[Option<Vec<Value>>]| -> Option<Vec<Value>> {
-                        let mut v = Vec::new();
-                        for o in ops {
-                            v.extend(o.clone()?);
-                        }
-                        Some(v)
-                    };
-                    let result = match op {
-                        "s_mov" | "s_cmov" | "s_cselect" | "s_or" | "s_xor" => all(&ops).map(Rule::All),
-                        "s_and" => Some(Rule::Any(ops.iter().flatten().cloned().collect())),
-                        "s_andn2" => all(&ops[..1]).map(Rule::All),
-                        "s_andn1" if saves => all(&ops[1..]).map(Rule::All),
-                        _ => None,
-                    };
-                    for w in outs() {
-                        let rule = if saves && !exec(w.0) {
-                            Some(Rule::All(old_exec.clone())) // the EXEC it saves
-                        } else {
-                            match &result {
-                                Some(Rule::All(v)) => Some(Rule::All(v.clone())),
-                                Some(Rule::Any(g)) => Some(Rule::Any(g.clone())),
-                                None => None,
-                            }
-                        };
-                        if let Some(rule) = rule {
-                            rules.push((w.1, rule));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    // the greatest set: every value a rule names, less what breaks its rule, until none does
-    set.extend(rules.iter().map(|r| r.0));
-    loop {
-        let gone: Vec<Value> = rules
-            .iter()
-            .filter(|(v, _)| set.contains(v))
-            .filter(|(_, rule)| match rule {
-                Rule::All(v) => !v.iter().all(|x| set.contains(x)),
-                Rule::Any(g) => !g.iter().any(|v| v.iter().all(|x| set.contains(x))),
-            })
-            .map(|r| r.0)
-            .collect();
-        if gone.is_empty() {
-            return set;
-        }
-        for v in gone {
-            set.remove(&v);
-        }
     }
 }
 
@@ -911,6 +792,9 @@ impl<'a> Lanes<'a> {
             .iter()
             .enumerate()
             .map(|(n, block)| {
+                // Reachability is fixed within the block. Vector instructions
+                // with the same EXEC therefore need the same guard.
+                let mut last_guard = None;
                 block
                     .insts
                     .iter()
@@ -920,8 +804,16 @@ impl<'a> Lanes<'a> {
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
                         }
-                        (&Some(e), _) if b.implies(cond[n], e) => None,
-                        (&Some(e), _) => Some(b.given(e, cond[n])),
+                        (&Some(e), _) => {
+                            if let Some((prev, guard)) = last_guard
+                                && prev == e
+                            {
+                                return guard;
+                            }
+                            let guard = (!b.implies(cond[n], e)).then(|| b.given(e, cond[n]));
+                            last_guard = Some((e, guard));
+                            guard
+                        }
                     })
                     .collect()
             })
@@ -969,8 +861,6 @@ impl<'a> Lanes<'a> {
             active: self.active,
             wide: self.wide,
             wave_any: self.wave_any,
-            // (only where the lowering asks for it, `Lower::above_threads`: off, as on `world`)
-            bounded: if crate::emit::mask_bounds_on() { bounded_masks(self.p) } else { HashSet::new() },
             scc_some: self
                 .scc_lane
                 .iter()
@@ -1699,6 +1589,37 @@ mod tests {
     }
 
     #[test]
+    fn guards_follow_exec_and_block_reachability() {
+        let p = build(
+            &[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xBF88_0005, // s_cbranch_execz -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x7DA4_0880, // v_cmpx_eq_u32 exec, 0, v4
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xBE82_0480, // s_mov_b64 s[2:3], 0
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let lane = |block: usize, i: usize| {
+            Atom::Lane(p.blocks[block].insts[i].write(Reg::S(EXEC)).unwrap())
+        };
+        let a = s.guards[0][1].unwrap();
+        let b = s.guards[1][2].unwrap();
+        assert_eq!(s.bools.node(a), Some((lane(0, 0), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[0], [None, Some(a), Some(a), None]);
+        // The fallthrough already implies the first compare. Only the second
+        // compare needs testing, and the scalar move never needs a guard.
+        assert_eq!(s.bools.node(b), Some((lane(1, 1), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[1], [None, None, Some(b), None, Some(b)]);
+    }
+
+    #[test]
     fn divergent_loop_exits_per_lane() {
         let p = build(
             &[
@@ -1731,49 +1652,27 @@ mod tests {
         ));
     }
 
-    /// `s_cselect` on the SCC a lane loop ended with (the program here is written for
-    /// the test): the loop is left when no lane
-    /// remains, so the select takes its second operand; it was a uniform atom whose value
-    /// no lane has.
+    /// `s_cselect` on the SCC a lane loop ended with (the blend-shape skinning
+    /// programs): the loop is left when no lane remains, so the select takes
+    /// its second operand; it was a uniform atom whose value no lane has.
     #[test]
     fn a_select_on_the_condition_a_lane_loop_ended_with_takes_its_second_operand() {
-        let cnd = (256 + 3) | ((256 + 6) << 9) | (9 << 18);
+        let cnd = 256 | (256 << 9) | (3 << 18);
         let p = build(
             &[
-                0xBE8E_037E, // 0: s_mov_b32 s14, exec_lo
-                0xBE95_037E, // s_mov_b32 s21, exec_lo
-                0x7E2C_0505, // 8: v_readfirstlane_b32 s22, v5
-                0x7DA4_0A16, // v_cmpx_eq_u32 exec_lo, s22, v5
-                0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+                0xBE83_037E, // 0: s_mov_b32 s3, exec_lo
+                0xBE9C_037E, // s_mov_b32 s28, exec_lo
+                0x7E3A_0507, // 8: v_readfirstlane_b32 s29, v7
+                0x7DA4_0E1D, // v_cmpx_eq_u32 exec_lo, s29, v7
+                0xBE9C_471C, // s_andn2_wrexec_b32 s28, s28
                 0xBF89_FFFC, // s_cbranch_execnz -> 8
-                0xBEFE_030E, // s_mov_b32 exec_lo, s14
-                0x8509_807E, // s_cselect_b32 s9, exec_lo, 0
-                0xD501_0002,
-                cnd, // v_cndmask_b32 v2, v3, v6, s9
+                0xBEFE_0303, // s_mov_b32 exec_lo, s3
+                0x8503_807E, // s_cselect_b32 s3, exec_lo, 0
+                0xD501_0001,
+                cnd, // v_cndmask_b32 v1, v0, v0, s3
                 S_ENDPGM,
             ],
             false,
-        );
-        let text: Vec<String> = p
-            .blocks
-            .iter()
-            .flat_map(|b| &b.insts)
-            .map(|i| i.name().to_owned())
-            .collect();
-        assert_eq!(
-            text,
-            [
-                "s_mov_b32",
-                "s_mov_b32",
-                "v_readfirstlane_b32",
-                "v_cmpx_eq_u32",
-                "s_andn2_wrexec_b32",
-                "s_cbranch_execnz",
-                "s_mov_b32",
-                "s_cselect_b32",
-                "v_cndmask_b32",
-                "s_endpgm",
-            ]
         );
         let s = structure(&p).unwrap();
         let select = p
@@ -1782,8 +1681,7 @@ mod tests {
             .flat_map(|b| &b.insts)
             .find(|i| i.name() == "s_cselect_b32")
             .expect("the select");
-        assert!(select.read(Reg::S(EXEC)).is_some() && select.read(Reg::Scc).is_some());
-        let mask = select.write(Reg::S(9)).unwrap();
+        let mask = select.write(Reg::S(3)).unwrap();
         assert_eq!(s.masks.get(&mask), Some(&Bool::FALSE));
     }
 
